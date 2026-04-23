@@ -1,0 +1,10 @@
+faster-whisper>=1.0.0
+PySide6>=6.6.0
+sounddevice>=0.4.6
+numpy>=1.24.0
+easyocr>=1.7.0
+mss>=9.0.0
+pyttsx3>=2.90
+keyboard>=0.13.5
+pyperclip>=1.8.2
+Pillow>=10.0.0

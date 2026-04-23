@@ -1,0 +1,35 @@
+# Virtual environment
+venv/
+env/
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+
+# Local settings and runtime files
+settings.json
+debug.log
+*.log
+
+# Models (downloaded at runtime, large)
+models/
+*.bin
+*.onnx
+
+# Temp / TTS cache
+*.mp3
+*.wav
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+Thumbs.db
+.DS_Store
+desktop.ini
