@@ -3,6 +3,7 @@
 import sys
 import os
 import ctypes
+import re
 import time
 import threading
 import numpy as np
@@ -13,14 +14,14 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QTextEdit, QLabel, QComboBox, QSlider, QGroupBox,
     QStatusBar, QSystemTrayIcon, QMenu, QDialog, QFormLayout,
-    QDialogButtonBox, QCheckBox, QSpinBox, QProgressBar, QSplitter,
-    QLineEdit, QFrame,
+    QDialogButtonBox, QCheckBox, QSpinBox, QProgressBar,
+    QFrame, QStyle,
 )
 from PySide6.QtCore import Qt, QTimer, Slot, QSize, Signal, QEvent
 from PySide6.QtGui import QIcon, QFont, QAction, QColor, QTextCharFormat
 import sounddevice as sd
 
-from config import Config
+from config import Config, DEFAULTS, normalize_hotkey, validate_hotkey
 from voice_engine import VoiceRecorder, Transcriber
 from screen_reader import ScreenCapture, OCREngine, RegionSelector
 from tts_engine import TTSEngine
@@ -218,6 +219,10 @@ class HotkeyCaptureWidget(QFrame):
     hotkey_changed = Signal(str)  # emits the new hotkey string
 
     SPECIAL_KEYS = {
+        # Standalone-friendly keys (good single-key push-to-talk choices)
+        Qt.Key.Key_CapsLock: "caps lock", Qt.Key.Key_ScrollLock: "scroll lock",
+        Qt.Key.Key_Pause: "pause", Qt.Key.Key_Print: "print screen",
+        Qt.Key.Key_Menu: "menu",
         Qt.Key.Key_F1: "f1", Qt.Key.Key_F2: "f2", Qt.Key.Key_F3: "f3",
         Qt.Key.Key_F4: "f4", Qt.Key.Key_F5: "f5", Qt.Key.Key_F6: "f6",
         Qt.Key.Key_F7: "f7", Qt.Key.Key_F8: "f8", Qt.Key.Key_F9: "f9",
@@ -389,237 +394,6 @@ class HotkeyCaptureWidget(QFrame):
         super().focusOutEvent(event)
 
 
-class HotkeyCaptureDialog(QDialog):
-    """Modal dialog that captures a keyboard shortcut via Qt's native key events.
-
-    Full control — allows:
-    - Any modifier combo + key (ctrl+alt+shift+letter, etc.)
-    - Function keys alone (f1-f12)
-    - Windows/Meta key combos
-    - Manual text entry as a backup
-    """
-
-    SPECIAL_KEYS = {
-        Qt.Key.Key_F1: "f1", Qt.Key.Key_F2: "f2", Qt.Key.Key_F3: "f3",
-        Qt.Key.Key_F4: "f4", Qt.Key.Key_F5: "f5", Qt.Key.Key_F6: "f6",
-        Qt.Key.Key_F7: "f7", Qt.Key.Key_F8: "f8", Qt.Key.Key_F9: "f9",
-        Qt.Key.Key_F10: "f10", Qt.Key.Key_F11: "f11", Qt.Key.Key_F12: "f12",
-        Qt.Key.Key_Space: "space", Qt.Key.Key_Return: "enter",
-        Qt.Key.Key_Enter: "enter",
-        Qt.Key.Key_Tab: "tab", Qt.Key.Key_Delete: "delete",
-        Qt.Key.Key_Backspace: "backspace", Qt.Key.Key_Insert: "insert",
-        Qt.Key.Key_Home: "home", Qt.Key.Key_End: "end",
-        Qt.Key.Key_PageUp: "pageup", Qt.Key.Key_PageDown: "pagedown",
-        Qt.Key.Key_Up: "up", Qt.Key.Key_Down: "down",
-        Qt.Key.Key_Left: "left", Qt.Key.Key_Right: "right",
-        Qt.Key.Key_Minus: "-", Qt.Key.Key_Equal: "=",
-        Qt.Key.Key_BracketLeft: "[", Qt.Key.Key_BracketRight: "]",
-        Qt.Key.Key_Semicolon: ";", Qt.Key.Key_Apostrophe: "'",
-        Qt.Key.Key_Comma: ",", Qt.Key.Key_Period: ".",
-        Qt.Key.Key_Slash: "/", Qt.Key.Key_Backslash: "\\",
-        Qt.Key.Key_QuoteLeft: "`",
-    }
-
-    def __init__(self, action_name, current_hotkey, parent=None):
-        super().__init__(parent)
-        self.captured_hotkey = current_hotkey
-        self._action_name = action_name
-        self.setWindowTitle(f"Set {action_name} Hotkey")
-        self.setModal(True)
-        self.setFixedSize(520, 340)
-        self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
-
-        layout = QVBoxLayout(self)
-        layout.setSpacing(12)
-        layout.setContentsMargins(24, 20, 24, 20)
-
-        title = QLabel(f"Set {action_name} Hotkey")
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        title.setStyleSheet("font-size: 16px; font-weight: bold; color: #cdd6f4;")
-        layout.addWidget(title)
-
-        self.instruction = QLabel("Press your hotkey combo  —  OR  —  type it below")
-        self.instruction.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.instruction.setStyleSheet("font-size: 13px; color: #f38ba8; font-weight: bold;")
-        layout.addWidget(self.instruction)
-
-        self.display = QLabel(current_hotkey or "(no combo yet)")
-        self.display.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.display.setStyleSheet(
-            "font-size: 22px; color: #89b4fa; font-weight: bold; "
-            "background: #181825; border: 1px solid #45475a; "
-            "border-radius: 6px; padding: 14px;"
-        )
-        layout.addWidget(self.display)
-
-        # Manual entry fallback
-        manual_label = QLabel("Or type the combo string directly:")
-        manual_label.setStyleSheet("color: #6c7086; font-size: 11px;")
-        layout.addWidget(manual_label)
-
-        self.manual_entry = QLineEdit()
-        self.manual_entry.setPlaceholderText("e.g. ctrl+shift+f9, alt+d, windows+j, f11")
-        self.manual_entry.setText(current_hotkey or "")
-        self.manual_entry.setStyleSheet(
-            "QLineEdit { background: #181825; color: #cdd6f4; "
-            "border: 1px solid #45475a; border-radius: 4px; padding: 6px 10px; "
-            "font-family: Consolas, monospace; }"
-        )
-        layout.addWidget(self.manual_entry)
-
-        hint = QLabel(
-            "ANY combo works — one key, two keys, three keys, any combination.\n"
-            "Press Escape alone to cancel. Click Save when you're happy with what's shown."
-        )
-        hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        hint.setStyleSheet("color: #6c7086; font-size: 10px;")
-        layout.addWidget(hint)
-
-        # Buttons
-        btn_row = QHBoxLayout()
-        btn_row.addStretch()
-        self.save_btn = QPushButton("Save Typed Hotkey")
-        self.save_btn.clicked.connect(self._save_manual)
-        self.cancel_btn = QPushButton("Cancel")
-        self.cancel_btn.clicked.connect(self.reject)
-        btn_row.addWidget(self.save_btn)
-        btn_row.addWidget(self.cancel_btn)
-        layout.addLayout(btn_row)
-
-        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-
-    def showEvent(self, event):
-        super().showEvent(event)
-        self.activateWindow()
-        self.raise_()
-        self.setFocus()
-
-    def _save_manual(self):
-        """Use whatever's in the text field."""
-        text = self.manual_entry.text().strip().lower()
-        if text:
-            self.captured_hotkey = text
-            self.accept()
-
-    def keyPressEvent(self, event):
-        key = event.key()
-        modifiers = event.modifiers()
-
-        # If the user is typing in the manual entry field, don't intercept
-        if self.manual_entry.hasFocus():
-            return super().keyPressEvent(event)
-
-        # Escape with no modifiers cancels
-        if key == Qt.Key.Key_Escape and modifiers == Qt.KeyboardModifier.NoModifier:
-            self.captured_hotkey = None
-            self.reject()
-            return
-
-        # Ignore bare modifier keys — wait for the real key
-        if key in (Qt.Key.Key_Control, Qt.Key.Key_Shift, Qt.Key.Key_Alt, Qt.Key.Key_Meta):
-            return
-
-        parts = []
-        if modifiers & Qt.KeyboardModifier.ControlModifier:
-            parts.append("ctrl")
-        if modifiers & Qt.KeyboardModifier.ShiftModifier:
-            parts.append("shift")
-        if modifiers & Qt.KeyboardModifier.AltModifier:
-            parts.append("alt")
-        if modifiers & Qt.KeyboardModifier.MetaModifier:
-            parts.append("windows")
-
-        # Resolve key name
-        key_name = ""
-        if Qt.Key.Key_A <= key <= Qt.Key.Key_Z:
-            key_name = chr(key).lower()
-        elif Qt.Key.Key_0 <= key <= Qt.Key.Key_9:
-            key_name = chr(key)
-        else:
-            key_name = self.SPECIAL_KEYS.get(key, "")
-
-        if key_name:
-            combo = "+".join(parts + [key_name])
-            self.captured_hotkey = combo
-            self.display.setText(combo)
-            self.manual_entry.setText(combo)
-            self.instruction.setText("✓ Captured — saving...")
-            self.instruction.setStyleSheet(
-                "font-size: 13px; color: #a6e3a1; font-weight: bold;"
-            )
-            # Auto-accept after a short confirmation delay
-            QTimer.singleShot(500, self.accept)
-
-
-class HotkeyButton(QPushButton):
-    """A button that captures keyboard shortcuts using the keyboard library directly."""
-
-    _hotkey_captured = Signal(str)
-
-    def __init__(self, current_hotkey="", parent=None):
-        super().__init__(parent)
-        self._hotkey = current_hotkey
-        self._capturing = False
-        self._set_idle()
-        self.clicked.connect(self._start_capture)
-        self._hotkey_captured.connect(self._on_captured)
-
-    def hotkey(self):
-        return self._hotkey
-
-    def set_hotkey(self, combo):
-        self._hotkey = combo
-        self._set_idle()
-
-    def _set_idle(self):
-        label = self._hotkey if self._hotkey else "Click to set..."
-        self.setText(f"  {label}")
-        self.setStyleSheet(
-            "QPushButton { background: #181825; border: 1px solid #45475a; "
-            "border-radius: 4px; padding: 8px 14px; color: #89b4fa; "
-            "font-weight: bold; font-size: 13px; text-align: left; }"
-            "QPushButton:hover { border-color: #89b4fa; }"
-        )
-
-    def _start_capture(self):
-        if self._capturing:
-            return
-        self._capturing = True
-        self.setText("  Press your shortcut combo now...")
-        self.setStyleSheet(
-            "QPushButton { background: #181825; border: 2px solid #f38ba8; "
-            "border-radius: 4px; padding: 8px 14px; color: #f38ba8; "
-            "font-weight: bold; font-size: 13px; text-align: left; }"
-        )
-        # Use the keyboard library to read the next hotkey — runs in a thread
-        import threading
-        thread = threading.Thread(target=self._capture_thread, daemon=True)
-        thread.start()
-
-    def _capture_thread(self):
-        """Blocking call to keyboard.read_hotkey() in a background thread."""
-        try:
-            combo = kb.read_hotkey(suppress=False)
-            # Normalize: keyboard lib returns things like "ctrl+shift+r"
-            self._hotkey_captured.emit(combo)
-        except Exception:
-            self._hotkey_captured.emit("")
-
-    @Slot(str)
-    def _on_captured(self, combo):
-        self._capturing = False
-        if combo and combo != "escape":
-            combo_lower = combo.lower()
-            # Validate: must have at least one non-modifier key
-            parts = [p.strip() for p in combo_lower.split("+")]
-            modifiers = {"ctrl", "shift", "alt", "windows", "cmd", "meta"}
-            non_modifier_parts = [p for p in parts if p not in modifiers]
-            if non_modifier_parts:
-                self._hotkey = combo_lower
-            # else: ignore — modifier-only combos aren't valid hotkeys
-        self._set_idle()
-
-
 class SettingsDialog(QDialog):
     """Settings dialog for configuring the assistant."""
 
@@ -708,6 +482,18 @@ class SettingsDialog(QDialog):
         self.aot_check.setChecked(self.config["always_on_top"])
         layout.addRow(self.aot_check)
 
+        self.startup_check = QCheckBox("Start with Windows")
+        self.startup_check.setChecked(self.config.get("start_with_windows", True))
+        layout.addRow(self.startup_check)
+
+        self.start_minimized_check = QCheckBox("Start minimized to tray")
+        self.start_minimized_check.setChecked(self.config.get("start_minimized", True))
+        layout.addRow(self.start_minimized_check)
+
+        self.cleanup_check = QCheckBox("Light cleanup for dictation")
+        self.cleanup_check.setChecked(self.config.get("light_cleanup", True))
+        layout.addRow(self.cleanup_check)
+
         # --- Buttons ---
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -723,6 +509,9 @@ class SettingsDialog(QDialog):
             "whisper_language": self.lang_combo.currentData(),
             "font_size": self.font_spin.value(),
             "always_on_top": self.aot_check.isChecked(),
+            "start_with_windows": self.startup_check.isChecked(),
+            "start_minimized": self.start_minimized_check.isChecked(),
+            "light_cleanup": self.cleanup_check.isChecked(),
             # Hotkeys are no longer edited here — keep current values
             "hotkey_record": self.config["hotkey_record"],
             "hotkey_read_aloud": self.config["hotkey_read_aloud"],
@@ -734,6 +523,48 @@ class SettingsDialog(QDialog):
 # Windows API helpers for dictation paste
 # ---------------------------------------------------------------------------
 user32 = ctypes.windll.user32
+
+
+def collapse_repeated_phrases(text):
+    """Collapse consecutive repeated phrases (1–8 words) — Whisper silence artifacts.
+
+    'send the file send the file' → 'send the file';  'the the the' → 'the'.
+    Comparison is case-insensitive; the first occurrence's casing is kept.
+    """
+    words = text.split()
+    out = []
+    i = 0
+    n = len(words)
+    while i < n:
+        matched = False
+        max_plen = min(8, (n - i) // 2)
+        for plen in range(max_plen, 0, -1):
+            phrase = [w.lower() for w in words[i:i + plen]]
+            reps = 1
+            j = i + plen
+            while [w.lower() for w in words[j:j + plen]] == phrase:
+                reps += 1
+                j += plen
+            if reps >= 2:
+                out.extend(words[i:i + plen])  # keep one copy, original casing
+                i = j
+                matched = True
+                break
+        if not matched:
+            out.append(words[i])
+            i += 1
+    return " ".join(out)
+
+
+def sanitize_for_paste(text):
+    """Make text safe to paste: drop control chars and flatten newlines/tabs.
+
+    Stray newlines/control chars are what make single-line and chat inputs emit
+    the Windows 'ding' on paste.
+    """
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
 
 
 def get_foreground_window():
@@ -756,8 +587,9 @@ def set_foreground_window(hwnd):
 
 
 _paste_lock = threading.Lock()
-_last_paste_end_time = [0.0]  # using list for mutability across function calls
 _debug_log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug.log")
+_single_instance_mutex = None
+_show_window_event = None
 
 
 def _dbg(msg):
@@ -766,6 +598,66 @@ def _dbg(msg):
             f.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
     except Exception:
         pass
+
+
+def request_existing_instance_show():
+    """Ask the already-running app to show its main window."""
+    EVENT_MODIFY_STATE = 0x0002
+    kernel32 = ctypes.windll.kernel32
+    event = kernel32.OpenEventW(EVENT_MODIFY_STATE, False, r"Local\VoiceAssistant.ShowWindow")
+    if event:
+        kernel32.SetEvent(event)
+        kernel32.CloseHandle(event)
+        return True
+    return False
+
+
+def create_show_window_event():
+    global _show_window_event
+    kernel32 = ctypes.windll.kernel32
+    _show_window_event = kernel32.CreateEventW(None, False, False, r"Local\VoiceAssistant.ShowWindow")
+    return _show_window_event
+
+
+def acquire_single_instance_lock():
+    """Prevent two app copies from registering the same global hotkeys."""
+    global _single_instance_mutex
+    ERROR_ALREADY_EXISTS = 183
+    kernel32 = ctypes.windll.kernel32
+    mutex = kernel32.CreateMutexW(None, False, r"Local\VoiceAssistant.MainInstance")
+    if not mutex:
+        return True
+    if kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
+        request_existing_instance_show()
+        _dbg("second instance detected; requested existing window show")
+        kernel32.CloseHandle(mutex)
+        return False
+    _single_instance_mutex = mutex
+    create_show_window_event()
+    return True
+
+
+def set_start_with_windows(enabled):
+    """Register or remove the tray-first startup command for this user."""
+    try:
+        import winreg
+        key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE) as key:
+            if enabled:
+                pythonw = sys.executable
+                if pythonw.lower().endswith("python.exe"):
+                    pythonw = pythonw[:-10] + "pythonw.exe"
+                command = f'"{pythonw}" "{os.path.abspath(__file__)}" --minimized'
+                winreg.SetValueEx(key, "VoiceAssistant", 0, winreg.REG_SZ, command)
+            else:
+                try:
+                    winreg.DeleteValue(key, "VoiceAssistant")
+                except FileNotFoundError:
+                    pass
+        return True
+    except Exception as e:
+        _dbg(f"startup registration failed: {e}")
+        return False
 
 
 def _win32_paste():
@@ -798,21 +690,24 @@ def _window_title(hwnd):
 
 
 def paste_to_window(hwnd, text):
-    """Focus a window and paste text. Guarded against re-entry AND rapid consecutive calls."""
+    """Focus a window and paste text. Guarded against re-entry only.
+
+    The non-blocking lock stops a genuine re-entrant double-paste; we no longer
+    impose a 1s cooldown, which used to swallow a legitimate fast second dictation.
+    """
     title = _window_title(hwnd)
     fg = user32.GetForegroundWindow()
     fg_title = _window_title(fg)
     _dbg(f"paste_to_window ENTER  target_hwnd={hwnd} title={title!r}  current_fg={fg} title={fg_title!r}")
 
-    since_last = time.time() - _last_paste_end_time[0]
-    if since_last < 1.0:
-        _dbg(f"paste_to_window REJECTED — only {since_last:.2f}s since last paste")
-        return False
-
     if not _paste_lock.acquire(blocking=False):
         _dbg("paste_to_window REJECTED — lock held")
         return False
     try:
+        text = sanitize_for_paste(text)
+        if not text:
+            _dbg("  nothing left after sanitize, skipping paste")
+            return False
         pyperclip.copy(text)
         _dbg(f"  clipboard set to {text!r}")
 
@@ -824,27 +719,22 @@ def paste_to_window(hwnd, text):
                 break
             time.sleep(0.02)
 
-        # ONLY press Escape if the current foreground window is NOT the target
-        # (meaning something else — probably Start menu — stole focus)
+        # If focus drifted off the target, just refocus it. We deliberately do
+        # NOT inject Escape — sending Esc into the target app is what produced
+        # the audible Windows beep on many controls.
         current_fg = user32.GetForegroundWindow()
         if current_fg != hwnd:
-            _dbg(f"  focus is on {current_fg} (title={_window_title(current_fg)!r}), pressing Esc to close intruder")
-            VK_ESCAPE = 0x1B
-            KEYEVENTF_KEYUP = 0x0002
-            user32.keybd_event(VK_ESCAPE, 0, 0, 0)
-            user32.keybd_event(VK_ESCAPE, 0, KEYEVENTF_KEYUP, 0)
-            time.sleep(0.05)
+            _dbg(f"  focus is on {current_fg} (title={_window_title(current_fg)!r}), refocusing target (no Esc)")
             if not set_foreground_window(hwnd):
                 _dbg("  set_foreground_window FAILED")
                 return False
             time.sleep(0.12)
         else:
-            _dbg(f"  focus already on target window, NOT pressing Esc")
+            _dbg(f"  focus already on target window")
             # Still need a small delay so any keystate settles
             time.sleep(0.05)
 
         _win32_paste()
-        _last_paste_end_time[0] = time.time()
         _dbg("paste_to_window DONE")
         return True
     finally:
@@ -856,7 +746,10 @@ def paste_to_window(hwnd, text):
 # Floating recording indicator — small always-on-top pill
 # ---------------------------------------------------------------------------
 class RecordingIndicator(QWidget):
-    """Tiny floating widget that shows recording / transcribing state."""
+    """Always-visible floating pill that shows dictation state and can be
+    clicked to start/stop recording. Drag it anywhere on the desktop."""
+
+    clicked = Signal()  # emitted on a click (not a drag)
 
     def __init__(self):
         super().__init__()
@@ -866,7 +759,12 @@ class RecordingIndicator(QWidget):
             | Qt.WindowType.Tool
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
-        self.setFixedSize(220, 40)
+        # Don't steal focus from the window the user is dictating into.
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self.setWindowFlag(Qt.WindowType.WindowDoesNotAcceptFocus, True)
+        self.setFixedSize(200, 40)
+        self.setToolTip("Click to start/stop dictation  •  drag to move")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
 
         lay = QHBoxLayout(self)
         lay.setContentsMargins(12, 6, 12, 6)
@@ -880,50 +778,68 @@ class RecordingIndicator(QWidget):
         lay.addWidget(self._label)
         lay.addStretch()
 
+        self._positioned = False  # auto-place once, then respect user drags
+        self._drag_offset = None
         self._set_idle()
 
     def _position_bottom_right(self):
+        if self._positioned:
+            return
         screen = QApplication.primaryScreen().availableGeometry()
         self.move(screen.right() - self.width() - 20, screen.bottom() - self.height() - 60)
+        self._positioned = True
 
-    def show_recording(self):
-        self.setStyleSheet("background-color: #1e1e2e; border: 2px solid #f38ba8; border-radius: 8px;")
-        self._dot.setStyleSheet(
-            "background-color: #f38ba8; border-radius: 7px; border: none;"
-        )
-        self._label.setText("Recording...")
-        self._label.setStyleSheet("color: #f38ba8; font-weight: bold; font-size: 13px;")
+    # --- drag-to-move + click-to-record ---
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            self._press_pos = event.globalPosition().toPoint()
+            event.accept()
+
+    def mouseMoveEvent(self, event):
+        if self._drag_offset is not None and (event.buttons() & Qt.MouseButton.LeftButton):
+            self.move(event.globalPosition().toPoint() - self._drag_offset)
+            self._positioned = True
+            event.accept()
+
+    def mouseReleaseEvent(self, event):
+        if self._drag_offset is not None:
+            moved = (event.globalPosition().toPoint() - self._press_pos).manhattanLength()
+            self._drag_offset = None
+            if moved < 6:  # treat as a click, not a drag
+                self.clicked.emit()
+            event.accept()
+
+    def _apply(self, border, dot, text, text_color):
+        self.setStyleSheet(f"background-color: #1e1e2e; border: 2px solid {border}; border-radius: 8px;")
+        self._dot.setStyleSheet(f"background-color: {dot}; border-radius: 7px; border: none;")
+        self._label.setText(text)
+        self._label.setStyleSheet(f"color: {text_color}; font-weight: bold; font-size: 13px;")
         self._position_bottom_right()
         self.show()
         self.raise_()
 
+    def show_recording(self):
+        self._apply("#f38ba8", "#f38ba8", "● Recording", "#f38ba8")
+
     def show_transcribing(self):
-        self.setStyleSheet("background-color: #1e1e2e; border: 2px solid #f9e2af; border-radius: 8px;")
-        self._dot.setStyleSheet(
-            "background-color: #f9e2af; border-radius: 7px; border: none;"
-        )
-        self._label.setText("Transcribing...")
-        self._label.setStyleSheet("color: #f9e2af; font-weight: bold; font-size: 13px;")
+        self._apply("#f9e2af", "#f9e2af", "Transcribing…", "#f9e2af")
+
+    def show_done(self):
+        self._apply("#a6e3a1", "#a6e3a1", "Pasted ✓", "#a6e3a1")
+        QTimer.singleShot(1500, self.show_idle)
+
+    def show_idle(self):
+        self._set_idle()
+        self._position_bottom_right()
         self.show()
         self.raise_()
 
-    def show_done(self):
-        self.setStyleSheet("background-color: #1e1e2e; border: 2px solid #a6e3a1; border-radius: 8px;")
-        self._dot.setStyleSheet(
-            "background-color: #a6e3a1; border-radius: 7px; border: none;"
-        )
-        self._label.setText("Pasted")
-        self._label.setStyleSheet("color: #a6e3a1; font-weight: bold; font-size: 13px;")
-        self.show()
-        QTimer.singleShot(1500, self.hide)
-
     def _set_idle(self):
         self.setStyleSheet("background-color: #1e1e2e; border: 1px solid #45475a; border-radius: 8px;")
-        self._dot.setStyleSheet(
-            "background-color: #45475a; border-radius: 7px; border: none;"
-        )
-        self._label.setText("Ready")
-        self._label.setStyleSheet("color: #6c7086; font-weight: bold; font-size: 13px;")
+        self._dot.setStyleSheet("background-color: #585b70; border-radius: 7px; border: none;")
+        self._label.setText("Ready — click to dictate")
+        self._label.setStyleSheet("color: #9399b2; font-weight: bold; font-size: 12px;")
 
 
 class MainWindow(QMainWindow):
@@ -932,7 +848,6 @@ class MainWindow(QMainWindow):
     _sig_hotkey_release = Signal()
     _sig_hotkey_screen = Signal()
     _sig_hotkey_read = Signal()
-    _sig_inline_hk = Signal(str, str, str, int)  # config_key, label, combo, button_id
 
     def __init__(self):
         super().__init__()
@@ -974,6 +889,8 @@ class MainWindow(QMainWindow):
 
         # Push-to-talk state
         self._ptt_active = False
+        self._last_hotkey_press_time = 0.0
+        self._force_quit = False
         # Debounce flag for read-aloud hotkey
         self._read_in_flight = False
         # Track last transcription to prevent double-paste
@@ -986,9 +903,11 @@ class MainWindow(QMainWindow):
         self._sig_hotkey_screen.connect(self._on_cursor_read)
         self._sig_hotkey_read.connect(self._on_read_aloud_toggle)
         self._sig_read_text_ready.connect(self._on_read_text_ready)
-        self._sig_inline_hk.connect(self._on_inline_hk_captured)
 
         self._setup_hotkeys()
+        self._setup_tray()
+        self._setup_show_request_timer()
+        set_start_with_windows(self.config.get("start_with_windows", True))
         self._apply_window_flags()
 
         # Load models in background
@@ -996,6 +915,7 @@ class MainWindow(QMainWindow):
         self.ocr.load_model()
 
         self._update_status("Starting up...")
+        self.indicator.show_idle()  # always-visible desktop pill
 
     # -----------------------------------------------------------------------
     # UI construction
@@ -1257,6 +1177,9 @@ class MainWindow(QMainWindow):
         self.region_selector.region_selected.connect(self._on_region_selected)
         self.region_selector.cancelled.connect(lambda: self._update_status("Selection cancelled"))
 
+        # Floating desktop indicator — click to toggle dictation
+        self.indicator.clicked.connect(self._on_indicator_clicked)
+
     # -----------------------------------------------------------------------
     # Hotkeys (global)
     # -----------------------------------------------------------------------
@@ -1266,23 +1189,22 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-        # Normalize hotkeys to lowercase — keyboard lib is case-sensitive
-        hk_record = self.config["hotkey_record"].lower()
-        hk_screen = self.config["hotkey_screen_read"].lower()
-        self.config.set("hotkey_record", hk_record)
-        self.config.set("hotkey_screen_read", hk_screen)
+        hk_record = self._clean_hotkey("hotkey_record")
+        hk_screen = self._clean_hotkey("hotkey_screen_read")
+        hk_read = self._clean_hotkey("hotkey_read_aloud")
         errors = []
 
-        # Push-to-talk: press combo to start, release trigger key to stop
-        # DON'T suppress — we need the release event for push-to-talk
         try:
-            kb.add_hotkey(hk_record, lambda: self._sig_hotkey_press.emit())
-            # Extract the trigger key (last part of combo)
-            trigger_key = hk_record.split("+")[-1].strip()
-            try:
-                kb.on_release_key(trigger_key, lambda e: self._sig_hotkey_release.emit())
-            except Exception:
-                pass
+            # Watch the trigger key for press (start) and release (stop). The press
+            # callback only fires recording when the FULL combo is held, so typing
+            # the trigger letter alone never starts dictation. Works for single-key
+            # hotkeys (e.g. f9) too. The release handler is a no-op unless PTT is on.
+            trigger_key = self._hotkey_trigger_key(hk_record)
+            kb.on_press_key(
+                trigger_key,
+                lambda e, combo=hk_record: self._emit_record_press_if_active(combo),
+            )
+            kb.on_release_key(trigger_key, lambda e: self._sig_hotkey_release.emit())
         except Exception as e:
             errors.append(f"Record hotkey ({hk_record}): {e}")
 
@@ -1291,16 +1213,11 @@ class MainWindow(QMainWindow):
         except Exception as e:
             errors.append(f"Screen hotkey ({hk_screen}): {e}")
 
-        hk_read = self.config["hotkey_read_aloud"].lower()
-        self.config.set("hotkey_read_aloud", hk_read)
-        # Suppress the keys if the hotkey contains the Windows key so it
-        # doesn't open the Start menu when released.
         needs_suppress_read = "windows" in hk_read
         try:
             kb.add_hotkey(hk_read, lambda: self._sig_hotkey_read.emit(),
                           suppress=needs_suppress_read)
-        except Exception as e:
-            # Try without suppress as fallback
+        except Exception:
             try:
                 kb.add_hotkey(hk_read, lambda: self._sig_hotkey_read.emit())
             except Exception as e2:
@@ -1311,10 +1228,52 @@ class MainWindow(QMainWindow):
         else:
             self._update_status(f"Hotkeys: {hk_record}=dictate  {hk_read}=read selection  {hk_screen}=OCR")
 
+    def _clean_hotkey(self, config_key):
+        combo = normalize_hotkey(self.config.get(config_key, DEFAULTS[config_key]))
+        if not validate_hotkey(combo):
+            combo = DEFAULTS[config_key]
+        self.config.set(config_key, combo)
+        return combo
+
+    def _hotkey_parts(self, combo):
+        return [part for part in normalize_hotkey(combo).split("+") if part]
+
+    def _hotkey_trigger_key(self, combo):
+        non_modifiers = [part for part in self._hotkey_parts(combo) if part not in {"ctrl", "shift", "alt", "windows", "cmd", "meta"}]
+        return non_modifiers[-1] if non_modifiers else self._hotkey_parts(combo)[-1]
+
+    def _emit_record_press_if_active(self, combo):
+        """Fire the record signal only when every key in the combo is held."""
+        try:
+            if all(kb.is_pressed(part) for part in self._hotkey_parts(combo)):
+                self._sig_hotkey_press.emit()
+        except Exception as e:
+            _dbg(f"record hotkey state check failed: {e}")
+
+    def _set_hotkey_if_valid(self, config_key, label, combo):
+        combo = normalize_hotkey(combo)
+        if not validate_hotkey(combo):
+            self._update_status(
+                f"{label}: use a single key like F9 or Caps Lock, or a combo like Ctrl+Shift+F9"
+            )
+            return False
+        other_keys = [k for k in ("hotkey_record", "hotkey_read_aloud", "hotkey_screen_read")
+                      if k != config_key]
+        if any(normalize_hotkey(self.config[k]) == combo for k in other_keys):
+            self._update_status(f"{combo} is already used by another hotkey")
+            return False
+        self.config.set(config_key, combo)
+        return True
+
     @Slot()
     def _hotkey_press_handler(self):
         """Hotkey pressed — start recording."""
         _dbg(f"_hotkey_press_handler: ptt={self._ptt_active}  recording={self.recorder.is_recording}")
+        now = time.monotonic()
+        if now - self._last_hotkey_press_time < 0.25:
+            _dbg("  ignored duplicate hotkey press inside debounce window")
+            return
+        self._last_hotkey_press_time = now
         if not self.recorder.is_recording and not self._ptt_active:
             self._ptt_active = True
             self._on_record_from_hotkey()
@@ -1322,6 +1281,10 @@ class MainWindow(QMainWindow):
     @Slot()
     def _hotkey_release_handler(self):
         """Trigger key released — stop recording if push-to-talk is active."""
+        # No-op (and no logging) unless PTT is active — this fires on every
+        # trigger-letter release during normal typing.
+        if not self._ptt_active:
+            return
         _dbg(f"_hotkey_release_handler: ptt={self._ptt_active}  recording={self.recorder.is_recording}")
         if self._ptt_active and self.recorder.is_recording:
             self._ptt_active = False
@@ -1344,6 +1307,21 @@ class MainWindow(QMainWindow):
             _dbg(f"  target_hwnd captured: {self._target_hwnd}")
         self.recorder.start()
         _dbg("  recorder.start() called")
+
+    @Slot()
+    def _on_indicator_clicked(self):
+        """Click the floating pill to toggle dictation (capture → record → paste)."""
+        if self.recorder.is_recording:
+            self._ptt_active = False
+            self._on_stop_record()
+            return
+        if not self.transcriber.is_loaded:
+            self._update_status("Whisper model still loading, please wait...")
+            return
+        # Pill doesn't take focus, so the foreground window is still the target.
+        if self._dictation_active:
+            self._target_hwnd = get_foreground_window()
+        self.recorder.start()
 
     @Slot()
     def _on_record(self):
@@ -1389,13 +1367,22 @@ class MainWindow(QMainWindow):
             return
         self._last_audio_id = id(audio)
 
+        min_seconds = float(self.config.get("min_record_seconds", 0.2))
+        min_peak = float(self.config.get("min_record_peak", 0.008))
+        if duration < min_seconds or max_amp < min_peak:
+            _dbg("  ignored - too short or too quiet for reliable dictation")
+            self._update_status("Recording ignored - too short or too quiet")
+            self.indicator.show_idle()
+            self._target_hwnd = None
+            return
+
         if len(audio) > 0:
             self._update_status(f"Transcribing {duration:.1f}s (peak {max_amp:.3f})...")
             self.indicator.show_transcribing()
             self.transcriber.transcribe(audio)
         else:
             self._update_status("No audio captured")
-            self.indicator.hide()
+            self.indicator.show_idle()
 
     @Slot(float)
     def _on_level_update(self, rms):
@@ -1428,14 +1415,17 @@ class MainWindow(QMainWindow):
     @Slot(str)
     def _on_transcription_ready(self, text):
         _dbg(f"_on_transcription_ready FIRED  text={text!r}")
-        # --- 1. Clean up Whisper duplicates (same phrase repeated back-to-back) ---
+        # --- 1. Clean up Whisper duplicates and light filler/stutter artifacts ---
         text = self._dedupe_repeated(text)
+        if self.config.get("light_cleanup", True):
+            text = self._light_cleanup(text)
 
-        # --- 2. Skip if we just emitted identical text within the last 3 seconds ---
+        # --- 2. Skip only a near-instant repeat of identical text (double-fire),
+        #        short enough that intentionally repeating a word still works ---
         now = time.time()
-        if text == self._last_transcription and (now - self._last_transcription_time) < 3.0:
+        if text == self._last_transcription and (now - self._last_transcription_time) < 1.2:
             _dbg(f"  → duplicate, ignoring")
-            self.indicator.hide()
+            self.indicator.show_idle()
             self._target_hwnd = None
             self._update_status("Duplicate transcription ignored")
             return
@@ -1450,7 +1440,8 @@ class MainWindow(QMainWindow):
             and self._target_hwnd == own_hwnd
         )
 
-        if (self._dictation_active and self._target_hwnd and not is_own_window
+        if (self._dictation_active and self.config.get("auto_paste", True)
+                and self._target_hwnd and not is_own_window
                 and text.strip() and "[No speech" not in text):
             success = paste_to_window(self._target_hwnd, text)
             if success:
@@ -1459,31 +1450,38 @@ class MainWindow(QMainWindow):
                 self._target_hwnd = None
                 return
             else:
-                self.indicator.hide()
+                self.indicator.show_idle()
                 self._update_status("Transcribed (target window unavailable, text in panel)")
         else:
-            self.indicator.hide()
+            self.indicator.show_idle()
             self._update_status("Transcription complete")
 
         self._append_output(text, prefix="[Voice]")
         self._target_hwnd = None
 
-    def _dedupe_repeated(self, text):
-        """Collapse immediate duplicates like 'Hello world. Hello world.' → 'Hello world.'"""
-        if not text or len(text) < 10:
+    def _light_cleanup(self, text):
+        """Very light dictation cleanup: fillers, simple stutters, spacing, casing."""
+        if not text or text.startswith("["):
             return text
-        # Check if the text is exactly "X X" where X is the same content
-        stripped = text.strip()
-        length = len(stripped)
-        # Try splitting at the midpoint (with small tolerance for punctuation differences)
-        for split in (length // 2 - 1, length // 2, length // 2 + 1):
-            if split <= 0 or split >= length:
-                continue
-            left = stripped[:split].strip().rstrip(".,!?;:").lower()
-            right = stripped[split:].strip().rstrip(".,!?;:").lower()
-            if left and left == right:
-                return stripped[:split].strip()
-        return text
+        cleaned = re.sub(r"\b(um+|uh+|erm|ah+)\b[, ]*", "", text, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\b(\w{1,4})[- ]+\1\b", r"\1", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        cleaned = re.sub(r"\s+([,.!?;:])", r"\1", cleaned)
+        if cleaned:
+            cleaned = cleaned[0].upper() + cleaned[1:]
+            if cleaned[-1] not in ".!?":
+                cleaned += "."
+        return cleaned
+
+    def _dedupe_repeated(self, text):
+        """Collapse consecutive repeated words/phrases Whisper emits on silence.
+
+        Handles 'the the the', 'send the file send the file send the file', and
+        repeated full sentences — not just the exact 2x split the old version caught.
+        """
+        if not text or text.startswith("["):
+            return text
+        return collapse_repeated_phrases(text)
 
     # -----------------------------------------------------------------------
     # Screen reader handlers
@@ -1669,63 +1667,10 @@ class MainWindow(QMainWindow):
         else:
             self._update_status("No text selected — highlight text first, then press the hotkey")
 
-    @Slot(str, str, str, int)
-    def _on_inline_hk_captured(self, config_key, label, combo, button_id):
-        """Called in main thread after inline hotkey capture completes."""
-        btn_map = {
-            id(self.hk_btn_record): self.hk_btn_record,
-            id(self.hk_btn_read): self.hk_btn_read,
-            id(self.hk_btn_screen): self.hk_btn_screen,
-        }
-        button = btn_map.get(button_id)
-        if not button:
-            # Still need to re-register global hotkeys
-            self._setup_hotkeys()
-            return
-
-        # Validate: must have modifier + key, not match another hotkey
-        combo_lower = (combo or "").lower()
-        parts = [p.strip() for p in combo_lower.split("+")]
-        modifiers = {"ctrl", "shift", "alt", "windows", "cmd", "meta"}
-        non_mod = [p for p in parts if p and p not in modifiers]
-
-        is_valid = (
-            combo_lower
-            and combo_lower != "escape"
-            and non_mod
-            and len(parts) >= 2
-        )
-
-        # Check for conflicts with other hotkeys
-        other_keys = [k for k in ("hotkey_record", "hotkey_read_aloud", "hotkey_screen_read")
-                      if k != config_key]
-        conflict = is_valid and any(self.config[k] == combo_lower for k in other_keys)
-
-        if is_valid and not conflict:
-            self.config.set(config_key, combo_lower)
-            button.setText(f"  {label}: {combo_lower}  ")
-            self._update_status(f"{label} hotkey set to {combo_lower}")
-        else:
-            current = self.config[config_key]
-            button.setText(f"  {label}: {current}  ")
-            if conflict:
-                self._update_status(f"{combo_lower} is already used by another hotkey")
-            elif combo_lower and not non_mod:
-                self._update_status("Need modifier + key (e.g., Ctrl+Shift+F9)")
-            else:
-                self._update_status("Hotkey change cancelled — kept existing")
-
-        self._reset_hotkey_button_style(button)
-        # ALWAYS re-register all hotkeys — capture temporarily unhooked them
-        self._setup_hotkeys()
-        self._update_dictation_hint()
-
     def _save_hotkey(self, config_key, label, combo):
         """Called when a HotkeyCaptureWidget captures a new combo."""
-        combo = (combo or "").lower().strip()
-        if not combo:
+        if not self._set_hotkey_if_valid(config_key, label, combo):
             return
-        self.config.set(config_key, combo)
         # Unhook old hotkeys and re-register all
         try:
             kb.unhook_all()
@@ -1735,87 +1680,7 @@ class MainWindow(QMainWindow):
         self._read_in_flight = False
         self._setup_hotkeys()
         self._update_dictation_hint()
-        self._update_status(f"{label} hotkey set to {combo}")
-
-    def _change_hotkey_inline(self, config_key, label, button):
-        """Inline edit: replace the pill with a text field. Type anything. Enter saves, Esc cancels."""
-        try:
-            kb.unhook_all()
-        except Exception:
-            pass
-        self._ptt_active = False
-        self._read_in_flight = False
-
-        current = self.config[config_key]
-
-        # Find the position of the button in its parent layout
-        parent_layout = button.parent().layout()
-        index = None
-        for i in range(parent_layout.count()):
-            item = parent_layout.itemAt(i)
-            if item and item.widget() is button:
-                index = i
-                break
-        if index is None:
-            self._setup_hotkeys()
-            return
-
-        # Replace the button with a QLineEdit
-        edit = QLineEdit(current)
-        edit.setToolTip("Type any combo (e.g. a, f9, ctrl+shift+q, alt+b). Enter=save  Esc=cancel")
-        edit.setStyleSheet(
-            "QLineEdit { background: #181825; color: #f9e2af; "
-            "border: 2px solid #f38ba8; border-radius: 6px; padding: 6px 12px; "
-            "font-weight: bold; font-size: 11px; font-family: Consolas, monospace; }"
-        )
-        edit.setFixedWidth(button.sizeHint().width() + 40)
-        edit.selectAll()
-
-        parent_layout.removeWidget(button)
-        button.hide()
-        parent_layout.insertWidget(index, edit)
-
-        self._update_status(f"Editing {label} hotkey — type it, Enter saves, Esc cancels")
-
-        def finish(save):
-            new_combo = edit.text().strip().lower() if save else ""
-            # Remove edit widget, restore button
-            idx = None
-            for i in range(parent_layout.count()):
-                if parent_layout.itemAt(i).widget() is edit:
-                    idx = i
-                    break
-            if idx is not None:
-                parent_layout.removeWidget(edit)
-            edit.deleteLater()
-
-            if save and new_combo:
-                self.config.set(config_key, new_combo)
-                button.setText(f"  {label}: {new_combo}  ")
-                self._update_status(f"{label} hotkey set to: {new_combo}")
-            else:
-                button.setText(f"  {label}: {current}  ")
-                self._update_status(f"{label} hotkey unchanged")
-
-            self._reset_hotkey_button_style(button)
-            if idx is not None:
-                parent_layout.insertWidget(idx, button)
-            button.show()
-            self._setup_hotkeys()
-            self._update_dictation_hint()
-
-        edit.returnPressed.connect(lambda: finish(True))
-
-        # Esc cancels — use a key event filter on the edit
-        original_keypress = edit.keyPressEvent
-        def edit_keypress(event):
-            if event.key() == Qt.Key.Key_Escape:
-                finish(False)
-                return
-            original_keypress(event)
-        edit.keyPressEvent = edit_keypress
-
-        edit.setFocus()
+        self._update_status(f"{label} hotkey set to {self.config[config_key]}")
 
     def _reset_hotkeys_to_defaults(self):
         from config import DEFAULTS
@@ -1902,6 +1767,10 @@ class MainWindow(QMainWindow):
             self.text_output.setFont(QFont("Cascadia Code", vals["font_size"]))
 
             self.config.set("always_on_top", vals["always_on_top"])
+            self.config.set("start_with_windows", vals["start_with_windows"])
+            self.config.set("start_minimized", vals["start_minimized"])
+            self.config.set("light_cleanup", vals["light_cleanup"])
+            set_start_with_windows(vals["start_with_windows"])
             self._apply_window_flags()
 
             # Hotkey changes — re-register
@@ -1963,35 +1832,106 @@ class MainWindow(QMainWindow):
     def _on_error(self, msg):
         self._update_status(f"Error: {msg}")
         self._append_output(msg, prefix="[Error]")
-        self.indicator.hide()
+        self.indicator.show_idle()
+
+    def _setup_show_request_timer(self):
+        self._show_request_timer = QTimer(self)
+        self._show_request_timer.timeout.connect(self._poll_show_request)
+        self._show_request_timer.start(500)
+
+    def _poll_show_request(self):
+        if not _show_window_event:
+            return
+        WAIT_OBJECT_0 = 0
+        result = ctypes.windll.kernel32.WaitForSingleObject(_show_window_event, 0)
+        if result == WAIT_OBJECT_0:
+            self.show_normal()
+
+    def _setup_tray(self):
+        self.tray = QSystemTrayIcon(self)
+        self.tray.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon))
+        menu = QMenu(self)
+        show_action = QAction("Show Voice Assistant", self)
+        show_action.triggered.connect(self.show_normal)
+        menu.addAction(show_action)
+        pause_action = QAction("Pause Dictation", self)
+        pause_action.setCheckable(True)
+        pause_action.setChecked(not self._dictation_active)
+        pause_action.toggled.connect(lambda paused: self.btn_dictation.setChecked(not paused))
+        menu.addAction(pause_action)
+        stop_action = QAction("Stop Reading", self)
+        stop_action.triggered.connect(self.tts.stop)
+        menu.addAction(stop_action)
+        menu.addSeparator()
+        quit_action = QAction("Quit", self)
+        quit_action.triggered.connect(self.quit_app)
+        menu.addAction(quit_action)
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(self._on_tray_activated)
+        self.tray.show()
+
+    def _on_tray_activated(self, reason):
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:
+            self.show_normal()
+
+    def show_normal(self):
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def quit_app(self):
+        self._force_quit = True
+        self.close()
 
     def _apply_window_flags(self):
+        was_visible = self.isVisible()
         flags = self.windowFlags()
         if self.config["always_on_top"]:
             flags |= Qt.WindowType.WindowStaysOnTopHint
         else:
             flags &= ~Qt.WindowType.WindowStaysOnTopHint
         self.setWindowFlags(flags)
-        self.show()
+        if was_visible:
+            self.show()
 
     def closeEvent(self, event):
-        # Clean up hotkeys
+        if not self._force_quit and self.tray.isVisible():
+            event.ignore()
+            self.hide()
+            self._update_status("Still running in the tray")
+            return
         try:
             kb.unhook_all()
         except Exception:
             pass
+        if _show_window_event:
+            try:
+                ctypes.windll.kernel32.CloseHandle(_show_window_event)
+            except Exception:
+                pass
+        if _single_instance_mutex:
+            try:
+                ctypes.windll.kernel32.CloseHandle(_single_instance_mutex)
+            except Exception:
+                pass
         self.config.save()
         event.accept()
 
 
 def main():
+    if not acquire_single_instance_lock():
+        return
     app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
     app.setApplicationName("Voice Assistant")
     app.setStyle("Fusion")
     app.setStyleSheet(DARK_STYLE)
 
     window = MainWindow()
-    window.show()
+    if "--minimized" in sys.argv or window.config.get("start_minimized", True):
+        window.hide()
+    else:
+        window.show()
 
     sys.exit(app.exec())
 

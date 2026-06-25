@@ -16,15 +16,26 @@ class ScreenCapture:
     def __init__(self):
         self._sct = mss.mss()
 
+    def _virtual_bounds(self):
+        monitors = self._sct.monitors[1:] or [self._sct.monitors[0]]
+        left = min(m["left"] for m in monitors)
+        top = min(m["top"] for m in monitors)
+        right = max(m["left"] + m["width"] for m in monitors)
+        bottom = max(m["top"] + m["height"] for m in monitors)
+        return left, top, right, bottom
+
     def capture_around_cursor(self, width=600, height=300):
         """Capture a region centered on the current mouse cursor."""
         cursor_pos = QCursor.pos()
-        x = cursor_pos.x() - width // 2
-        y = cursor_pos.y() - height // 2
+        left, top, right, bottom = self._virtual_bounds()
+        width = min(width, right - left)
+        height = min(height, bottom - top)
+        x = max(left, min(cursor_pos.x() - width // 2, right - width))
+        y = max(top, min(cursor_pos.y() - height // 2, bottom - height))
 
         monitor = {
-            "left": max(0, x),
-            "top": max(0, y),
+            "left": x,
+            "top": y,
             "width": width,
             "height": height,
         }
@@ -39,14 +50,6 @@ class ScreenCapture:
         screenshot = self._sct.grab(monitor)
         img = Image.frombytes("RGB", screenshot.size, screenshot.rgb)
         return img
-
-    def capture_full_screen(self):
-        """Capture the entire primary screen."""
-        monitor = self._sct.monitors[1]
-        screenshot = self._sct.grab(monitor)
-        img = Image.frombytes("RGB", screenshot.size, screenshot.rgb)
-        return img
-
 
 class OCREngine(QObject):
     """EasyOCR-based text recognition."""

@@ -115,21 +115,6 @@ class TTSEngine(QObject):
         if self._pyttsx_engine:
             self._pyttsx_engine.setProperty("rate", int(175 * self._speed))
 
-    def set_rate(self, rate):
-        """Legacy method for WPM — convert to speed multiplier."""
-        self.set_speed(rate / 175.0)
-        self._rate = rate
-
-    def set_volume(self, volume):
-        self._volume = volume
-        if self._pyttsx_engine:
-            self._pyttsx_engine.setProperty("volume", volume)
-        if self._vlc_player:
-            try:
-                self._vlc_player.audio_set_volume(int(volume * 100))
-            except Exception:
-                pass
-
     def speak(self, text):
         """Generate and play text."""
         if not text.strip():
@@ -158,7 +143,15 @@ class TTSEngine(QObject):
                 self.status.emit("Speech complete")
             except Exception as e:
                 if not self._stop_event.is_set():
-                    self.error.emit(f"TTS error: {e}")
+                    if not self._use_offline and self._pyttsx_engine:
+                        try:
+                            self.status.emit("Neural speech failed; using offline voice...")
+                            self._speak_offline(text)
+                            self.status.emit("Speech complete")
+                        except Exception as e2:
+                            self.error.emit(f"TTS error: {e2}")
+                    else:
+                        self.error.emit(f"TTS error: {e}")
             finally:
                 self._speaking = False
                 self.speaking_finished.emit()
@@ -281,10 +274,6 @@ class TTSEngine(QObject):
         engine.say(text)
         engine.runAndWait()
         engine.stop()
-
-    def restart_if_speaking(self):
-        """Kept for compat — no longer needed since VLC supports live speed."""
-        pass
 
     def stop(self):
         """Stop playback immediately."""

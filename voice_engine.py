@@ -145,33 +145,51 @@ class Transcriber(QObject):
         )
         thread.start()
 
+    def _run_transcribe(self, audio_data, use_vad):
+        """Run one transcription pass. With VAD on, silence is trimmed (kills
+        repeat/junk hallucinations); with VAD off, nothing is ever dropped."""
+        kwargs = dict(
+            language=self.language,
+            beam_size=1,
+            best_of=1,
+            temperature=0.0,
+            condition_on_previous_text=False,
+            word_timestamps=False,
+        )
+        if use_vad:
+            kwargs.update(
+                vad_filter=True,
+                vad_parameters=dict(min_silence_duration_ms=400),
+                no_speech_threshold=0.6,
+                compression_ratio_threshold=2.4,
+            )
+        segments, _info = self._model.transcribe(audio_data, **kwargs)
+        text_parts = []
+        for segment in segments:
+            if use_vad and getattr(segment, "no_speech_prob", 0.0) > 0.6:
+                continue
+            seg_text = segment.text.strip()
+            if seg_text:
+                text_parts.append(seg_text)
+        return " ".join(text_parts).strip()
+
     def _transcribe_worker(self, audio_data):
         try:
             with self._lock:
-                self.transcription_progress.emit("Transcribing...")
                 duration = len(audio_data) / 16000
                 max_amp = float(np.max(np.abs(audio_data)))
                 self.transcription_progress.emit(
                     f"Transcribing {duration:.1f}s audio (peak: {max_amp:.3f})..."
                 )
 
-                segments, info = self._model.transcribe(
-                    audio_data,
-                    language=self.language,
-                    beam_size=1,
-                    best_of=1,
-                    temperature=0.0,
-                    condition_on_previous_text=False,
-                    vad_filter=False,
-                    word_timestamps=False,
-                )
-                text_parts = []
-                for segment in segments:
-                    text_parts.append(segment.text.strip())
+                full_text = self._run_transcribe(audio_data, use_vad=True)
+                if not full_text:
+                    # VAD may have judged quiet/short speech as silence. Retry
+                    # without it so real audio is never lost ("voice not working").
+                    full_text = self._run_transcribe(audio_data, use_vad=False)
 
-                full_text = " ".join(text_parts)
-                if full_text.strip():
-                    self.transcription_ready.emit(full_text.strip())
+                if full_text:
+                    self.transcription_ready.emit(full_text)
                 else:
                     self.transcription_ready.emit("[No speech detected]")
         except Exception as e:
