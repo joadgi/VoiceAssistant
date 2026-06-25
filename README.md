@@ -5,11 +5,12 @@ A local Windows desktop app for voice dictation, screen text reading, and OCR �
 ## Features
 
 - **Push-to-talk dictation** — hold a hotkey, speak, release, and the transcription is pasted directly into whichever window had your cursor (Outlook, Word, Chrome, Slack, anything).
+- **Floating desktop pill** — an always-visible indicator (drag it anywhere) that shows Ready / Recording / Transcribing / Pasted, and can be **clicked to start and stop** dictation without a hotkey.
 - **Read highlighted text aloud** — highlight any text in any app, press a hotkey, and hear it read by a natural neural voice.
 - **OCR at cursor** — capture on-screen text from images, PDFs, error dialogs, or anything else you can't select, and have it read aloud.
 - **Real-time speed control** — drag the speed slider from 0.5x to 3.0x *while audio is playing* — no restart.
 - **Modern Microsoft neural voices** — Andrew, Brian, Christopher, Eric, Guy, Emma, Ava, Jenny, and more.
-- **Fully customizable hotkeys** — click any hotkey pill on the main window, press your preferred combo.
+- **Fully customizable hotkeys** — click any hotkey pill on the main window, then press a **single key (like F9) or a combo**. (The `Fn` key can't be bound — it's handled in keyboard firmware and never reaches Windows.)
 - **Local Whisper transcription** — `faster-whisper` on NVIDIA GPU (CUDA) with CPU fallback.
 
 ## Stack

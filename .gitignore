@@ -24,9 +24,11 @@ models/
 *.mp3
 *.wav
 
-# IDE
+# IDE / agent tooling
 .vscode/
 .idea/
+.agents/
+.codex/
 *.swp
 
 # OS
