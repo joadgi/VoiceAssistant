@@ -695,10 +695,10 @@ def paste_to_window(hwnd, text):
     The non-blocking lock stops a genuine re-entrant double-paste; we no longer
     impose a 1s cooldown, which used to swallow a legitimate fast second dictation.
     """
-    title = _window_title(hwnd)
+    # Privacy: log only handles/lengths here — never window titles or the
+    # actual dictated/clipboard text (debug.log persists on disk).
     fg = user32.GetForegroundWindow()
-    fg_title = _window_title(fg)
-    _dbg(f"paste_to_window ENTER  target_hwnd={hwnd} title={title!r}  current_fg={fg} title={fg_title!r}")
+    _dbg(f"paste_to_window ENTER  target_hwnd={hwnd}  current_fg={fg}")
 
     if not _paste_lock.acquire(blocking=False):
         _dbg("paste_to_window REJECTED — lock held")
@@ -709,7 +709,7 @@ def paste_to_window(hwnd, text):
             _dbg("  nothing left after sanitize, skipping paste")
             return False
         pyperclip.copy(text)
-        _dbg(f"  clipboard set to {text!r}")
+        _dbg(f"  clipboard set ({len(text)} chars)")
 
         # Wait until user has released modifier keys first
         for i in range(100):
@@ -724,7 +724,7 @@ def paste_to_window(hwnd, text):
         # the audible Windows beep on many controls.
         current_fg = user32.GetForegroundWindow()
         if current_fg != hwnd:
-            _dbg(f"  focus is on {current_fg} (title={_window_title(current_fg)!r}), refocusing target (no Esc)")
+            _dbg(f"  focus is on {current_fg}, refocusing target (no Esc)")
             if not set_foreground_window(hwnd):
                 _dbg("  set_foreground_window FAILED")
                 return False
@@ -1267,14 +1267,19 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _hotkey_press_handler(self):
-        """Hotkey pressed — start recording."""
-        _dbg(f"_hotkey_press_handler: ptt={self._ptt_active}  recording={self.recorder.is_recording}")
+        """Hotkey pressed — start recording.
+
+        NOTE: OS key-autorepeat re-fires this at ~30Hz for the whole time the
+        hotkey is held. Keep the debounce path silent and log only when we
+        actually act — the old per-repeat logging wrote to disk ~60x/sec on the
+        GUI thread and bloated debug.log by megabytes per session.
+        """
         now = time.monotonic()
         if now - self._last_hotkey_press_time < 0.25:
-            _dbg("  ignored duplicate hotkey press inside debounce window")
-            return
+            return  # autorepeat / double-fire — ignore silently
         self._last_hotkey_press_time = now
         if not self.recorder.is_recording and not self._ptt_active:
+            _dbg(f"_hotkey_press_handler: starting PTT")
             self._ptt_active = True
             self._on_record_from_hotkey()
 
@@ -1414,7 +1419,7 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _on_transcription_ready(self, text):
-        _dbg(f"_on_transcription_ready FIRED  text={text!r}")
+        _dbg(f"_on_transcription_ready FIRED  ({len(text)} chars)")
         # --- 1. Clean up Whisper duplicates and light filler/stutter artifacts ---
         text = self._dedupe_repeated(text)
         if self.config.get("light_cleanup", True):

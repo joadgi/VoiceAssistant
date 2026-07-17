@@ -7,8 +7,12 @@
 ## What this is
 
 A **local, private, Windows desktop dictation app** — and the dictation engine is the
-point. Everything runs on the user's own machine (GPU with CPU fallback); nothing is
-sent to the cloud. The goal is to be a faster, cleaner alternative to Wispr Flow.
+point. Dictation (Whisper) and OCR (EasyOCR) run entirely on the user's own machine
+(GPU with CPU fallback) — voice and screen contents never leave it. **Exception:**
+read-aloud's *neural* voices use Microsoft's online `edge-tts` service (selected text
+is sent to Microsoft for synthesis); the `pyttsx3` SAPI fallback is fully offline.
+Never describe the whole app as "nothing sent to the cloud" — scope the claim.
+The goal is to be a faster, cleaner alternative to Wispr Flow.
 
 Three features, in priority order:
 
@@ -71,9 +75,14 @@ live (no regeneration). Falls back to `pyttsx3` SAPI if neural/VLC fails.
   sources of an audible Windows "ding" on single-line/chat inputs.
 - **One hotkey-capture path** (`HotkeyCaptureWidget`): two earlier duplicate implementations
   and a dead inline-edit path were removed. Keep it to one.
-- **Single-key hotkeys allowed** (`validate_hotkey`): F-keys, Caps Lock, etc. are valid
-  alone; bare typing keys (letters/digits/space/punctuation) and bare modifiers are blocked
-  so a hotkey can't fire mid-sentence.
+- **Hotkeys are fully user-configurable — never hardcode them** (`validate_hotkey`):
+  every action's hotkey (Dictate / Read / OCR) is a per-user setting edited via the
+  capture pills and stored in `settings.json`; `DEFAULTS` are factory defaults only.
+  Valid: single safe keys (F-keys, Caps Lock…), normal combos, and **modifier-only
+  combos of 2+ modifiers** (e.g. `ctrl+alt` — a deliberate product decision for
+  hold-to-talk ergonomics; docs warn about AltGr on international layouts). Blocked
+  only where a binding would break basic function: bare typing keys (letters/digits/
+  space/punctuation — they'd fire mid-sentence), a single bare modifier, and `escape`.
 - **Push-to-talk** = `on_press_key(trigger)` that only fires when *all* combo keys are held,
   plus `on_release_key(trigger)` to stop. The release handler no-ops (and stays silent)
   unless PTT is active.

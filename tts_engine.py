@@ -3,7 +3,10 @@
 import threading
 import asyncio
 import tempfile
+import time
 import os
+import re
+import queue as _queue
 from PySide6.QtCore import QObject, Signal
 
 # Modern Microsoft neural voices (available via edge-tts)
@@ -138,8 +141,8 @@ class TTSEngine(QObject):
                     self.status.emit("Using offline TTS...")
                     self._speak_offline(text)
                 else:
-                    self.status.emit("Streaming neural speech...")
-                    self._stream_neural_to_vlc(text)
+                    self.status.emit("Generating neural speech...")
+                    self._synthesize_and_play(text)
                 self.status.emit("Speech complete")
             except Exception as e:
                 if not self._stop_event.is_set():
@@ -156,66 +159,116 @@ class TTSEngine(QObject):
                 self._speaking = False
                 self.speaking_finished.emit()
 
-    def _stream_neural_to_vlc(self, text):
-        """Stream edge-tts audio directly to file and start VLC playback ASAP."""
+    def _split_for_streaming(self, text):
+        """Break text into small chunks (sentences) so the first plays fast."""
+        text = text.strip()
+        if not text:
+            return []
+        pieces = re.split(r"(?<=[.!?])\s+", text)
+        chunks, buf = [], ""
+        for p in pieces:
+            p = p.strip()
+            if not p:
+                continue
+            buf = f"{buf} {p}".strip() if buf else p
+            if buf[-1] in ".!?" or len(buf) >= 160:
+                chunks.append(buf)
+                buf = ""
+        if buf:
+            chunks.append(buf)
+        # Hard-split any oversized chunk (e.g. no punctuation) on word boundaries.
+        out = []
+        for c in chunks:
+            while len(c) > 240:
+                cut = c.rfind(" ", 0, 240)
+                cut = cut if cut > 0 else 240
+                out.append(c[:cut].strip())
+                c = c[cut:].strip()
+            if c:
+                out.append(c)
+        return out
+
+    def _synthesize_and_play(self, text):
+        """Play the first sentence as soon as it downloads; fetch the rest in the
+        background. Each chunk is a COMPLETE file, so there's no mid-clip starvation
+        (the old glitch), and time-to-first-audio is just the first short sentence.
+        """
         import edge_tts
-        import time as _time
 
-        audio_path = os.path.join(self._temp_dir, "tts_stream.mp3")
-        # Clear any old content
-        open(audio_path, "wb").close()
+        chunks = self._split_for_streaming(text)
+        if not chunks:
+            return
 
-        first_chunk = threading.Event()
-        writer_done = threading.Event()
-        writer_error = [None]
+        audio_q = _queue.Queue()
+        producer_error = [None]
 
-        def stream_writer():
-            async def do_stream():
-                communicate = edge_tts.Communicate(text, self._voice_id)
-                with open(audio_path, "ab") as f:
-                    async for chunk in communicate.stream():
-                        if self._stop_event.is_set():
-                            return
-                        if chunk["type"] == "audio":
-                            f.write(chunk["data"])
-                            f.flush()
-                            if not first_chunk.is_set():
-                                first_chunk.set()
+        def producer():
+            async def gen():
+                for i, chunk in enumerate(chunks):
+                    if self._stop_event.is_set():
+                        return
+                    path = os.path.join(self._temp_dir, f"tts_{i}.mp3")
+                    communicate = edge_tts.Communicate(chunk, self._voice_id)
+                    with open(path, "wb") as f:
+                        async for ck in communicate.stream():
+                            if self._stop_event.is_set():
+                                return
+                            if ck["type"] == "audio":
+                                f.write(ck["data"])
+                    if os.path.getsize(path) > 0:
+                        audio_q.put(path)
 
             loop = asyncio.new_event_loop()
             try:
-                loop.run_until_complete(do_stream())
+                loop.run_until_complete(gen())
             except Exception as e:
-                writer_error[0] = e
+                producer_error[0] = e
             finally:
                 loop.close()
-                writer_done.set()
+                audio_q.put(None)  # sentinel: no more chunks
 
-        writer_thread = threading.Thread(target=stream_writer, daemon=True)
-        writer_thread.start()
+        threading.Thread(target=producer, daemon=True).start()
 
-        # Wait for first audio chunk to arrive (max 5s)
-        if not first_chunk.wait(timeout=5):
-            if writer_error[0]:
-                raise writer_error[0]
-            raise RuntimeError("Timed out waiting for TTS audio")
+        # Consume with a timeout so a stalled network can NEVER wedge this worker:
+        # edge-tts can connect and then hang without raising, in which case the
+        # producer's sentinel never arrives. A bounded get() + stop_event check
+        # keeps stop() responsive and lets the first-audio timeout raise into
+        # _speak_worker's fallback (pyttsx3) instead of blocking forever.
+        FIRST_AUDIO_TIMEOUT = 6.0   # no first chunk in time -> raise -> offline fallback
+        STALL_TIMEOUT = 30.0        # mid-stream stall -> truncate, don't re-read from top
+        played_any = False
+        wait_started = time.monotonic()
+        while not self._stop_event.is_set():
+            try:
+                path = audio_q.get(timeout=0.25)
+            except _queue.Empty:
+                limit = STALL_TIMEOUT if played_any else FIRST_AUDIO_TIMEOUT
+                if time.monotonic() - wait_started >= limit:
+                    if played_any:
+                        self.status.emit("Speech cut short (network stall)")
+                        return
+                    raise TimeoutError(
+                        f"Neural TTS produced no audio within {limit:.0f}s (network stall)"
+                    )
+                continue
+            if path is None:
+                break
+            if self._stop_event.is_set():
+                return
+            self.status.emit(f"Playing at {self._speed:.2f}x...")
+            self._play_vlc(path)
+            played_any = True
+            wait_started = time.monotonic()  # reset stall clock after each chunk
 
-        if self._stop_event.is_set():
-            return
+        if producer_error[0] and not played_any:
+            raise producer_error[0]
+        if producer_error[0] and played_any:
+            # Some sentences played but synthesis died mid-stream — say so
+            # instead of reporting a clean "Speech complete".
+            self.status.emit("Speech cut short (synthesis error)")
 
-        # Give writer a tiny head-start so VLC has enough data to decode
-        _time.sleep(0.08)
-
-        self.status.emit(f"Playing at {self._speed:.2f}x...")
-        self._play_vlc(audio_path, wait_for_writer=writer_done)
-
-    def _play_vlc(self, path, wait_for_writer=None):
-        """Play audio via VLC — supports real-time speed changes via set_rate.
-
-        If wait_for_writer is provided, it's an Event signaled when streaming is
-        complete. We need to keep the media "live" until then so VLC sees the
-        growing file.
-        """
+    def _play_vlc(self, path):
+        """Play a complete audio file via VLC, honoring stop + live speed changes."""
         if not self._vlc_player:
             self._init_vlc()
         if not self._vlc_player:
@@ -223,20 +276,19 @@ class TTSEngine(QObject):
 
         import vlc
         import time
-        # :file-caching=50 reduces startup latency
-        media = self._vlc_instance.media_new(path, ":file-caching=50")
+
+        media = self._vlc_instance.media_new(path)
         self._vlc_player.set_media(media)
         self._vlc_player.audio_set_volume(int(self._volume * 100))
         self._vlc_player.play()
 
-        # Wait for playback to actually begin (fast path ~50ms)
-        for _ in range(20):
+        # Wait for playback to actually begin, then apply the speed multiplier.
+        for _ in range(40):
             if self._vlc_player.is_playing():
                 break
             time.sleep(0.025)
         self._vlc_player.set_rate(self._speed)
 
-        # Playback loop — exit when stopped OR (ended AND writer done)
         while True:
             if self._stop_event.is_set():
                 self._vlc_player.stop()
@@ -245,23 +297,8 @@ class TTSEngine(QObject):
             if state == vlc.State.Error:
                 return
             if state in (vlc.State.Ended, vlc.State.Stopped):
-                # If still streaming, reload media to pick up new data
-                if wait_for_writer and not wait_for_writer.is_set():
-                    pos_ms = self._vlc_player.get_time()
-                    media2 = self._vlc_instance.media_new(path, ":file-caching=50")
-                    self._vlc_player.set_media(media2)
-                    self._vlc_player.play()
-                    for _ in range(20):
-                        if self._vlc_player.is_playing():
-                            break
-                        time.sleep(0.025)
-                    if pos_ms > 0:
-                        self._vlc_player.set_time(pos_ms)
-                    self._vlc_player.set_rate(self._speed)
-                    time.sleep(0.1)
-                    continue
                 break
-            time.sleep(0.1)
+            time.sleep(0.05)
 
     def _speak_offline(self, text):
         """Offline fallback using pyttsx3 SAPI."""

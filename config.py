@@ -82,8 +82,11 @@ def validate_hotkey(value):
         key = parts[0]
         # e.g. f1-f12, caps lock, right ctrl, insert, pause — fine alone.
         return key not in TYPING_KEYS and key not in MODIFIER_KEYS
-    # Multi-key combo: must include at least one non-modifier.
-    return any(part not in MODIFIER_KEYS for part in parts)
+    # Multi-key combo: valid if it has a real key (ctrl+shift+f9) OR is a combo
+    # of two or more modifiers held together (e.g. ctrl+alt).
+    if any(part not in MODIFIER_KEYS for part in parts):
+        return True
+    return all(part in MODIFIER_KEYS for part in parts) and len(parts) >= 2
 
 
 def sanitize_settings(data):
