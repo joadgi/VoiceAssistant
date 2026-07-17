@@ -149,10 +149,20 @@ class HotkeyCaptureWidget(QFrame):
             return
 
         mods = self._current_mods(modifiers)
+        # event.modifiers() does NOT reliably include the modifier key being
+        # pressed right now (Qt often reports the state BEFORE this key), so a
+        # modifier-only combo like ctrl+alt could otherwise register as just
+        # "ctrl" and be refused. Fold in the pressed modifier key explicitly.
+        _MODKEY = {
+            Qt.Key.Key_Control: "ctrl", Qt.Key.Key_Shift: "shift",
+            Qt.Key.Key_Alt: "alt", Qt.Key.Key_Meta: "windows",
+        }
+        if key in _MODKEY and _MODKEY[key] not in mods:
+            mods = mods + [_MODKEY[key]]
         self._held_mods = mods  # remember current set for release handling
 
         # If this is a modifier key itself, update the display and wait for more
-        if key in (Qt.Key.Key_Control, Qt.Key.Key_Shift, Qt.Key.Key_Alt, Qt.Key.Key_Meta):
+        if key in _MODKEY:
             self._show_in_progress(mods)
             return
 

@@ -97,3 +97,75 @@ def test_pill_menu_has_expected_actions(main_window):
     assert any("Read selection" in x for x in labels)
     assert any("Settings" in x for x in labels)
     assert any("Quit" in x for x in labels)
+
+
+# ---------------------------------------------------------------------------
+# The pill key-CAPTURE flow: pressing keys on a HotkeyCaptureWidget must
+# translate Qt key events into the right combo string (the literal
+# "change my hotkey" interaction). This is what the registration battery did
+# NOT cover — it tested downstream of capture.
+# ---------------------------------------------------------------------------
+class TestHotkeyCapture:
+    def _widget(self, qapp):
+        from voiceassistant.widgets import HotkeyCaptureWidget
+        w = HotkeyCaptureWidget("Dictate", "f9")
+        captured = []
+        w.hotkey_changed.connect(captured.append)
+        w._capturing = True  # what mousePressEvent does when you click the pill
+        return w, captured
+
+    def _press(self, w, key, mods):
+        from PySide6.QtCore import QEvent
+        from PySide6.QtGui import QKeyEvent
+        w.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, key, mods))
+
+    def _release(self, w, mods):
+        from PySide6.QtCore import QEvent
+        from PySide6.QtGui import QKeyEvent
+        w.keyReleaseEvent(QKeyEvent(QEvent.Type.KeyRelease, 0, mods))
+
+    def test_capture_combo_with_modifiers(self, qapp):
+        from PySide6.QtCore import Qt
+        w, captured = self._widget(qapp)
+        self._press(w, Qt.Key.Key_F9,
+                    Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier)
+        assert captured == ["ctrl+shift+f9"], captured
+
+    def test_capture_single_key(self, qapp):
+        from PySide6.QtCore import Qt
+        w, captured = self._widget(qapp)
+        self._press(w, Qt.Key.Key_F9, Qt.KeyboardModifier.NoModifier)
+        assert captured == ["f9"], captured
+
+    def test_capture_letter_combo(self, qapp):
+        from PySide6.QtCore import Qt
+        w, captured = self._widget(qapp)
+        self._press(w, Qt.Key.Key_R,
+                    Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier)
+        assert captured == ["ctrl+shift+r"], captured
+
+    def test_capture_modifier_only_combo(self, qapp):
+        # Josh's ctrl+alt: press both modifiers, release all -> saved on release.
+        from PySide6.QtCore import Qt
+        w, captured = self._widget(qapp)
+        self._press(w, Qt.Key.Key_Control, Qt.KeyboardModifier.ControlModifier)
+        self._press(w, Qt.Key.Key_Alt,
+                    Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.AltModifier)
+        assert captured == []  # nothing saved while still held
+        self._release(w, Qt.KeyboardModifier.NoModifier)
+        assert captured == ["ctrl+alt"], captured
+
+    def test_single_modifier_alone_not_saved(self, qapp):
+        # One bare modifier is not a usable hotkey — must NOT be captured.
+        from PySide6.QtCore import Qt
+        w, captured = self._widget(qapp)
+        self._press(w, Qt.Key.Key_Control, Qt.KeyboardModifier.ControlModifier)
+        self._release(w, Qt.KeyboardModifier.NoModifier)
+        assert captured == [], captured
+
+    def test_escape_cancels_capture(self, qapp):
+        from PySide6.QtCore import Qt
+        w, captured = self._widget(qapp)
+        self._press(w, Qt.Key.Key_Escape, Qt.KeyboardModifier.NoModifier)
+        assert captured == []
+        assert w._capturing is False  # capture ended, nothing emitted
