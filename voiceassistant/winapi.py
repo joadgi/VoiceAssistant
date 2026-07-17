@@ -29,6 +29,23 @@ def get_foreground_window():
     return user32.GetForegroundWindow()
 
 
+class _POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
+def get_cursor_pos():
+    """Cursor position in PHYSICAL screen pixels.
+
+    Qt6 makes the process per-monitor DPI aware, so GetCursorPos returns true
+    physical coordinates — the same space mss captures in. Qt's own
+    QCursor.pos() is in LOGICAL (scaled) coordinates and was the reason OCR
+    grabbed the wrong region on 125%/150% displays.
+    """
+    pt = _POINT()
+    user32.GetCursorPos(ctypes.byref(pt))
+    return pt.x, pt.y
+
+
 def is_window(hwnd):
     return bool(hwnd) and bool(user32.IsWindow(hwnd))
 

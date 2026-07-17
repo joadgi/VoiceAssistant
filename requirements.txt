@@ -1,13 +1,25 @@
+# Core (all backends local except edge-tts neural voices — see README Privacy)
 faster-whisper>=1.0.0
 PySide6>=6.6.0
 sounddevice>=0.4.6
 numpy>=1.24.0
-easyocr>=1.7.0
 mss>=9.0.0
 pyttsx3>=2.90
 keyboard>=0.13.5
 pyperclip>=1.8.2
 Pillow>=10.0.0
+winsdk>=1.0.0
 
+# Neural read-aloud (online) + playback
 edge-tts>=7.0.0
 python-vlc>=3.0.0
+
+# GPU transcription runtime for CTranslate2/faster-whisper (skip on CPU-only
+# machines — the app falls back to CPU int8 automatically).
+nvidia-cublas-cu12; sys_platform == "win32"
+nvidia-cudnn-cu12; sys_platform == "win32"
+
+# OPTIONAL fallback OCR backend. The default is the Windows-native engine
+# (zero extra deps). Only install easyocr if you need it — it pulls the
+# multi-GB PyTorch stack:
+#   pip install easyocr

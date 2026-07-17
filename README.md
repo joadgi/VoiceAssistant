@@ -24,7 +24,7 @@ A local Windows desktop app for voice dictation, screen text reading, and OCR.
 | Text-to-speech | `edge-tts` (streaming neural voices — **online** Microsoft service); `pyttsx3` SAPI offline fallback |
 | Audio playback | VLC (via `python-vlc`) — for real-time speed control |
 | Screen capture | `mss` |
-| OCR | EasyOCR (GPU-accelerated) |
+| OCR | **Windows-native OCR** (the same engine PowerToys Text Extractor uses — instant, no downloads); EasyOCR available as an optional fallback |
 | Global hotkeys | `keyboard` |
 | Clipboard | `pyperclip` + raw Win32 `keybd_event` |
 
@@ -43,14 +43,17 @@ cd VoiceAssistant
 setup.bat
 ```
 
-This creates a Python virtual environment, installs PyTorch with CUDA support, and pulls all dependencies.
+This creates a Python virtual environment and pulls all dependencies (~600 MB —
+no PyTorch needed; OCR uses the Windows-native engine and Whisper-GPU uses the
+slim NVIDIA runtime wheels).
 
 **Run:**
 ```powershell
 run.bat
 ```
 
-Or double-click `run.bat` in File Explorer. First launch downloads Whisper + EasyOCR models (~1 GB, one-time).
+Or double-click `run.bat` in File Explorer. First launch downloads the Whisper
+speech model (one-time). OCR needs no download — it's built into Windows.
 
 ## Project Structure
 

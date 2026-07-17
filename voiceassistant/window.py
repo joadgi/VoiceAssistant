@@ -64,6 +64,7 @@ class MainWindow(QMainWindow):
         self.ocr = OCREngine(
             languages=self.config["ocr_languages"],
             gpu=self.config["ocr_gpu"],
+            backend=self.config.get("ocr_backend", "auto"),
         )
         self.tts = TTSEngine(
             rate=self.config["tts_rate"],
@@ -111,7 +112,7 @@ class MainWindow(QMainWindow):
         self._setup_tray()
         self._setup_show_request_timer()
         winapi.set_start_with_windows(
-            self.config.get("start_with_windows", True), self._entry_script
+            self.config.get("start_with_windows"), self._entry_script
         )
         self._apply_window_flags()
 
@@ -138,9 +139,17 @@ class MainWindow(QMainWindow):
         voice_group = QGroupBox("Voice")
         voice_lay = QHBoxLayout(voice_group)
 
-        self.btn_record = QPushButton("  Record")
+        # Honest label: unlike the hotkey/pill flow, this button records into
+        # the panel below and deliberately does NOT paste anywhere (you
+        # clicked into this window, so there is no target). It doubles as the
+        # mic test.
+        self.btn_record = QPushButton("  Record to Panel")
         self.btn_record.setObjectName("btn_record")
-        self.btn_record.setToolTip(f"Start recording ({self.config['hotkey_record']})")
+        self.btn_record.setToolTip(
+            "Record and transcribe into the panel below (mic test).\n"
+            f"To dictate into another app, hold {self.config['hotkey_record']} "
+            "there or click the floating pill."
+        )
 
         self.btn_stop = QPushButton("  Stop")
         self.btn_stop.setObjectName("btn_stop")
@@ -177,16 +186,10 @@ class MainWindow(QMainWindow):
         top_row.addWidget(screen_group, 1)
         root_layout.addLayout(top_row)
 
-        # ---- Model selector ----
+        # ---- Model status (the model SELECTOR lives in Settings — its one
+        # home; it used to be duplicated here and in the dialog) ----
         model_row = QHBoxLayout()
-        model_row.addWidget(QLabel("Whisper Model:"))
-        self.model_combo = QComboBox()
-        for m in ["tiny", "base", "small", "medium", "large-v3"]:
-            self.model_combo.addItem(m)
-        self.model_combo.setCurrentText(self.config["whisper_model"])
-        model_row.addWidget(self.model_combo)
         model_row.addStretch()
-
         self.label_model_status = QLabel("Loading...")
         self.label_model_status.setStyleSheet("color: #f9e2af; font-weight: bold;")
         model_row.addWidget(self.label_model_status)
@@ -343,7 +346,6 @@ class MainWindow(QMainWindow):
         self.btn_clear.clicked.connect(self._on_clear)
         self.btn_speak_toggle.clicked.connect(self._on_speak_toggle)
         self.btn_settings.clicked.connect(self._on_settings)
-        self.model_combo.currentTextChanged.connect(self._on_model_change)
 
         self.voice_combo.currentIndexChanged.connect(self._on_voice_change)
         self.speed_slider.valueChanged.connect(self._on_speed_change)
@@ -609,8 +611,7 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _on_ocr_ready(self):
-        gpu_str = "GPU" if self.ocr.gpu else "CPU"
-        self._update_status(f"Ready  |  OCR engine loaded ({gpu_str})")
+        self._update_status(f"Ready  |  OCR engine loaded ({self.ocr.describe()})")
 
     @Slot(object)
     def _on_transcription_ready(self, result):
@@ -794,12 +795,14 @@ class MainWindow(QMainWindow):
                 break
             time.sleep(0.005)
 
-        # Give Windows a moment in case Start menu opened, then close it via Esc.
-        # (Escape is only needed for Windows-key hotkeys; scoping it further is
-        # a Phase 4 item — see M2.)
-        time.sleep(0.05)
-        winapi.send_escape()
-        time.sleep(0.05)
+        # Escape is ONLY needed when the hotkey involves the Windows key (to
+        # dismiss the Start menu it opened). Injecting Esc into an ordinary
+        # target app deselects text in spreadsheets/editors (breaking the
+        # copy) and can trigger the Windows "ding" — never send it otherwise.
+        if "windows" in self.config["hotkey_read_aloud"].lower():
+            time.sleep(0.05)
+            winapi.send_escape()
+            time.sleep(0.05)
 
         # Refocus the target window (where the user had text selected)
         target = self._read_target_hwnd
@@ -940,7 +943,6 @@ class MainWindow(QMainWindow):
 
             if vals["whisper_model"] != self.config["whisper_model"]:
                 self.config.set("whisper_model", vals["whisper_model"])
-                self.model_combo.setCurrentText(vals["whisper_model"])
                 self.transcriber.change_model(vals["whisper_model"])
 
             self.config.set("whisper_language", vals["whisper_language"])
@@ -959,12 +961,6 @@ class MainWindow(QMainWindow):
             self._apply_window_flags()
 
             self.config.save()
-
-    @Slot(str)
-    def _on_model_change(self, model_name):
-        if model_name != self.transcriber.model_size:
-            self.config.set("whisper_model", model_name)
-            self.transcriber.change_model(model_name)
 
     # -----------------------------------------------------------------------
     # Helpers

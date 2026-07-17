@@ -29,7 +29,7 @@ Three features, in priority order:
 | Voice-to-text | `faster-whisper` (CTranslate2 Whisper) on CUDA, CPU fallback |
 | Text-to-speech | `edge-tts` streaming neural voices → VLC playback (live speed); `pyttsx3` SAPI offline fallback |
 | Screen capture | `mss` |
-| OCR | EasyOCR (GPU, CPU fallback) |
+| OCR | **Windows-native `Windows.Media.Ocr`** via `winsdk` (default — ~10ms, zero heavy deps; DPI-correct physical-pixel capture); EasyOCR optional fallback (`pip install easyocr`, pulls the multi-GB torch stack) |
 | Global hotkeys | `keyboard` |
 | Paste/copy | `pyperclip` + raw Win32 `keybd_event` (via `ctypes`) |
 
@@ -113,9 +113,18 @@ live (no regeneration). Falls back to `pyttsx3` SAPI if neural/VLC fails.
   Windows, so no software can capture it. Recommend an F-key (F9) instead.
 - Avoid **Windows-key** hotkeys (OS intercepts them) and common browser combos (`Ctrl+T/W/R`).
 - **VLC must be installed** for neural TTS playback (`winget install VideoLAN.VLC`).
-- `settings.json` and `debug.log` are **gitignored** (local runtime state). Internal tuning
-  knobs (`min_record_seconds`, `min_record_peak`) live in both `DEFAULTS` and `settings.json`.
-- Whisper + EasyOCR models download on first run (~1 GB) and are cached outside the repo.
+- `settings.json`, `debug.log`, and `crash.log` are **gitignored** (local runtime state).
+  Internal tuning knobs (`min_record_seconds`, `min_record_peak`) live in both `DEFAULTS`
+  and `settings.json`. Debug logging is opt-in (`debug_logging`, default off).
+- The Whisper model downloads on first run (one-time, cached outside the repo). The
+  default OCR backend is Windows-native — no model download, no PyTorch. **PyTorch is
+  no longer a dependency** (it only ever served EasyOCR); Whisper-GPU gets its CUDA
+  runtime from the `nvidia-cublas-cu12`/`nvidia-cudnn-cu12` wheels (see
+  `Transcriber._add_nvidia_dll_dirs`).
+- **TTS dependency decision (2026-07-17):** Piper (fully local neural TTS) was evaluated
+  as an edge-tts replacement and DEFERRED — edge-tts voice quality is materially better,
+  the offline-private option already exists (SAPI fallback), and live speed control
+  depends on VLC either way. Revisit if/when packaging for distribution.
 
 ## Setup & run
 

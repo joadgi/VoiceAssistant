@@ -36,6 +36,8 @@ DEFAULTS = {
 
     "ocr_languages": ["en"],
     "ocr_gpu": True,
+    # "auto" = Windows-native OCR (fast, zero heavy deps), EasyOCR fallback.
+    "ocr_backend": "auto",
     "screen_capture_width": 600,
     "screen_capture_height": 300,
 
@@ -49,7 +51,9 @@ DEFAULTS = {
     "auto_paste": True,
 
     "always_on_top": False,
-    "start_with_windows": True,
+    # Release-safe default: never silently register OS auto-start — the user
+    # opts in via Settings. (Existing users' saved True persists untouched.)
+    "start_with_windows": False,
     "start_minimized": True,
     "dark_mode": True,
     "font_size": 13,
@@ -98,8 +102,20 @@ def validate_hotkey(value):
         return False
     if len(parts) == 1:
         key = parts[0]
-        # e.g. f1-f12, caps lock, right ctrl, insert, pause — fine alone.
-        return key not in TYPING_KEYS and key not in MODIFIER_KEYS
+        if key in TYPING_KEYS or key in MODIFIER_KEYS:
+            return False
+        # e.g. f1-f12, caps lock, right ctrl, insert, pause — fine alone,
+        # but it must be a key the keyboard library can actually bind
+        # ("banana" used to validate and then silently fail to register).
+        try:
+            import keyboard as _kb
+
+            _kb.key_to_scan_codes(key)
+            return True
+        except (ValueError, ImportError):
+            return False
+        except Exception:
+            return True  # unexpected lookup failure: don't block the user
     # Multi-key combo: valid if it has a real key (ctrl+shift+f9) OR is a combo
     # of two or more modifiers held together (e.g. ctrl+alt).
     if any(part not in MODIFIER_KEYS for part in parts):

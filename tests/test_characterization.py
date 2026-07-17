@@ -240,15 +240,15 @@ class TestHotkeys:
         assert not validate_hotkey("")
         assert not validate_hotkey(None)
 
-    def test_unknown_single_token_accepted_CURRENT_BEHAVIOR(self):
-        # KNOWN GAP (L11, tightened in Phase 4): validate_hotkey accepts ANY
-        # unknown single token ("banana", "f13", even a whole garbage string
-        # that contains no '+') because it is neither a typing key nor a
-        # modifier. Registration fails gracefully at runtime (caught per-key,
-        # status message shown) so this cannot crash startup — but sanitize
-        # does NOT reset it.
-        assert validate_hotkey("banana")
-        assert validate_hotkey("not a real key combo +++")  # -> one token
+    def test_unknown_single_token_rejected_FIXED_L11(self):
+        # Phase 4 fix: a single key must be one the keyboard library can
+        # actually bind — "banana" used to validate and then silently fail
+        # to register at runtime.
+        assert not validate_hotkey("banana")
+        assert not validate_hotkey("not a real key combo +++")
+        # Real bindable single keys still pass.
+        assert validate_hotkey("f9")
+        assert validate_hotkey("caps lock")
 
     def test_sanitize_settings_resets_rule_invalid_hotkey(self):
         data = dict(DEFAULTS)

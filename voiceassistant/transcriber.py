@@ -57,9 +57,38 @@ class Transcriber(QObject):
         """Load the Whisper model on the transcriber worker."""
         self._worker.submit(self._load_job)
 
+    @staticmethod
+    def _add_nvidia_dll_dirs():
+        """Make CTranslate2's CUDA path work WITHOUT PyTorch installed.
+
+        Historically the cuBLAS/cuDNN DLLs came along for the ride with the
+        ~3GB torch install (which only EasyOCR needed). With the native OCR
+        backend, new installs get the slim NVIDIA runtime wheels instead
+        (nvidia-cublas-cu12 / nvidia-cudnn-cu12) — this registers their bin
+        dirs. Harmless no-op when the wheels (or torch) provide DLLs already.
+        """
+        import importlib.util
+        import os
+
+        for mod in ("nvidia.cublas", "nvidia.cudnn"):
+            try:
+                spec = importlib.util.find_spec(mod)
+            except (ImportError, ModuleNotFoundError, ValueError):
+                continue
+            if spec and spec.submodule_search_locations:
+                for loc in spec.submodule_search_locations:
+                    bin_dir = os.path.join(loc, "bin")
+                    if os.path.isdir(bin_dir):
+                        try:
+                            os.add_dll_directory(bin_dir)
+                        except OSError:
+                            pass
+
     def _load_job(self):
         try:
             self.model_loading.emit(f"Loading Whisper {self.model_size} model...")
+            if self.device == "cuda":
+                self._add_nvidia_dll_dirs()
             from faster_whisper import WhisperModel
 
             self._model = WhisperModel(

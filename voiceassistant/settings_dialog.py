@@ -100,7 +100,7 @@ class SettingsDialog(QDialog):
         layout.addRow(self.aot_check)
 
         self.startup_check = QCheckBox("Start with Windows")
-        self.startup_check.setChecked(self.config.get("start_with_windows", True))
+        self.startup_check.setChecked(self.config.get("start_with_windows"))
         layout.addRow(self.startup_check)
 
         self.start_minimized_check = QCheckBox("Start minimized to tray")

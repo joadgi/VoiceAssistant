@@ -37,6 +37,7 @@ class VoiceRecorder(QObject):
             return
         self._is_recording = True
         self._audio_queue = queue.Queue()
+        self._overflow_count = 0
 
         try:
             dev = self.device if self.device and self.device >= 0 else None
@@ -78,6 +79,14 @@ class VoiceRecorder(QObject):
             if err is not None:
                 self.error.emit(f"Microphone stop error: {err}")
 
+        if getattr(self, "_overflow_count", 0):
+            from . import applog
+
+            applog.error(
+                f"audio input overflow x{self._overflow_count} during recording "
+                "(dropped samples — system under load?)"
+            )
+
         chunks = []
         while not self._audio_queue.empty():
             chunks.append(self._audio_queue.get())
@@ -90,6 +99,10 @@ class VoiceRecorder(QObject):
 
     def _audio_callback(self, indata, frames, time_info, status):
         if self._is_recording:
+            if status:
+                # Input overflow = dropped samples (gappy audio). Count here
+                # (audio-rate callback — never log per-block), surface at stop.
+                self._overflow_count += 1
             self._audio_queue.put(indata.copy())
             rms = float(np.sqrt(np.mean(indata ** 2)))
             self.level_update.emit(rms)
