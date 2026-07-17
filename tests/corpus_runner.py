@@ -1,0 +1,143 @@
+"""Golden-audio corpus runner — drives the REAL dictation pipeline end-to-end.
+
+Replicates exactly what the app does to a recorded buffer:
+  1. the recording gate (min_record_seconds / min_record_peak) from config,
+  2. Transcriber._run_transcribe(vad=True), retry without VAD when empty
+     (verbatim logic from Transcriber._transcribe_worker),
+  3. the post-processing chain (_dedupe_repeated -> _light_cleanup).
+
+Modes:
+  python tests/corpus_runner.py baseline   # record current behavior -> baseline.json
+  python tests/corpus_runner.py run        # run + print, no file written
+Import `run_corpus()` from tests for assertions (Phase 2 corpus gate).
+"""
+
+import os
+import sys
+import json
+import time
+import wave
+
+import numpy as np
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+
+AUDIO_DIR = os.path.join(ROOT, "tests", "fixtures", "audio")
+BASELINE_PATH = os.path.join(ROOT, "tests", "fixtures", "baseline.json")
+
+
+def load_wav(path):
+    with wave.open(path, "rb") as w:
+        assert w.getframerate() == 16000 and w.getnchannels() == 1
+        raw = w.readframes(w.getnframes())
+    return np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+
+
+def build_transcriber():
+    """Load the model the same way the app does (CUDA -> CPU int8 fallback)."""
+    from config import DEFAULTS
+    from voice_engine import Transcriber
+
+    t = Transcriber(
+        model_size=DEFAULTS["whisper_model"],
+        device=DEFAULTS["whisper_device"],
+        compute_type=DEFAULTS["whisper_compute_type"],
+        language=DEFAULTS["whisper_language"],
+    )
+    from faster_whisper import WhisperModel
+
+    try:
+        t._model = WhisperModel(t.model_size, device=t.device, compute_type=t.compute_type)
+    except Exception as e:
+        print(f"  GPU load failed ({e.__class__.__name__}); CPU int8 fallback")
+        t._model = WhisperModel(t.model_size, device="cpu", compute_type="int8")
+        t.device, t.compute_type = "cpu", "int8"
+    return t
+
+
+def app_pipeline(transcriber, audio):
+    """The app's transcribe path, verbatim (worker logic + retry)."""
+    t0 = time.perf_counter()
+    text_vad = transcriber._run_transcribe(audio, use_vad=True)
+    t1 = time.perf_counter()
+    retried = False
+    text_final = text_vad
+    if not text_vad:
+        retried = True
+        text_final = transcriber._run_transcribe(audio, use_vad=False)
+    t2 = time.perf_counter()
+    return {
+        "raw_vad": text_vad,
+        "retried_no_vad": retried,
+        "raw_final": text_final if text_final else "[No speech detected]",
+        "vad_pass_ms": round((t1 - t0) * 1000),
+        "total_ms": round((t2 - t0) * 1000),
+    }
+
+
+def post_process(text):
+    """The app's cleanup chain from _on_transcription_ready."""
+    from main import MainWindow
+
+    text = MainWindow._dedupe_repeated(None, text)
+    text = MainWindow._light_cleanup(None, text)
+    return text
+
+
+def gate_decision(audio):
+    """The app's silent-drop gate from _on_recording_stopped."""
+    from config import DEFAULTS
+
+    duration = len(audio) / 16000.0 if len(audio) else 0.0
+    peak = float(np.max(np.abs(audio))) if len(audio) else 0.0
+    rms = float(np.sqrt(np.mean(audio**2))) if len(audio) else 0.0
+    passes = duration >= float(DEFAULTS["min_record_seconds"]) and peak >= float(
+        DEFAULTS["min_record_peak"]
+    )
+    return {
+        "duration_s": round(duration, 2),
+        "peak": round(peak, 4),
+        "rms": round(rms, 4),
+        "passes_gate": passes,
+    }
+
+
+def run_corpus(transcriber=None):
+    transcriber = transcriber or build_transcriber()
+    results = {}
+    fixtures = sorted(f for f in os.listdir(AUDIO_DIR) if f.endswith(".wav"))
+    for name in fixtures:
+        audio = load_wav(os.path.join(AUDIO_DIR, name))
+        entry = gate_decision(audio)
+        if entry["passes_gate"]:
+            entry.update(app_pipeline(transcriber, audio))
+            entry["cleaned"] = post_process(entry["raw_final"])
+        else:
+            entry["raw_final"] = None
+            entry["cleaned"] = None
+        results[name] = entry
+        shown = entry["cleaned"] if entry["passes_gate"] else "(dropped by gate)"
+        print(f"  {name:38s} -> {shown!r}")
+    meta = {
+        "model": transcriber.model_size,
+        "device": transcriber.device,
+        "compute_type": transcriber.compute_type,
+    }
+    return {"meta": meta, "results": results}
+
+
+def main():
+    mode = sys.argv[1] if len(sys.argv) > 1 else "run"
+    print("Loading Whisper model...")
+    t = build_transcriber()
+    print(f"Model: {t.model_size} on {t.device} ({t.compute_type})\n")
+    data = run_corpus(t)
+    if mode == "baseline":
+        with open(BASELINE_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        print(f"\nBaseline written to {BASELINE_PATH}")
+
+
+if __name__ == "__main__":
+    main()

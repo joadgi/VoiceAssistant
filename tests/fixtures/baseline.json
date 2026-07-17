@@ -1,0 +1,137 @@
+{
+  "meta": {
+    "model": "medium",
+    "device": "cuda",
+    "compute_type": "float16"
+  },
+  "results": {
+    "breath_click_0p35s.wav": {
+      "duration_s": 0.63,
+      "peak": 0.05,
+      "rms": 0.0041,
+      "passes_gate": true,
+      "raw_vad": "",
+      "retried_no_vad": true,
+      "raw_final": "you",
+      "vad_pass_ms": 168,
+      "total_ms": 662,
+      "cleaned": "You."
+    },
+    "intentional_no_no_no.wav": {
+      "duration_s": 1.54,
+      "peak": 0.3,
+      "rms": 0.0365,
+      "passes_gate": true,
+      "raw_vad": "No no no.",
+      "retried_no_vad": false,
+      "raw_final": "No no no.",
+      "vad_pass_ms": 256,
+      "total_ms": 256,
+      "cleaned": "No."
+    },
+    "long_paragraph_trailing_silence.wav": {
+      "duration_s": 10.79,
+      "peak": 0.3,
+      "rms": 0.0241,
+      "passes_gate": true,
+      "raw_vad": "Here is the first point. The second point follows from it. Finally, the third point wraps everything up.",
+      "retried_no_vad": false,
+      "raw_final": "Here is the first point. The second point follows from it. Finally, the third point wraps everything up.",
+      "vad_pass_ms": 433,
+      "total_ms": 433,
+      "cleaned": "Here is the first point. The second point follows from it. Finally, the third point wraps everything up."
+    },
+    "normal_sentence.wav": {
+      "duration_s": 4.41,
+      "peak": 0.3,
+      "rms": 0.032,
+      "passes_gate": true,
+      "raw_vad": "The quarterly report is ready for review and the numbers look strong.",
+      "retried_no_vad": false,
+      "raw_final": "The quarterly report is ready for review and the numbers look strong.",
+      "vad_pass_ms": 336,
+      "total_ms": 336,
+      "cleaned": "The quarterly report is ready for review and the numbers look strong."
+    },
+    "numbers_dates.wav": {
+      "duration_s": 4.11,
+      "peak": 0.3,
+      "rms": 0.0302,
+      "passes_gate": true,
+      "raw_vad": "The meeting is on July 21 at 3.30 pm.",
+      "retried_no_vad": false,
+      "raw_final": "The meeting is on July 21 at 3.30 pm.",
+      "vad_pass_ms": 278,
+      "total_ms": 278,
+      "cleaned": "The meeting is on July 21 at 3.30 pm."
+    },
+    "quiet_yes.wav": {
+      "duration_s": 1.27,
+      "peak": 0.02,
+      "rms": 0.0013,
+      "passes_gate": true,
+      "raw_vad": "Yes.",
+      "retried_no_vad": false,
+      "raw_final": "Yes.",
+      "vad_pass_ms": 225,
+      "total_ms": 225,
+      "cleaned": "Yes."
+    },
+    "repeat_phrase_x2.wav": {
+      "duration_s": 3.88,
+      "peak": 0.3,
+      "rms": 0.0256,
+      "passes_gate": true,
+      "raw_vad": "Send a file. Send a file.",
+      "retried_no_vad": false,
+      "raw_final": "Send a file. Send a file.",
+      "vad_pass_ms": 261,
+      "total_ms": 261,
+      "cleaned": "Send a file."
+    },
+    "room_noise_3s.wav": {
+      "duration_s": 3.0,
+      "peak": 0.03,
+      "rms": 0.006,
+      "passes_gate": true,
+      "raw_vad": "",
+      "retried_no_vad": true,
+      "raw_final": "[No speech detected]",
+      "vad_pass_ms": 6,
+      "total_ms": 195,
+      "cleaned": "[No speech detected]"
+    },
+    "room_noise_quiet_3s.wav": {
+      "duration_s": 3.0,
+      "peak": 0.009,
+      "rms": 0.002,
+      "passes_gate": true,
+      "raw_vad": "",
+      "retried_no_vad": true,
+      "raw_final": "[No speech detected]",
+      "vad_pass_ms": 6,
+      "total_ms": 200,
+      "cleaned": "[No speech detected]"
+    },
+    "silence_2s.wav": {
+      "duration_s": 2.0,
+      "peak": 0.0,
+      "rms": 0.0,
+      "passes_gate": false,
+      "raw_final": null,
+      "cleaned": null
+    },
+    "stutter_the_x3.wav": {
+      "duration_s": 3.83,
+      "peak": 0.3,
+      "rms": 0.0217,
+      "passes_gate": true,
+      "raw_vad": "Buh. Buh. Buh.",
+      "retried_no_vad": false,
+      "raw_final": "Buh. Buh. Buh.",
+      "vad_pass_ms": 269,
+      "total_ms": 269,
+      "cleaned": "Buh."
+    }
+  }
+}
