@@ -2,9 +2,29 @@
 
 import threading
 import queue
+from dataclasses import dataclass
+from typing import Any
+
 import numpy as np
 import sounddevice as sd
 from PySide6.QtCore import QObject, Signal
+
+
+@dataclass
+class TranscriptionResult:
+    """One completed transcription job.
+
+    The job carries its own context (e.g. the target HWND captured at record
+    time) so overlapping dictations can never read each other's state — the
+    old shared `_target_hwnd` field was a confirmed wrong-window-paste race.
+    """
+
+    text: str
+    job_id: int
+    context: Any = None      # opaque app payload (dictation: target HWND or None)
+    duration_s: float = 0.0
+    retried: bool = False    # True if the no-VAD retry produced this text
+    no_speech: bool = False  # True if both passes found nothing
 
 
 class VoiceRecorder(QObject):
@@ -54,10 +74,23 @@ class VoiceRecorder(QObject):
             return
         self._is_recording = False
 
-        if self._stream is not None:
-            self._stream.stop()
-            self._stream.close()
-            self._stream = None
+        # Guarded teardown: PortAudio raises here if the device vanished
+        # mid-recording (USB mic unplugged). That must never prevent the
+        # recording_stopped emit below — an unemitted stop wedged the whole
+        # dictation state machine (stuck "Recording" pill) and lost the audio.
+        stream, self._stream = self._stream, None
+        if stream is not None:
+            err = None
+            try:
+                stream.stop()
+            except Exception as e:
+                err = e
+            try:
+                stream.close()  # must run even when stop() raised
+            except Exception as e:
+                err = err or e
+            if err is not None:
+                self.error.emit(f"Microphone stop error: {err}")
 
         chunks = []
         while not self._audio_queue.empty():
@@ -81,7 +114,7 @@ class Transcriber(QObject):
 
     model_loading = Signal(str)  # status message
     model_ready = Signal()
-    transcription_ready = Signal(str)
+    transcription_ready = Signal(object)  # emits TranscriptionResult
     transcription_progress = Signal(str)  # partial results
     error = Signal(str)
 
@@ -93,6 +126,7 @@ class Transcriber(QObject):
         self.language = language
         self._model = None
         self._lock = threading.Lock()
+        self._job_seq = 0  # monotonic job ids (replaces the id(audio) guard)
 
     @property
     def is_loaded(self):
@@ -131,8 +165,13 @@ class Transcriber(QObject):
             except Exception as e2:
                 self.error.emit(f"Failed to load model: {e2}")
 
-    def transcribe(self, audio_data):
-        """Transcribe audio in a background thread."""
+    def transcribe(self, audio_data, context=None):
+        """Transcribe audio in a background thread.
+
+        `context` is carried through to the TranscriptionResult untouched —
+        the dictation flow passes the target HWND captured at record time so
+        the result can never paste into a window captured for a later job.
+        """
         if not self.is_loaded:
             self.error.emit("Model not loaded yet")
             return
@@ -140,14 +179,25 @@ class Transcriber(QObject):
             self.error.emit("No audio recorded")
             return
 
+        self._job_seq += 1
         thread = threading.Thread(
-            target=self._transcribe_worker, args=(audio_data,), daemon=True
+            target=self._transcribe_worker,
+            args=(audio_data, context, self._job_seq),
+            daemon=True,
         )
         thread.start()
 
     def _run_transcribe(self, audio_data, use_vad):
-        """Run one transcription pass. With VAD on, silence is trimmed (kills
-        repeat/junk hallucinations); with VAD off, nothing is ever dropped."""
+        """Run one transcription pass.
+
+        With VAD on, silence is trimmed (kills repeat/junk hallucinations);
+        with VAD off, nothing is ever dropped. The anti-hallucination guards
+        (no_speech/compression thresholds + the per-segment no_speech_prob
+        filter) apply to BOTH passes — the no-VAD retry fires on exactly the
+        silence/short/quiet case, which is where Whisper invents text, so the
+        retry needs the guards the most. (Confirmed live: unguarded retry
+        turned a 0.35s breath/click into "you" — see tests/fixtures/baseline.)
+        """
         kwargs = dict(
             language=self.language,
             beam_size=1,
@@ -155,25 +205,25 @@ class Transcriber(QObject):
             temperature=0.0,
             condition_on_previous_text=False,
             word_timestamps=False,
+            no_speech_threshold=0.6,
+            compression_ratio_threshold=2.4,
         )
         if use_vad:
             kwargs.update(
                 vad_filter=True,
                 vad_parameters=dict(min_silence_duration_ms=400),
-                no_speech_threshold=0.6,
-                compression_ratio_threshold=2.4,
             )
         segments, _info = self._model.transcribe(audio_data, **kwargs)
         text_parts = []
         for segment in segments:
-            if use_vad and getattr(segment, "no_speech_prob", 0.0) > 0.6:
+            if getattr(segment, "no_speech_prob", 0.0) > 0.6:
                 continue
             seg_text = segment.text.strip()
             if seg_text:
                 text_parts.append(seg_text)
         return " ".join(text_parts).strip()
 
-    def _transcribe_worker(self, audio_data):
+    def _transcribe_worker(self, audio_data, context, job_id):
         try:
             with self._lock:
                 duration = len(audio_data) / 16000
@@ -182,16 +232,25 @@ class Transcriber(QObject):
                     f"Transcribing {duration:.1f}s audio (peak: {max_amp:.3f})..."
                 )
 
+                retried = False
                 full_text = self._run_transcribe(audio_data, use_vad=True)
                 if not full_text:
                     # VAD may have judged quiet/short speech as silence. Retry
-                    # without it so real audio is never lost ("voice not working").
+                    # without it so real audio is never lost ("voice not
+                    # working") — with the shared segment guards still active.
+                    retried = True
                     full_text = self._run_transcribe(audio_data, use_vad=False)
 
-                if full_text:
-                    self.transcription_ready.emit(full_text)
-                else:
-                    self.transcription_ready.emit("[No speech detected]")
+                self.transcription_ready.emit(
+                    TranscriptionResult(
+                        text=full_text,
+                        job_id=job_id,
+                        context=context,
+                        duration_s=duration,
+                        retried=retried,
+                        no_speech=not full_text,
+                    )
+                )
         except Exception as e:
             self.error.emit(f"Transcription error: {e}")
 

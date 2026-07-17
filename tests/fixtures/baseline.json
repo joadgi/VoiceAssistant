@@ -12,10 +12,12 @@
       "passes_gate": true,
       "raw_vad": "",
       "retried_no_vad": true,
-      "raw_final": "you",
-      "vad_pass_ms": 168,
-      "total_ms": 662,
-      "cleaned": "You."
+      "raw_final": "",
+      "vad_pass_ms": 89,
+      "total_ms": 563,
+      "cleaned": null,
+      "would_paste": false,
+      "verdict": "no_speech"
     },
     "intentional_no_no_no.wav": {
       "duration_s": 1.54,
@@ -25,9 +27,11 @@
       "raw_vad": "No no no.",
       "retried_no_vad": false,
       "raw_final": "No no no.",
-      "vad_pass_ms": 256,
-      "total_ms": 256,
-      "cleaned": "No."
+      "vad_pass_ms": 252,
+      "total_ms": 252,
+      "cleaned": "No no no.",
+      "would_paste": true,
+      "verdict": "paste"
     },
     "long_paragraph_trailing_silence.wav": {
       "duration_s": 10.79,
@@ -37,9 +41,11 @@
       "raw_vad": "Here is the first point. The second point follows from it. Finally, the third point wraps everything up.",
       "retried_no_vad": false,
       "raw_final": "Here is the first point. The second point follows from it. Finally, the third point wraps everything up.",
-      "vad_pass_ms": 433,
-      "total_ms": 433,
-      "cleaned": "Here is the first point. The second point follows from it. Finally, the third point wraps everything up."
+      "vad_pass_ms": 410,
+      "total_ms": 410,
+      "cleaned": "Here is the first point. The second point follows from it. Finally, the third point wraps everything up.",
+      "would_paste": true,
+      "verdict": "paste"
     },
     "normal_sentence.wav": {
       "duration_s": 4.41,
@@ -49,9 +55,11 @@
       "raw_vad": "The quarterly report is ready for review and the numbers look strong.",
       "retried_no_vad": false,
       "raw_final": "The quarterly report is ready for review and the numbers look strong.",
-      "vad_pass_ms": 336,
-      "total_ms": 336,
-      "cleaned": "The quarterly report is ready for review and the numbers look strong."
+      "vad_pass_ms": 308,
+      "total_ms": 308,
+      "cleaned": "The quarterly report is ready for review and the numbers look strong.",
+      "would_paste": true,
+      "verdict": "paste"
     },
     "numbers_dates.wav": {
       "duration_s": 4.11,
@@ -61,9 +69,25 @@
       "raw_vad": "The meeting is on July 21 at 3.30 pm.",
       "retried_no_vad": false,
       "raw_final": "The meeting is on July 21 at 3.30 pm.",
-      "vad_pass_ms": 278,
-      "total_ms": 278,
-      "cleaned": "The meeting is on July 21 at 3.30 pm."
+      "vad_pass_ms": 296,
+      "total_ms": 296,
+      "cleaned": "The meeting is on July 21 at 3.30 pm.",
+      "would_paste": true,
+      "verdict": "paste"
+    },
+    "quiet_thank_you.wav": {
+      "duration_s": 1.38,
+      "peak": 0.012,
+      "rms": 0.0008,
+      "passes_gate": true,
+      "raw_vad": "Thank you.",
+      "retried_no_vad": false,
+      "raw_final": "Thank you.",
+      "vad_pass_ms": 217,
+      "total_ms": 217,
+      "cleaned": "Thank you.",
+      "would_paste": true,
+      "verdict": "paste"
     },
     "quiet_yes.wav": {
       "duration_s": 1.27,
@@ -73,9 +97,11 @@
       "raw_vad": "Yes.",
       "retried_no_vad": false,
       "raw_final": "Yes.",
-      "vad_pass_ms": 225,
-      "total_ms": 225,
-      "cleaned": "Yes."
+      "vad_pass_ms": 208,
+      "total_ms": 208,
+      "cleaned": "Yes.",
+      "would_paste": true,
+      "verdict": "paste"
     },
     "repeat_phrase_x2.wav": {
       "duration_s": 3.88,
@@ -85,9 +111,11 @@
       "raw_vad": "Send a file. Send a file.",
       "retried_no_vad": false,
       "raw_final": "Send a file. Send a file.",
-      "vad_pass_ms": 261,
-      "total_ms": 261,
-      "cleaned": "Send a file."
+      "vad_pass_ms": 277,
+      "total_ms": 277,
+      "cleaned": "Send a file.",
+      "would_paste": true,
+      "verdict": "paste"
     },
     "room_noise_3s.wav": {
       "duration_s": 3.0,
@@ -96,10 +124,12 @@
       "passes_gate": true,
       "raw_vad": "",
       "retried_no_vad": true,
-      "raw_final": "[No speech detected]",
-      "vad_pass_ms": 6,
-      "total_ms": 195,
-      "cleaned": "[No speech detected]"
+      "raw_final": "",
+      "vad_pass_ms": 5,
+      "total_ms": 190,
+      "cleaned": null,
+      "would_paste": false,
+      "verdict": "no_speech"
     },
     "room_noise_quiet_3s.wav": {
       "duration_s": 3.0,
@@ -108,10 +138,12 @@
       "passes_gate": true,
       "raw_vad": "",
       "retried_no_vad": true,
-      "raw_final": "[No speech detected]",
+      "raw_final": "",
       "vad_pass_ms": 6,
-      "total_ms": 200,
-      "cleaned": "[No speech detected]"
+      "total_ms": 186,
+      "cleaned": null,
+      "would_paste": false,
+      "verdict": "no_speech"
     },
     "silence_2s.wav": {
       "duration_s": 2.0,
@@ -119,7 +151,9 @@
       "rms": 0.0,
       "passes_gate": false,
       "raw_final": null,
-      "cleaned": null
+      "cleaned": null,
+      "would_paste": false,
+      "verdict": "dropped_by_gate"
     },
     "stutter_the_x3.wav": {
       "duration_s": 3.83,
@@ -129,9 +163,25 @@
       "raw_vad": "Buh. Buh. Buh.",
       "retried_no_vad": false,
       "raw_final": "Buh. Buh. Buh.",
-      "vad_pass_ms": 269,
-      "total_ms": 269,
-      "cleaned": "Buh."
+      "vad_pass_ms": 249,
+      "total_ms": 249,
+      "cleaned": "Buh. Buh. Buh.",
+      "would_paste": true,
+      "verdict": "paste"
+    },
+    "whisper_quiet_yes.wav": {
+      "duration_s": 1.27,
+      "peak": 0.01,
+      "rms": 0.0007,
+      "passes_gate": true,
+      "raw_vad": "Yes.",
+      "retried_no_vad": false,
+      "raw_final": "Yes.",
+      "vad_pass_ms": 189,
+      "total_ms": 189,
+      "cleaned": "Yes.",
+      "would_paste": true,
+      "verdict": "paste"
     }
   }
 }

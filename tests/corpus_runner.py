@@ -70,19 +70,32 @@ def app_pipeline(transcriber, audio):
     return {
         "raw_vad": text_vad,
         "retried_no_vad": retried,
-        "raw_final": text_final if text_final else "[No speech detected]",
+        "raw_final": text_final,  # "" when both passes found nothing
         "vad_pass_ms": round((t1 - t0) * 1000),
         "total_ms": round((t2 - t0) * 1000),
     }
 
 
-def post_process(text):
-    """The app's cleanup chain from _on_transcription_ready."""
-    from main import MainWindow
+def app_decision(entry):
+    """Replicate _on_transcription_ready's verdict for this clip: what text
+    (if any) would actually be pasted?"""
+    from main import clean_transcript, is_probable_hallucination
+    from voice_engine import TranscriptionResult
 
-    text = MainWindow._dedupe_repeated(None, text)
-    text = MainWindow._light_cleanup(None, text)
-    return text
+    raw = entry["raw_final"]
+    result = TranscriptionResult(
+        text=raw,
+        job_id=0,
+        duration_s=entry["duration_s"],
+        retried=entry["retried_no_vad"],
+        no_speech=not raw,
+    )
+    if result.no_speech:
+        return {"cleaned": None, "would_paste": False, "verdict": "no_speech"}
+    cleaned = clean_transcript(raw, light=True)
+    if is_probable_hallucination(result, cleaned):
+        return {"cleaned": cleaned, "would_paste": False, "verdict": "suppressed_hallucination"}
+    return {"cleaned": cleaned, "would_paste": bool(cleaned.strip()), "verdict": "paste"}
 
 
 def gate_decision(audio):
@@ -112,12 +125,14 @@ def run_corpus(transcriber=None):
         entry = gate_decision(audio)
         if entry["passes_gate"]:
             entry.update(app_pipeline(transcriber, audio))
-            entry["cleaned"] = post_process(entry["raw_final"])
+            entry.update(app_decision(entry))
         else:
-            entry["raw_final"] = None
-            entry["cleaned"] = None
+            entry.update(
+                {"raw_final": None, "cleaned": None, "would_paste": False,
+                 "verdict": "dropped_by_gate"}
+            )
         results[name] = entry
-        shown = entry["cleaned"] if entry["passes_gate"] else "(dropped by gate)"
+        shown = entry["cleaned"] if entry["would_paste"] else f"({entry['verdict']})"
         print(f"  {name:38s} -> {shown!r}")
     meta = {
         "model": transcriber.model_size,

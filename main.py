@@ -525,11 +525,41 @@ class SettingsDialog(QDialog):
 user32 = ctypes.windll.user32
 
 
-def collapse_repeated_phrases(text):
-    """Collapse consecutive repeated phrases (1–8 words) — Whisper silence artifacts.
+# Function words that are never grammatically doubled in English — a 2x run of
+# one of these is a stutter/artifact. Deliberately EXCLUDES words that can
+# legitimately double across grammar ("that that", "in in", "had had", "it. It")
+# — for dictation trust, corrupting correct output is worse than missing an
+# artifact. Content words ("no no no", "very very") can be deliberate, so
+# single content words only collapse at longer runs (4+).
+_STUTTER_DOUBLE_WORDS = {
+    "the", "a", "an", "of", "to", "and", "but", "or", "with",
+}
 
-    'send the file send the file' → 'send the file';  'the the the' → 'the'.
-    Comparison is case-insensitive; the first occurrence's casing is kept.
+_SENTENCE_END = (".", "!", "?")
+
+_TOKEN_TRIM = ".,!?;:\"'…—-"
+
+
+def _norm_token(word):
+    """Comparison form of a token: case-folded, surrounding punctuation trimmed.
+
+    'Home,' and 'home.' must compare equal — punctuation-attached comparison is
+    what let 'I went home, I went home.' slip through the old collapse.
+    """
+    return word.strip(_TOKEN_TRIM).lower()
+
+
+def collapse_repeated_phrases(text):
+    """Collapse consecutive repeated phrases (1–8 words) — Whisper artifacts.
+
+    - Multi-word phrase repeats ('send the file send the file') collapse at 2+
+      reps: nobody dictates the same phrase back-to-back on purpose.
+    - Single-word repeats collapse at 2+ reps only for function words (see
+      _STUTTER_DOUBLE_WORDS); content words need 4+ reps so intentional
+      repeats like 'no no no' survive (confirmed: Whisper transcribes them
+      correctly — the OLD collapse was what ate them).
+    - Comparison is case- and punctuation-insensitive; the LAST copy's tokens
+      are kept so sentence-final punctuation survives.
     """
     words = text.split()
     out = []
@@ -539,21 +569,121 @@ def collapse_repeated_phrases(text):
         matched = False
         max_plen = min(8, (n - i) // 2)
         for plen in range(max_plen, 0, -1):
-            phrase = [w.lower() for w in words[i:i + plen]]
+            phrase = [_norm_token(w) for w in words[i:i + plen]]
+            if not any(phrase):
+                continue
+            # A "phrase" of one repeated word ('go go', 'wait - wait') is a
+            # single-word run in disguise — defer to the plen==1 policy and
+            # its thresholds instead of the permissive phrase rule.
+            if plen > 1 and len({t for t in phrase if t}) == 1:
+                continue
             reps = 1
             j = i + plen
-            while [w.lower() for w in words[j:j + plen]] == phrase:
+            while [_norm_token(w) for w in words[j:j + plen]] == phrase:
                 reps += 1
                 j += plen
-            if reps >= 2:
-                out.extend(words[i:i + plen])  # keep one copy, original casing
-                i = j
-                matched = True
-                break
+            if reps < 2:
+                continue
+            if plen == 1:
+                run = words[i:j]
+                # A sentence boundary inside the run ('…like it. It works…')
+                # is grammar, not a stutter — require the long-run threshold
+                # before touching it.
+                crosses_sentence = any(
+                    w.endswith(_SENTENCE_END) for w in run[:-1]
+                )
+                if crosses_sentence or phrase[0] not in _STUTTER_DOUBLE_WORDS:
+                    needed = 4
+                else:
+                    needed = 2
+                if reps < needed:
+                    continue
+            # Keep one copy — the LAST, so terminal punctuation survives; but
+            # merge the FIRST copy's leading capitalization so a collapse at a
+            # sentence start doesn't decapitalize it.
+            kept = list(words[j - plen:j])
+            first = words[i]
+            if first[:1].isupper() and kept[0][:1].islower():
+                kept[0] = kept[0][0].upper() + kept[0][1:]
+            out.extend(kept)
+            i = j
+            matched = True
+            break
         if not matched:
             out.append(words[i])
             i += 1
     return " ".join(out)
+
+
+def strip_fillers(text):
+    """Remove filler words and hyphen-joined prefix stutters ('th-the' → 'the').
+
+    The stutter pattern requires a TRUE prefix (the fragment is shorter than
+    the word it stutters into), so real hyphenated words like 'no-no' and
+    'win-win' are untouched. Space-separated doubles ('the the') are NOT
+    handled here — that policy lives in collapse_repeated_phrases so
+    intentional repeats are judged in exactly one place.
+    """
+    cleaned = re.sub(r"\b(um+|uh+|erm|ah+)\b[, ]*", "", text, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b(\w{1,3})-(\1\w+)\b", r"\2", cleaned, flags=re.IGNORECASE)
+    return cleaned
+
+
+def finish_transcript(text):
+    """Final tidy: spacing, punctuation spacing, leading capital, terminal period."""
+    cleaned = re.sub(r"\s+", " ", text).strip()
+    cleaned = re.sub(r"\s+([,.!?;:])", r"\1", cleaned)
+    if cleaned:
+        cleaned = cleaned[0].upper() + cleaned[1:]
+        if cleaned[-1] not in ".!?":
+            cleaned += "."
+    return cleaned
+
+
+def clean_transcript(text, light=True):
+    """The dictation cleanup chain, in the correct order.
+
+    Fillers are stripped BEFORE the repeat collapse — the old order let
+    'the um the file' survive as 'the the file' because the collapse ran
+    first and the filler removal then created a new adjacent repeat.
+    Repeat collapse always runs; fillers/finishing follow the light_cleanup
+    setting.
+    """
+    if not text or text.startswith("["):
+        return text
+    if light:
+        text = strip_fillers(text)
+    text = collapse_repeated_phrases(text)
+    if light:
+        text = finish_transcript(text)
+    else:
+        text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+# Classic Whisper silence-hallucinations (YouTube-outro artifacts). Only ever
+# consulted for SHORT clips whose VAD pass found nothing (the retry produced
+# the text). DELIBERATELY EXCLUDES phrases people actually dictate standalone
+# ("thank you", "bye", "cheers", "see you") — silently eating a real quiet
+# utterance is the historical regression this app must never repeat. The
+# per-segment no_speech_prob filter is the primary defense; this list is a
+# narrow backstop for phrases essentially never dictated alone in under 1.2s.
+HALLUCINATION_DENYLIST = {
+    "you", "thanks for watching", "thank you for watching",
+    "thanks for listening", "subscribe", "the end",
+}
+
+
+def is_probable_hallucination(result, cleaned_text):
+    """True when a transcription is almost certainly invented from noise.
+
+    Criteria: the VAD pass judged the clip silent (retry produced the text),
+    the clip is sub-1.2s, and the cleaned text is a known artifact phrase.
+    """
+    if not result.retried or result.duration_s >= 1.2:
+        return False
+    norm = re.sub(r"[^\w\s]", "", cleaned_text).strip().lower()
+    return norm in HALLUCINATION_DENYLIST
 
 
 def sanitize_for_paste(text):
@@ -587,6 +717,7 @@ def set_foreground_window(hwnd):
 
 
 _paste_lock = threading.Lock()
+_paste_generation = 0  # guards deferred clipboard-restores against newer pastes
 _debug_log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug.log")
 _single_instance_mutex = None
 _show_window_event = None
@@ -689,12 +820,58 @@ def _window_title(hwnd):
         return "?"
 
 
+# When a restore is still pending, the next paste must carry the ORIGINAL
+# user snapshot forward instead of snapshotting the clipboard (which would
+# still hold the previous dictation). (generation, snapshot) tuple; GUI-thread
+# only — no lock needed.
+_pending_restore = None
+
+
+def _schedule_clipboard_restore(snapshot, generation, pasted_text, delay_ms=600):
+    """Restore the user's clipboard after the target has consumed our paste.
+
+    Three guards, all required:
+      * generation — a newer paste in flight is never clobbered;
+      * clipboard still equals OUR pasted text — if anything else wrote the
+        clipboard meanwhile (the read-aloud sentinel, the Copy button, the
+        user), we must not overwrite it;
+      * text snapshots only (pyperclip can't round-trip images) — an
+        empty/unavailable snapshot leaves the pasted text in place.
+    NOTE(Phase 3): QTimer requires the GUI thread — when paste moves to a
+    worker, route this through the controller instead.
+    """
+    global _pending_restore
+    if not isinstance(snapshot, str) or not snapshot:
+        return
+    _pending_restore = (generation, snapshot)
+
+    def _restore():
+        global _pending_restore
+        # Always release our pending marker, even when superseded — a stale
+        # marker would make every future paste carry a long-dead "original".
+        if _pending_restore and _pending_restore[0] == generation:
+            _pending_restore = None
+        if _paste_generation != generation:
+            return  # a newer paste owns the clipboard now
+        try:
+            if pyperclip.paste() == pasted_text:
+                pyperclip.copy(snapshot)
+                _dbg("  clipboard restored")
+        except Exception:
+            pass
+
+    QTimer.singleShot(delay_ms, _restore)
+
+
 def paste_to_window(hwnd, text):
     """Focus a window and paste text. Guarded against re-entry only.
 
     The non-blocking lock stops a genuine re-entrant double-paste; we no longer
     impose a 1s cooldown, which used to swallow a legitimate fast second dictation.
+    The user's prior clipboard is snapshotted and restored afterwards — dictating
+    must not destroy whatever they had copied.
     """
+    global _paste_generation
     # Privacy: log only handles/lengths here — never window titles or the
     # actual dictated/clipboard text (debug.log persists on disk).
     fg = user32.GetForegroundWindow()
@@ -703,11 +880,26 @@ def paste_to_window(hwnd, text):
     if not _paste_lock.acquire(blocking=False):
         _dbg("paste_to_window REJECTED — lock held")
         return False
+    paste_sent = False
+    old_clipboard = ""
+    generation = 0
     try:
         text = sanitize_for_paste(text)
         if not text:
             _dbg("  nothing left after sanitize, skipping paste")
             return False
+        if _pending_restore is not None:
+            # Back-to-back paste before the previous restore fired: the
+            # clipboard still holds the previous dictation — carry the true
+            # original forward instead of snapshotting our own leftovers.
+            old_clipboard = _pending_restore[1]
+        else:
+            try:
+                old_clipboard = pyperclip.paste()
+            except Exception:
+                old_clipboard = ""
+        _paste_generation += 1
+        generation = _paste_generation
         pyperclip.copy(text)
         _dbg(f"  clipboard set ({len(text)} chars)")
 
@@ -735,10 +927,17 @@ def paste_to_window(hwnd, text):
             time.sleep(0.05)
 
         _win32_paste()
+        paste_sent = True
         _dbg("paste_to_window DONE")
         return True
     finally:
         time.sleep(0.3)
+        # Only restore when the paste keystroke actually fired. On failure
+        # (refocus failed, etc.) the dictation deliberately stays on the
+        # clipboard so the user can paste it manually — the panel status
+        # tells them it's there.
+        if paste_sent:
+            _schedule_clipboard_restore(old_clipboard, generation, text)
         _paste_lock.release()
 
 
@@ -879,10 +1078,16 @@ class MainWindow(QMainWindow):
         self.region_selector = RegionSelector()
         self.indicator = RecordingIndicator()
 
-        # Dictation state
-        self._target_hwnd = None  # window to paste into after transcription
+        # Dictation state.
+        # _pending_target_hwnd is only a hand-off between record-START (where
+        # the foreground window is captured) and record-STOP (where it is bound
+        # into the transcription job). From then on the HWND travels WITH the
+        # job (TranscriptionResult.context) — overlapping dictations can no
+        # longer paste into each other's windows.
+        self._pending_target_hwnd = None
         self._read_target_hwnd = None  # window to refocus for read-selection copy
         self._dictation_active = self.config.get("dictation_mode", True)
+        self._last_job_id = None  # duplicate-delivery guard (monotonic job ids)
 
         self._build_ui()
         self._connect_signals()
@@ -893,9 +1098,6 @@ class MainWindow(QMainWindow):
         self._force_quit = False
         # Debounce flag for read-aloud hotkey
         self._read_in_flight = False
-        # Track last transcription to prevent double-paste
-        self._last_transcription = ""
-        self._last_transcription_time = 0.0
 
         # Wire hotkey signals BEFORE registering hotkeys
         self._sig_hotkey_press.connect(self._hotkey_press_handler)
@@ -1152,7 +1354,7 @@ class MainWindow(QMainWindow):
         self.recorder.recording_started.connect(self._on_recording_started)
         self.recorder.recording_stopped.connect(self._on_recording_stopped)
         self.recorder.level_update.connect(self._on_level_update)
-        self.recorder.error.connect(self._on_error)
+        self.recorder.error.connect(self._on_mic_error)
 
         # Transcriber
         self.transcriber.model_loading.connect(self._on_model_loading)
@@ -1308,8 +1510,8 @@ class MainWindow(QMainWindow):
             self._update_status("Whisper model still loading, please wait...")
             return
         if self._dictation_active:
-            self._target_hwnd = get_foreground_window()
-            _dbg(f"  target_hwnd captured: {self._target_hwnd}")
+            self._pending_target_hwnd = get_foreground_window()
+            _dbg(f"  target_hwnd captured: {self._pending_target_hwnd}")
         self.recorder.start()
         _dbg("  recorder.start() called")
 
@@ -1325,7 +1527,7 @@ class MainWindow(QMainWindow):
             return
         # Pill doesn't take focus, so the foreground window is still the target.
         if self._dictation_active:
-            self._target_hwnd = get_foreground_window()
+            self._pending_target_hwnd = get_foreground_window()
         self.recorder.start()
 
     @Slot()
@@ -1334,7 +1536,7 @@ class MainWindow(QMainWindow):
         if not self.transcriber.is_loaded:
             self._update_status("Whisper model still loading, please wait...")
             return
-        self._target_hwnd = None  # clicked in our own window, don't paste elsewhere
+        self._pending_target_hwnd = None  # clicked in our own window, don't paste elsewhere
         self.recorder.start()
 
     @Slot()
@@ -1367,10 +1569,11 @@ class MainWindow(QMainWindow):
         self.btn_stop.setEnabled(False)
         self.level_bar.setValue(0)
 
-        if getattr(self, "_last_audio_id", None) == id(audio):
-            _dbg("  ignored — same audio buffer")
-            return
-        self._last_audio_id = id(audio)
+        # Consume the pending target exactly once — from here on it travels
+        # WITH the job. (The old shared-field approach let a second dictation
+        # overwrite the first one's paste target: confirmed wrong-window race.)
+        target_hwnd = self._pending_target_hwnd
+        self._pending_target_hwnd = None
 
         min_seconds = float(self.config.get("min_record_seconds", 0.2))
         min_peak = float(self.config.get("min_record_peak", 0.008))
@@ -1378,13 +1581,12 @@ class MainWindow(QMainWindow):
             _dbg("  ignored - too short or too quiet for reliable dictation")
             self._update_status("Recording ignored - too short or too quiet")
             self.indicator.show_idle()
-            self._target_hwnd = None
             return
 
         if len(audio) > 0:
             self._update_status(f"Transcribing {duration:.1f}s (peak {max_amp:.3f})...")
             self.indicator.show_transcribing()
-            self.transcriber.transcribe(audio)
+            self.transcriber.transcribe(audio, context=target_hwnd)
         else:
             self._update_status("No audio captured")
             self.indicator.show_idle()
@@ -1417,42 +1619,48 @@ class MainWindow(QMainWindow):
         gpu_str = "GPU" if self.ocr.gpu else "CPU"
         self._update_status(f"Ready  |  OCR engine loaded ({gpu_str})")
 
-    @Slot(str)
-    def _on_transcription_ready(self, text):
-        _dbg(f"_on_transcription_ready FIRED  ({len(text)} chars)")
-        # --- 1. Clean up Whisper duplicates and light filler/stutter artifacts ---
-        text = self._dedupe_repeated(text)
-        if self.config.get("light_cleanup", True):
-            text = self._light_cleanup(text)
-
-        # --- 2. Skip only a near-instant repeat of identical text (double-fire),
-        #        short enough that intentionally repeating a word still works ---
-        now = time.time()
-        if text == self._last_transcription and (now - self._last_transcription_time) < 1.2:
-            _dbg(f"  → duplicate, ignoring")
-            self.indicator.show_idle()
-            self._target_hwnd = None
-            self._update_status("Duplicate transcription ignored")
+    @Slot(object)
+    def _on_transcription_ready(self, result):
+        """Handle a completed transcription job (TranscriptionResult)."""
+        _dbg(
+            f"_on_transcription_ready job={result.job_id} "
+            f"({len(result.text)} chars, retried={result.retried}, "
+            f"dur={result.duration_s:.2f}s)"
+        )
+        # Duplicate-delivery guard: monotonic job ids (the old id(audio) check
+        # could drop a REAL second dictation after CPython reused the address).
+        if self._last_job_id == result.job_id:
+            _dbg("  duplicate job delivery ignored")
             return
-        self._last_transcription = text
-        self._last_transcription_time = now
+        self._last_job_id = result.job_id
 
-        # --- 3. Check if target is our own window ---
-        own_hwnd = int(self.winId())
-        is_own_window = (
-            self._target_hwnd is not None
-            and self._target_hwnd == get_foreground_window()
-            and self._target_hwnd == own_hwnd
+        if result.no_speech:
+            self.indicator.show_idle()
+            self._update_status("No speech detected")
+            return
+
+        text = clean_transcript(
+            result.text, light=self.config.get("light_cleanup", True)
         )
 
+        # Backstop for silence-hallucinations that slip past the segment
+        # filters: sub-1.2s clip, VAD found nothing, text is a known artifact.
+        if is_probable_hallucination(result, text):
+            _dbg("  suppressed probable hallucination (retry artifact)")
+            self.indicator.show_idle()
+            self._update_status("Ignored noise (no clear speech)")
+            return
+
+        target_hwnd = result.context
+        own_hwnd = int(self.winId())
+        is_own_window = target_hwnd is not None and target_hwnd == own_hwnd
+
         if (self._dictation_active and self.config.get("auto_paste", True)
-                and self._target_hwnd and not is_own_window
-                and text.strip() and "[No speech" not in text):
-            success = paste_to_window(self._target_hwnd, text)
+                and target_hwnd and not is_own_window and text.strip()):
+            success = paste_to_window(target_hwnd, text)
             if success:
                 self.indicator.show_done()
                 self._update_status("Transcribed and pasted")
-                self._target_hwnd = None
                 return
             else:
                 self.indicator.show_idle()
@@ -1462,31 +1670,6 @@ class MainWindow(QMainWindow):
             self._update_status("Transcription complete")
 
         self._append_output(text, prefix="[Voice]")
-        self._target_hwnd = None
-
-    def _light_cleanup(self, text):
-        """Very light dictation cleanup: fillers, simple stutters, spacing, casing."""
-        if not text or text.startswith("["):
-            return text
-        cleaned = re.sub(r"\b(um+|uh+|erm|ah+)\b[, ]*", "", text, flags=re.IGNORECASE)
-        cleaned = re.sub(r"\b(\w{1,4})[- ]+\1\b", r"\1", cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(r"\s+", " ", cleaned).strip()
-        cleaned = re.sub(r"\s+([,.!?;:])", r"\1", cleaned)
-        if cleaned:
-            cleaned = cleaned[0].upper() + cleaned[1:]
-            if cleaned[-1] not in ".!?":
-                cleaned += "."
-        return cleaned
-
-    def _dedupe_repeated(self, text):
-        """Collapse consecutive repeated words/phrases Whisper emits on silence.
-
-        Handles 'the the the', 'send the file send the file send the file', and
-        repeated full sentences — not just the exact 2x split the old version caught.
-        """
-        if not text or text.startswith("["):
-            return text
-        return collapse_repeated_phrases(text)
 
     # -----------------------------------------------------------------------
     # Screen reader handlers
@@ -1832,6 +2015,18 @@ class MainWindow(QMainWindow):
 
     def _update_status(self, msg):
         self.status_bar.showMessage(msg)
+
+    @Slot(str)
+    def _on_mic_error(self, msg):
+        """Recorder failure: clear dictation hand-off state, then report.
+
+        A failed start leaves no recording_stopped to consume the pending
+        target — clear it (and push-to-talk) so nothing stale leaks into a
+        later dictation.
+        """
+        self._pending_target_hwnd = None
+        self._ptt_active = False
+        self._on_error(msg)
 
     @Slot(str)
     def _on_error(self, msg):

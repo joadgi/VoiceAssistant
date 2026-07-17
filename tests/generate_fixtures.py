@@ -135,6 +135,14 @@ def main():
     yes = tts_to_f32("Yes.")
     save_wav("quiet_yes.wav", peak_normalize(yes, 0.02))
 
+    # Whisper-level speech, just above the record gate (peak 0.008). These are
+    # the review-F2 regression guards: real speech that may FAIL the VAD pass
+    # must still come back via the retry, and a real "thank you" must never be
+    # eaten by the hallucination backstop.
+    save_wav("whisper_quiet_yes.wav", peak_normalize(yes, 0.010))
+    thanks = tts_to_f32("Thank you.")
+    save_wav("quiet_thank_you.wav", peak_normalize(thanks, 0.012))
+
     sent = tts_to_f32(
         "The quarterly report is ready for review and the numbers look strong."
     )

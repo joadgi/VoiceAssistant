@@ -90,13 +90,23 @@ def validate_hotkey(value):
 
 
 def sanitize_settings(data):
-    """Clean persisted settings so one bad hotkey cannot break startup."""
+    """Clean persisted settings so one bad hotkey cannot break startup.
+
+    When a duplicate/invalid hotkey is reset, the replacement must itself be
+    unique — resetting to a default that IS the colliding value used to leave
+    two actions bound to one combo. A reserve pool guarantees a free combo.
+    """
+    fallback_pool = [DEFAULTS[k] for k in HOTKEY_KEYS] + [
+        "ctrl+shift+f9", "ctrl+shift+f10", "ctrl+shift+f11",
+    ]
     cleaned = dict(data)
     seen = set()
     for key in HOTKEY_KEYS:
         value = normalize_hotkey(cleaned.get(key, DEFAULTS[key]))
         if not validate_hotkey(value) or value in seen:
             value = DEFAULTS[key]
+            if value in seen:
+                value = next(v for v in fallback_pool if v not in seen)
         cleaned[key] = value
         seen.add(value)
     return cleaned

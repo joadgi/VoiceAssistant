@@ -15,7 +15,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config as config_mod
 from config import DEFAULTS, normalize_hotkey, validate_hotkey, sanitize_settings
-from main import MainWindow, collapse_repeated_phrases, sanitize_for_paste
+from main import (
+    clean_transcript,
+    collapse_repeated_phrases,
+    is_probable_hallucination,
+    sanitize_for_paste,
+    strip_fillers,
+)
+from voice_engine import TranscriptionResult
 
 
 # ---------------------------------------------------------------------------
@@ -37,22 +44,56 @@ class TestCollapseRepeats:
             collapse_repeated_phrases("Send a file. Send a file.") == "Send a file."
         )
 
-    def test_case_insensitive_keeps_first_casing(self):
-        assert collapse_repeated_phrases("Hello hello world") == "Hello world"
+    def test_content_word_double_preserved(self):
+        # Phase 2 policy: content words CAN be deliberately repeated —
+        # a 2x run of a non-function word is kept.
+        assert collapse_repeated_phrases("Hello hello world") == "Hello hello world"
+
+    def test_content_word_long_run_collapsed(self):
+        # …but a 4+ run of the same word is a Whisper artifact.
+        assert collapse_repeated_phrases("go go go go go now") == "go now"
 
     def test_no_repeats_untouched(self):
         s = "this sentence has no repeated phrases at all"
         assert collapse_repeated_phrases(s) == s
 
-    def test_punctuation_defeats_match_CURRENT_BEHAVIOR(self):
-        # KNOWN GAP (M4, fixed in Phase 2): differing punctuation blocks the
-        # match because tokens are compared with punctuation attached.
-        s = "I went home, I went home."
-        assert collapse_repeated_phrases(s) == s  # NOT collapsed today
+    def test_punctuation_insensitive_match_FIXED_M4(self):
+        # Phase 2 fix: 'home,' and 'home.' compare equal; last copy's
+        # punctuation is kept.
+        assert collapse_repeated_phrases("I went home, I went home.") == "I went home."
 
-    def test_intentional_repeat_eaten_CURRENT_BEHAVIOR(self):
-        # KNOWN GAP (M5, fixed in Phase 2): deliberate repeats are collapsed.
-        assert collapse_repeated_phrases("no no no") == "no"
+    def test_intentional_repeat_preserved_FIXED_M5(self):
+        # Phase 2 fix: deliberate short repeats survive (Whisper transcribes
+        # them correctly; the old collapse was what ate them).
+        assert collapse_repeated_phrases("no no no") == "no no no"
+        assert collapse_repeated_phrases("very very good") == "very very good"
+
+    def test_sentence_boundary_is_grammar_not_stutter(self):
+        # Review finding F1: '…it. It…' across a sentence boundary is normal
+        # English, not a stutter — collapsing it deleted words and periods.
+        for s in (
+            "I like it. It works.",
+            "Look at this. This is the one.",
+            "There it was. Was it good?",
+        ):
+            assert collapse_repeated_phrases(s) == s, s
+
+    def test_grammatical_doubles_preserved(self):
+        # Review finding F5: 'that that' / 'in in' are legitimate English.
+        assert collapse_repeated_phrases("I know that that is true") == "I know that that is true"
+        assert collapse_repeated_phrases("He walked in in a hurry") == "He walked in in a hurry"
+
+    def test_capitalization_merged_on_collapse(self):
+        # Review finding F6: keep-last must not decapitalize a sentence start.
+        assert (
+            collapse_repeated_phrases("The the file is ready.")
+            == "The file is ready."
+        )
+
+    def test_mixed_token_run_not_mangled(self):
+        # Review finding F11: 'wait - wait - wait' must not half-collapse.
+        s = "wait - wait - wait"
+        assert collapse_repeated_phrases(s) == s
 
     def test_empty(self):
         assert collapse_repeated_phrases("") == ""
@@ -76,32 +117,83 @@ class TestSanitizeForPaste:
 
 
 # ---------------------------------------------------------------------------
-# _light_cleanup (called unbound; it does not use self)
+# clean_transcript — the full cleanup chain (fillers -> collapse -> finish)
 # ---------------------------------------------------------------------------
-def light_cleanup(text):
-    return MainWindow._light_cleanup(None, text)
-
-
-class TestLightCleanup:
+class TestCleanTranscript:
     def test_fillers_removed(self):
-        assert light_cleanup("um I think uh this works") == "I think this works."
+        assert clean_transcript("um I think uh this works") == "I think this works."
 
     def test_forces_capital_and_period_CURRENT_BEHAVIOR(self):
-        # KNOWN GAP (M3, made optional later): every dictation is capitalized
-        # and gets a trailing period.
-        assert light_cleanup("lowercase text") == "Lowercase text."
+        # KNOWN GAP (M3, made optional in Phase 4): every dictation is
+        # capitalized and gets a trailing period.
+        assert clean_transcript("lowercase text") == "Lowercase text."
 
     def test_keeps_existing_terminal_punctuation(self):
-        assert light_cleanup("is this a question?") == "Is this a question?"
+        assert clean_transcript("is this a question?") == "Is this a question?"
 
     def test_space_before_punct_removed(self):
-        assert light_cleanup("hello , world .") == "Hello, world."
+        assert clean_transcript("hello , world .") == "Hello, world."
 
     def test_bracket_passthrough(self):
-        assert light_cleanup("[No speech detected]") == "[No speech detected]"
+        assert clean_transcript("[No speech detected]") == "[No speech detected]"
 
-    def test_short_stutter_collapsed(self):
-        assert light_cleanup("the the file") == "The file."
+    def test_function_word_stutter_collapsed(self):
+        assert clean_transcript("the the file") == "The file."
+
+    def test_filler_ordering_FIXED_M4(self):
+        # Phase 2 fix: fillers are stripped BEFORE the repeat collapse, so a
+        # filler wedged inside a stutter no longer shields the repeat.
+        assert clean_transcript("the um the file") == "The file."
+
+    def test_intentional_repeat_survives_full_chain_FIXED_M5(self):
+        assert clean_transcript("no no no") == "No no no."
+
+    def test_hyphen_prefix_stutter_stripped(self):
+        # True prefix stutters collapse; real hyphenated words survive (F10).
+        assert strip_fillers("th-the file") == "the file"
+        assert strip_fillers("b-because") == "because"
+        assert strip_fillers("no-no problem") == "no-no problem"
+        assert strip_fillers("win-win deal") == "win-win deal"
+
+    def test_light_false_still_collapses_repeats(self):
+        out = clean_transcript("send the file send the file", light=False)
+        assert out == "send the file"
+
+
+# ---------------------------------------------------------------------------
+# Hallucination backstop (denylist applies only to short VAD-empty retries)
+# ---------------------------------------------------------------------------
+def _result(text, duration_s, retried):
+    return TranscriptionResult(
+        text=text, job_id=1, duration_s=duration_s, retried=retried
+    )
+
+
+class TestHallucinationBackstop:
+    def test_short_retry_artifact_suppressed(self):
+        assert is_probable_hallucination(_result("you", 0.6, True), "You.")
+        assert is_probable_hallucination(
+            _result("Thanks for watching!", 0.9, True), "Thanks for watching!"
+        )
+
+    def test_real_word_not_suppressed(self):
+        assert not is_probable_hallucination(_result("yes", 0.6, True), "Yes.")
+
+    def test_real_phrases_never_suppressed(self):
+        # Review finding F2: people genuinely dictate these — silently eating
+        # them is the historical "quiet speech lost" regression. They must
+        # NOT be in the denylist.
+        for phrase in ("Thank you.", "Bye.", "See you.", "Cheers.", "Goodbye."):
+            assert not is_probable_hallucination(
+                _result(phrase, 0.9, True), phrase
+            ), phrase
+
+    def test_vad_passed_text_never_suppressed(self):
+        # If the VAD pass produced it, it is speech — even "you".
+        assert not is_probable_hallucination(_result("you", 0.6, False), "You.")
+
+    def test_long_clip_never_suppressed(self):
+        assert not is_probable_hallucination(_result("you", 2.5, True), "You.")
 
 
 # ---------------------------------------------------------------------------
@@ -162,17 +254,15 @@ class TestHotkeys:
         cleaned = sanitize_settings(data)
         assert cleaned["hotkey_record"] == DEFAULTS["hotkey_record"]
 
-    def test_sanitize_settings_dedupe_hole_CURRENT_BEHAVIOR(self):
-        # NEW BUG found by this suite (fixed in Phase 2): when a duplicate is
-        # reset to its DEFAULT but that default IS the colliding value, the
-        # duplicate survives. Here record takes screen_read's default combo;
-        # screen_read is "reset"… right back to the same combo. Result: two
-        # actions bound to one hotkey.
+    def test_sanitize_settings_dedupe_hole_FIXED(self):
+        # Phase 2 fix: resetting a collision now draws from a reserve pool, so
+        # the replacement can never itself be the colliding combo.
         data = dict(DEFAULTS)
         data["hotkey_record"] = "ctrl+shift+s"       # steals screen_read's default
         data["hotkey_screen_read"] = "ctrl+shift+s"
         cleaned = sanitize_settings(data)
-        assert cleaned["hotkey_record"] == cleaned["hotkey_screen_read"]  # the hole
+        vals = [cleaned[k] for k in ("hotkey_record", "hotkey_screen_read", "hotkey_read_aloud")]
+        assert len(set(vals)) == 3, f"hotkeys not unique after sanitize: {vals}"
 
     def test_sanitize_settings_dedupes_when_default_differs(self):
         # The dedupe DOES work when the reset target isn't itself the dupe.
