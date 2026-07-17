@@ -14,6 +14,13 @@ ENTRY_SCRIPT = os.path.join(CONFIG_DIR, "main.py")
 
 
 def main():
+    # Self-diagnostic — fast, no GUI, no single-instance lock. Run this on a
+    # new machine (or after a restart) to confirm every component is present.
+    if "--check" in sys.argv:
+        from .selfcheck import run_selfcheck
+
+        sys.exit(run_selfcheck(deep="--deep" in sys.argv))
+
     # Crash handlers FIRST — pythonw discards stderr, so anything before this
     # point failing is invisible. After this line, every unhandled exception
     # (main thread, any worker) lands in debug.log + crash.log.

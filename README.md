@@ -55,6 +55,14 @@ run.bat
 Or double-click `run.bat` in File Explorer. First launch downloads the Whisper
 speech model (one-time). OCR needs no download — it's built into Windows.
 
+**Verify your install** (optional — run in a terminal):
+```powershell
+venv\Scripts\python.exe main.py --check
+```
+Reports PASS/WARN/FAIL for every component (mic, hotkeys, CUDA runtime, OCR,
+VLC, offline/neural TTS). Add `--deep` to also load the Whisper model and prove
+the transcription path. A non-zero exit means a **required** component is missing.
+
 ## Project Structure
 
 ```
