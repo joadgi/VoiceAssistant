@@ -565,9 +565,16 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _on_record(self):
-        """Start recording via button click."""
+        """Start recording into the panel via the button click."""
         if not self.transcriber.is_loaded:
             self._update_status("Whisper model still loading, please wait...")
+            return
+        # Guard the hand-off race: if a dictation is already recording (e.g.
+        # a held push-to-talk into another window), do NOT clobber its pending
+        # target — clicking this button mid-hold used to null _pending_target_hwnd
+        # and mis-route that dictation to the panel. recorder.start() would
+        # no-op anyway; bail so the in-flight target survives to paste.
+        if self.recorder.is_recording:
             return
         self._pending_target_hwnd = None  # clicked in our own window, don't paste elsewhere
         self.recorder.start()
@@ -688,6 +695,14 @@ class MainWindow(QMainWindow):
         text = clean_transcript(
             result.text, light=self.config.get("light_cleanup", True)
         )
+
+        # Cleanup can reduce a filler-only utterance ("um") to nothing. Route
+        # off the CLEANED text, not just the raw no_speech flag — otherwise a
+        # blank "[Voice]" marker gets appended to the panel.
+        if not text.strip():
+            self.indicator.show_idle()
+            self._update_status("No speech detected")
+            return
 
         # Backstop for silence-hallucinations that slip past the segment
         # filters: sub-1.2s clip, VAD found nothing, text is a known artifact.
@@ -856,10 +871,18 @@ class MainWindow(QMainWindow):
             winapi.send_escape()
             time.sleep(0.05)
 
-        # Refocus the target window (where the user had text selected)
+        # Refocus the source window (where the user had text selected). HONOR
+        # the return value: set_foreground_window verifies the switch actually
+        # took and returns False under the Windows foreground lock. If it
+        # didn't take we must NOT send Ctrl+C — it would copy from whatever
+        # window is really in front and read the WRONG selection aloud.
+        # (The paste path bails the same way.) Bail here, before touching the
+        # clipboard, so there is nothing to undo.
         target = self._read_target_hwnd
         if target:
-            winapi.set_foreground_window(target)
+            if not winapi.set_foreground_window(target):
+                applog.dbg("read-aloud: refocus of source window failed; aborting capture")
+                return ""
             time.sleep(0.1)
 
         # Save current clipboard and write a sentinel
@@ -889,14 +912,16 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
-        if not text.strip():
-            try:
-                if old_clipboard:
-                    pyperclip.copy(old_clipboard)
-            except Exception:
-                pass
-            return ""
-        return text
+        # Always restore the user's clipboard — read-aloud speaks `text`; it
+        # never needs the clipboard afterward. Restoring unconditionally (a)
+        # clears the NUL sentinel even when the prior clipboard was empty, and
+        # (b) no longer leaves the grabbed selection sitting on the clipboard
+        # on the success path (matches the paste subsystem's restore).
+        try:
+            pyperclip.copy(old_clipboard)
+        except Exception:
+            pass
+        return text if text.strip() else ""
 
     @Slot(str)
     def _on_read_text_ready(self, text):

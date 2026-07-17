@@ -306,16 +306,12 @@ def test_no_speech_result_is_silent(flow):
 # --------------------------------------------------------------------------- #
 # 4b. Filler-only transcript - documents a real spam bug in the routing slot.
 # --------------------------------------------------------------------------- #
-def test_filler_only_transcript_documents_panel_marker(flow):
+def test_filler_only_transcript_not_pasted_and_no_panel_marker(flow):
     """A filler-only utterance ("um") is a REACHABLE input (Whisper transcribes
-    it, no_speech is derived from the RAW text so it is False). clean_transcript
-    then strips it to "", so nothing is pasted -- correct. BUT the else-branch
-    still calls _append_output("", prefix="[Voice]"), inserting a contentless
-    "[Voice]" marker into the panel.
-
-    This test PINS that current behavior (it is not the desired outcome). See
-    the FINDINGS section of the report: window.py:704-713 routes on the RAW
-    text's no_speech flag, not on whether the CLEANED text is empty."""
+    it; no_speech is derived from the RAW text so it is False). clean_transcript
+    strips it to "" -> nothing to paste AND nothing to show. FIXED: the handler
+    now routes on the CLEANED text being empty, so it neither pastes nor dumps
+    a contentless "[Voice]" marker into the panel (it reports "No speech")."""
     mw, ft, fp = flow.mw, flow.transcribe, flow.paste
     mw._dictation_active = True
     mw.transcriber.transcription_ready.emit(
@@ -323,8 +319,25 @@ def test_filler_only_transcript_documents_panel_marker(flow):
                             duration_s=2.0, retried=False, no_speech=False)
     )
     assert fp.calls == []  # cleaned to "" -> correctly not pasted
-    # Documented bug: bare prefix with no content lands in the panel.
-    assert mw.text_output.toPlainText().strip() == "[Voice]"
+    assert mw.text_output.toPlainText().strip() == ""  # no blank marker in panel
+
+
+# --------------------------------------------------------------------------- #
+def test_panel_record_during_ptt_hold_does_not_clobber_target(flow):
+    """Hand-off race regression: while a push-to-talk dictation is recording
+    into an external window, clicking "Record to Panel" must NOT null the
+    pending target (which used to mis-route that dictation to the panel on
+    release). The button is a guarded no-op while a recording is in flight."""
+    mw = flow.mw
+    mw._dictation_active = True
+    mw._pending_target_hwnd = 0xABCD          # PTT captured an external window
+    mw.recorder._is_recording = True          # simulate recording in progress
+    try:
+        mw._on_record()                       # user clicks "Record to Panel" mid-hold
+        assert mw._pending_target_hwnd == 0xABCD, \
+            "panel Record clobbered the in-flight push-to-talk target"
+    finally:
+        mw.recorder._is_recording = False
 
 
 # --------------------------------------------------------------------------- #

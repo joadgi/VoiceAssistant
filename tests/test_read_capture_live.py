@@ -361,7 +361,7 @@ def test_capture_returns_the_selected_text(qapp, mw, make_target, monkeypatch):
     mw.config.set("hotkey_read_aloud", "ctrl+shift+t")  # non-windows default
     mw._read_target_hwnd = hwnd
 
-    seed = "PRIOR-CLIP::should-be-replaced-by-the-selection"
+    seed = "PRIOR-CLIP::must-survive-a-read"
     _seed_clipboard(seed)
 
     captured = _run_capture(qapp, mw)
@@ -369,10 +369,9 @@ def test_capture_returns_the_selected_text(qapp, mw, make_target, monkeypatch):
     assert captured.strip() == known, f"captured {captured!r}, expected {known!r}"
     # M2 contract: no Escape for a non-windows hotkey.
     assert esc["n"] == 0, "Escape was injected for a non-windows hotkey (M2 regression)"
-    # Documented behavior (NOTES #3): the success path leaves the SELECTION on
-    # the clipboard and does NOT restore the prior clipboard.
-    assert pyperclip.paste().strip() == known, "selection not left on clipboard"
-    assert pyperclip.paste() != seed, "prior clipboard unexpectedly restored on success"
+    # FIXED (#3): read-aloud now RESTORES the user's clipboard on success — the
+    # grabbed selection is not left sitting on the clipboard (matches paste).
+    assert pyperclip.paste() == seed, "prior clipboard was not restored on success"
 
 
 # --------------------------------------------------------------------------- #
