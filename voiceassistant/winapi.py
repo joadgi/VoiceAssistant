@@ -8,11 +8,26 @@ import ctypes
 import os
 import sys
 import time
+from ctypes import wintypes
 
 from . import applog
 
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
+
+# Declare handle-returning functions as pointer-width. Without this, ctypes
+# defaults their return to C int and SIGN-TRUNCATES HWNDs to 32 bits on 64-bit
+# Windows — so a handle from GetForegroundWindow() could never compare equal to
+# a full-width handle from Qt's winId(), silently breaking the is-own-window /
+# focus checks. (Found by the live paste test.)
+user32.GetForegroundWindow.restype = wintypes.HWND
+user32.GetForegroundWindow.argtypes = []
+user32.SetForegroundWindow.restype = wintypes.BOOL
+user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+user32.IsWindow.restype = wintypes.BOOL
+user32.IsWindow.argtypes = [wintypes.HWND]
+user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.c_void_p]
 
 VK_CONTROL = 0x11
 VK_ESCAPE = 0x1B
@@ -25,8 +40,8 @@ KEYEVENTF_KEYUP = 0x0002
 # Foreground window
 # ---------------------------------------------------------------------------
 def get_foreground_window():
-    """Return the HWND of the currently focused window."""
-    return user32.GetForegroundWindow()
+    """Return the HWND (int) of the currently focused window, or 0."""
+    return int(user32.GetForegroundWindow() or 0)
 
 
 class _POINT(ctypes.Structure):
@@ -51,17 +66,38 @@ def is_window(hwnd):
 
 
 def set_foreground_window(hwnd):
-    """Bring a window to front. Uses AttachThreadInput trick for reliability."""
+    """Bring a window to front and VERIFY it actually took.
+
+    Windows enforces a foreground lock: SetForegroundWindow can be silently
+    refused (returns without effect) when the calling process isn't the
+    current foreground process. If we don't verify, the caller believes it
+    refocused the target and pastes Ctrl+V into whatever window is REALLY in
+    front — silently mis-delivering the user's dictation. So we confirm
+    GetForegroundWindow() == hwnd (briefly polling for the async switch) and
+    return False if the refocus did not take; the paste path treats False as
+    "leave the text on the clipboard + panel" rather than blindly pasting.
+    """
     if not is_window(hwnd):
         return False
+    hwnd = int(hwnd)
+    if get_foreground_window() == hwnd:
+        return True
     current_thread = kernel32.GetCurrentThreadId()
     target_thread = user32.GetWindowThreadProcessId(hwnd, None)
-    if current_thread != target_thread:
+    attached = current_thread != target_thread
+    if attached:
         user32.AttachThreadInput(current_thread, target_thread, True)
-    user32.SetForegroundWindow(hwnd)
-    if current_thread != target_thread:
-        user32.AttachThreadInput(current_thread, target_thread, False)
-    return True
+    try:
+        user32.SetForegroundWindow(hwnd)
+    finally:
+        if attached:
+            user32.AttachThreadInput(current_thread, target_thread, False)
+    # The switch is asynchronous — poll briefly for it to actually take.
+    for _ in range(15):
+        if get_foreground_window() == hwnd:
+            return True
+        time.sleep(0.02)
+    return False
 
 
 # ---------------------------------------------------------------------------

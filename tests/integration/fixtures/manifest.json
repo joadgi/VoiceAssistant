@@ -1,0 +1,188 @@
+{
+  "sample_rate": 16000,
+  "seed": 42,
+  "generator_version": 1,
+  "note": "Expected transcripts are what the pipeline SHOULD paste. Speech assertions are WER-tolerance based, never exact-match (Whisper on GPU is not bit-deterministic). Regenerate WAVs with gen_speech_battery.py; this manifest is committed.",
+  "clips": [
+    {
+      "file": "cmd_open_report.wav",
+      "kind": "speech",
+      "expected": "Open the report.",
+      "noisy": false,
+      "snr_db": null,
+      "rate": 175,
+      "max_wer": 0.15,
+      "note": "short command"
+    },
+    {
+      "file": "paragraph_60w.wav",
+      "kind": "speech",
+      "expected": "Thanks for joining the call today. I want to walk through the plan for the next quarter and make sure we are aligned. First, we will finalize the budget and confirm the timeline with each team. Then we will review the open risks, assign clear owners, and agree on the metrics that tell us whether we are actually making progress.",
+      "noisy": false,
+      "snr_db": null,
+      "rate": 175,
+      "max_wer": 0.15,
+      "note": "~60-word paragraph"
+    },
+    {
+      "file": "numbers_currency.wav",
+      "kind": "speech",
+      "expected": "Transfer $1,250 on March 3rd at 4:45 PM.",
+      "noisy": false,
+      "snr_db": null,
+      "rate": 170,
+      "max_wer": 0.4,
+      "note": "numbers/dates/currency"
+    },
+    {
+      "file": "email_url.wav",
+      "kind": "speech",
+      "expected": "Email me at josh dot gibson at example dot com, or visit example dot com slash docs.",
+      "noisy": false,
+      "snr_db": null,
+      "rate": 165,
+      "max_wer": 0.3,
+      "note": "email + URL"
+    },
+    {
+      "file": "technical_jargon.wav",
+      "kind": "speech",
+      "expected": "Our microservice authenticates with an OAuth token and caches the response in Redis.",
+      "noisy": false,
+      "snr_db": null,
+      "rate": 175,
+      "max_wer": 0.3,
+      "note": "technical jargon"
+    },
+    {
+      "file": "questions_punct.wav",
+      "kind": "speech",
+      "expected": "Are you ready for the review? If so, please bring the slides, the budget, and your laptop.",
+      "noisy": false,
+      "snr_db": null,
+      "rate": 175,
+      "max_wer": 0.15,
+      "note": "mixed punctuation & question"
+    },
+    {
+      "file": "rate_slow.wav",
+      "kind": "speech",
+      "expected": "The quarterly report is ready for review and the numbers look strong.",
+      "noisy": false,
+      "snr_db": null,
+      "rate": 130,
+      "max_wer": 0.15,
+      "note": "speaking rate 130 wpm"
+    },
+    {
+      "file": "rate_med.wav",
+      "kind": "speech",
+      "expected": "The quarterly report is ready for review and the numbers look strong.",
+      "noisy": false,
+      "snr_db": null,
+      "rate": 175,
+      "max_wer": 0.15,
+      "note": "speaking rate 175 wpm"
+    },
+    {
+      "file": "rate_fast.wav",
+      "kind": "speech",
+      "expected": "The quarterly report is ready for review and the numbers look strong.",
+      "noisy": false,
+      "snr_db": null,
+      "rate": 215,
+      "max_wer": 0.2,
+      "note": "speaking rate 215 wpm"
+    },
+    {
+      "file": "cmd_open_report_noise20db.wav",
+      "kind": "speech",
+      "expected": "Open the report.",
+      "noisy": true,
+      "snr_db": 20,
+      "rate": 175,
+      "max_wer": 0.35,
+      "note": "cmd_open_report @ 20 dB SNR"
+    },
+    {
+      "file": "cmd_open_report_noise10db.wav",
+      "kind": "speech",
+      "expected": "Open the report.",
+      "noisy": true,
+      "snr_db": 10,
+      "rate": 175,
+      "max_wer": 0.35,
+      "note": "cmd_open_report @ 10 dB SNR"
+    },
+    {
+      "file": "rate_med_noise20db.wav",
+      "kind": "speech",
+      "expected": "The quarterly report is ready for review and the numbers look strong.",
+      "noisy": true,
+      "snr_db": 20,
+      "rate": 175,
+      "max_wer": 0.35,
+      "note": "rate_med @ 20 dB SNR"
+    },
+    {
+      "file": "rate_med_noise10db.wav",
+      "kind": "speech",
+      "expected": "The quarterly report is ready for review and the numbers look strong.",
+      "noisy": true,
+      "snr_db": 10,
+      "rate": 175,
+      "max_wer": 0.35,
+      "note": "rate_med @ 10 dB SNR"
+    },
+    {
+      "file": "questions_punct_noise20db.wav",
+      "kind": "speech",
+      "expected": "Are you ready for the review? If so, please bring the slides, the budget, and your laptop.",
+      "noisy": true,
+      "snr_db": 20,
+      "rate": 175,
+      "max_wer": 0.35,
+      "note": "questions_punct @ 20 dB SNR"
+    },
+    {
+      "file": "questions_punct_noise10db.wav",
+      "kind": "speech",
+      "expected": "Are you ready for the review? If so, please bring the slides, the budget, and your laptop.",
+      "noisy": true,
+      "snr_db": 10,
+      "rate": 175,
+      "max_wer": 0.35,
+      "note": "questions_punct @ 10 dB SNR"
+    },
+    {
+      "file": "near_silence_2s.wav",
+      "kind": "noise",
+      "expected": "",
+      "noisy": true,
+      "snr_db": null,
+      "rate": null,
+      "max_wer": null,
+      "note": "near-silence (dropped by record gate)"
+    },
+    {
+      "file": "room_noise_3s.wav",
+      "kind": "noise",
+      "expected": "",
+      "noisy": true,
+      "snr_db": null,
+      "rate": null,
+      "max_wer": null,
+      "note": "room noise, clears gate (must not paste)"
+    },
+    {
+      "file": "white_noise_loud_3s.wav",
+      "kind": "noise",
+      "expected": "",
+      "noisy": true,
+      "snr_db": null,
+      "rate": null,
+      "max_wer": null,
+      "note": "louder white-noise stress (must not paste)"
+    }
+  ]
+}
