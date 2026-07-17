@@ -1,9 +1,26 @@
-"""Configuration and settings for Voice Assistant."""
+"""Configuration and settings for Voice Assistant.
+
+Settings live in settings.json next to the app (per-user, gitignored).
+Writes are ATOMIC (temp file + os.replace) so a crash mid-save can never
+truncate the file, and a corrupt file is backed up — never silently discarded.
+
+HOTKEY CONTRACT (user directive — never hardcode): every action's hotkey
+(Dictate / Read / OCR) is a per-user setting, editable in the UI and stored
+here; DEFAULTS are factory defaults only. Modifier-only combos (ctrl+alt) are
+a supported deliberate choice. Only bindings that would break basic function
+are rejected (bare typing keys, a single bare modifier, escape).
+"""
 
 import json
 import os
+import shutil
+import tempfile
 
-CONFIG_DIR = os.path.dirname(os.path.abspath(__file__))
+from . import applog
+
+# The app root is the parent of this package — settings.json stays where it
+# has always lived, next to run.bat.
+CONFIG_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_FILE = os.path.join(CONFIG_DIR, "settings.json")
 
 DEFAULTS = {
@@ -40,6 +57,7 @@ DEFAULTS = {
     "min_record_seconds": 0.2,
     "min_record_peak": 0.008,
     "light_cleanup": True,
+    "debug_logging": False,
 }
 
 
@@ -115,6 +133,8 @@ def sanitize_settings(data):
 class Config:
     def __init__(self):
         self._data = dict(DEFAULTS)
+        self._dirty = False
+        self.load_error = None  # set when a corrupt file was backed up
         self.load()
 
     def load(self):
@@ -123,25 +143,67 @@ class Config:
                 with open(CONFIG_FILE, "r") as f:
                     saved = json.load(f)
                 self._data.update(saved)
-            except (json.JSONDecodeError, IOError):
-                pass
+            except (json.JSONDecodeError, IOError) as e:
+                # Never silently discard the user's settings — back the file
+                # up so it can be inspected/recovered, and surface the event.
+                backup = CONFIG_FILE + ".corrupt.bak"
+                try:
+                    shutil.copyfile(CONFIG_FILE, backup)
+                    self.load_error = (
+                        f"settings.json was unreadable ({e.__class__.__name__}); "
+                        f"backed up to {os.path.basename(backup)} and reset to defaults"
+                    )
+                except OSError:
+                    self.load_error = "settings.json was unreadable; reset to defaults"
+                applog.error(self.load_error)
         sanitized = sanitize_settings(self._data)
         if sanitized != self._data:
             self._data = sanitized
             self.save()
 
     def save(self):
-        with open(CONFIG_FILE, "w") as f:
-            json.dump(self._data, f, indent=2)
+        """Atomic write: temp file in the same directory, then os.replace.
+
+        A crash or power loss mid-write can no longer truncate settings.json
+        (which previously reset every preference to defaults on next launch).
+        """
+        try:
+            fd, tmp_path = tempfile.mkstemp(
+                dir=CONFIG_DIR, prefix="settings.", suffix=".tmp"
+            )
+            try:
+                with os.fdopen(fd, "w") as f:
+                    json.dump(self._data, f, indent=2)
+                os.replace(tmp_path, CONFIG_FILE)
+            finally:
+                if os.path.exists(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+            self._dirty = False
+        except OSError as e:
+            applog.error(f"settings save failed: {e}")
 
     def get(self, key, default=None):
         return self._data.get(key, default if default is not None else DEFAULTS.get(key))
 
-    def set(self, key, value):
+    def set(self, key, value, defer_save=False):
+        """Set a value. defer_save=True marks dirty without writing — used by
+        high-frequency callers (the speed slider fired a disk write per tick);
+        call flush() when the interaction ends."""
         if self._data.get(key) == value:
             return
         self._data[key] = value
-        self.save()
+        if defer_save:
+            self._dirty = True
+        else:
+            self.save()
+
+    def flush(self):
+        """Write deferred changes, if any."""
+        if self._dirty:
+            self.save()
 
     def __getitem__(self, key):
         return self._data[key]

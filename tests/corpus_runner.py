@@ -36,8 +36,8 @@ def load_wav(path):
 
 def build_transcriber():
     """Load the model the same way the app does (CUDA -> CPU int8 fallback)."""
-    from config import DEFAULTS
-    from voice_engine import Transcriber
+    from voiceassistant.config import DEFAULTS
+    from voiceassistant.transcriber import Transcriber
 
     t = Transcriber(
         model_size=DEFAULTS["whisper_model"],
@@ -79,8 +79,8 @@ def app_pipeline(transcriber, audio):
 def app_decision(entry):
     """Replicate _on_transcription_ready's verdict for this clip: what text
     (if any) would actually be pasted?"""
-    from main import clean_transcript, is_probable_hallucination
-    from voice_engine import TranscriptionResult
+    from voiceassistant.text import clean_transcript, is_probable_hallucination
+    from voiceassistant.transcriber import TranscriptionResult
 
     raw = entry["raw_final"]
     result = TranscriptionResult(
@@ -100,7 +100,7 @@ def app_decision(entry):
 
 def gate_decision(audio):
     """The app's silent-drop gate from _on_recording_stopped."""
-    from config import DEFAULTS
+    from voiceassistant.config import DEFAULTS
 
     duration = len(audio) / 16000.0 if len(audio) else 0.0
     peak = float(np.max(np.abs(audio))) if len(audio) else 0.0

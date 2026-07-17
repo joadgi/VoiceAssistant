@@ -13,16 +13,18 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import config as config_mod
-from config import DEFAULTS, normalize_hotkey, validate_hotkey, sanitize_settings
-from main import (
+import voiceassistant.config as config_mod
+from voiceassistant.config import (
+    DEFAULTS, normalize_hotkey, validate_hotkey, sanitize_settings,
+)
+from voiceassistant.text import (
     clean_transcript,
     collapse_repeated_phrases,
     is_probable_hallucination,
     sanitize_for_paste,
     strip_fillers,
 )
-from voice_engine import TranscriptionResult
+from voiceassistant.transcriber import TranscriptionResult
 
 
 # ---------------------------------------------------------------------------

@@ -1,13 +1,21 @@
-"""Screen capture and OCR engine for reading on-screen text."""
+"""Screen capture + OCR + region-selection overlay.
 
-import threading
+Phase 3 changes from the old screen_reader.py:
+  * one owned SerialWorker for model load + reads (threading law);
+  * the process-global sys.stdout/stderr swap is GONE — it raced the Whisper
+    loader on another thread and silently no-op'd under pythonw. EasyOCR's
+    progress output is suppressed with its own verbose=False instead.
+"""
+
 import numpy as np
 from PIL import Image
 import mss
 import mss.tools
-from PySide6.QtCore import QObject, Signal, Qt, QPoint, QRect
+from PySide6.QtCore import QObject, Signal, Qt, QRect
 from PySide6.QtGui import QPainter, QColor, QPen, QCursor, QGuiApplication
 from PySide6.QtWidgets import QWidget
+
+from .workers import SerialWorker
 
 
 class ScreenCapture:
@@ -33,23 +41,16 @@ class ScreenCapture:
         x = max(left, min(cursor_pos.x() - width // 2, right - width))
         y = max(top, min(cursor_pos.y() - height // 2, bottom - height))
 
-        monitor = {
-            "left": x,
-            "top": y,
-            "width": width,
-            "height": height,
-        }
-
+        monitor = {"left": x, "top": y, "width": width, "height": height}
         screenshot = self._sct.grab(monitor)
-        img = Image.frombytes("RGB", screenshot.size, screenshot.rgb)
-        return img
+        return Image.frombytes("RGB", screenshot.size, screenshot.rgb)
 
     def capture_region(self, x, y, w, h):
         """Capture a specific screen region."""
         monitor = {"left": x, "top": y, "width": w, "height": h}
         screenshot = self._sct.grab(monitor)
-        img = Image.frombytes("RGB", screenshot.size, screenshot.rgb)
-        return img
+        return Image.frombytes("RGB", screenshot.size, screenshot.rgb)
+
 
 class OCREngine(QObject):
     """EasyOCR-based text recognition."""
@@ -64,76 +65,55 @@ class OCREngine(QObject):
         self.languages = languages or ["en"]
         self.gpu = gpu
         self._reader = None
-        self._lock = threading.Lock()
+        self._worker = SerialWorker("ocr")
 
     @property
     def is_loaded(self):
         return self._reader is not None
 
     def load_model(self):
-        """Load the EasyOCR model in a background thread."""
-        thread = threading.Thread(target=self._load_worker, daemon=True)
-        thread.start()
+        """Load the EasyOCR model on the OCR worker."""
+        self._worker.submit(self._load_job)
 
-    def _load_worker(self):
-        import sys, io
-
-        # EasyOCR prints Unicode progress bars that crash on Windows cp1252
-        old_stdout = sys.stdout
-        old_stderr = sys.stderr
-        try:
-            sys.stdout = io.TextIOWrapper(
-                sys.stdout.buffer, encoding="utf-8", errors="replace", line_buffering=True
-            )
-            sys.stderr = io.TextIOWrapper(
-                sys.stderr.buffer, encoding="utf-8", errors="replace", line_buffering=True
-            )
-        except Exception:
-            pass
-
+    def _load_job(self):
         try:
             self.model_loading.emit("Loading OCR engine...")
             import easyocr
 
-            self._reader = easyocr.Reader(self.languages, gpu=self.gpu)
+            # verbose=False suppresses the Unicode progress bars that crashed
+            # on cp1252 consoles — no more swapping process-global stdio.
+            self._reader = easyocr.Reader(self.languages, gpu=self.gpu, verbose=False)
             self.model_ready.emit()
         except Exception as e:
+            from . import applog
+
+            applog.error(f"GPU OCR load failed ({e}); trying CPU")
             try:
                 self.model_loading.emit("GPU OCR failed, trying CPU...")
                 import easyocr
 
-                self._reader = easyocr.Reader(self.languages, gpu=False)
+                self._reader = easyocr.Reader(self.languages, gpu=False, verbose=False)
                 self.gpu = False
                 self.model_ready.emit()
             except Exception as e2:
                 self.error.emit(f"OCR load failed: {e2}")
-        finally:
-            try:
-                sys.stdout = old_stdout
-                sys.stderr = old_stderr
-            except Exception:
-                pass
 
     def read_image(self, pil_image):
-        """Run OCR on a PIL image in a background thread."""
+        """Run OCR on a PIL image on the OCR worker."""
         if not self.is_loaded:
             self.error.emit("OCR engine not loaded yet")
             return
-        thread = threading.Thread(
-            target=self._read_worker, args=(pil_image,), daemon=True
-        )
-        thread.start()
+        self._worker.submit(self._read_job, pil_image)
 
-    def _read_worker(self, pil_image):
+    def _read_job(self, pil_image):
         try:
-            with self._lock:
-                img_array = np.array(pil_image)
-                results = self._reader.readtext(img_array)
-                lines = [text for (_, text, conf) in results if conf > 0.3]
-                if lines:
-                    self.text_ready.emit("\n".join(lines))
-                else:
-                    self.text_ready.emit("[No text detected in region]")
+            img_array = np.array(pil_image)
+            results = self._reader.readtext(img_array)
+            lines = [text for (_, text, conf) in results if conf > 0.3]
+            if lines:
+                self.text_ready.emit("\n".join(lines))
+            else:
+                self.text_ready.emit("[No text detected in region]")
         except Exception as e:
             self.error.emit(f"OCR error: {e}")
 
@@ -170,15 +150,12 @@ class RegionSelector(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        # Semi-transparent dark overlay
         painter.fillRect(self.rect(), QColor(0, 0, 0, 80))
 
         if self._start_pos and self._current_pos:
             rect = QRect(self._start_pos, self._current_pos).normalized()
-            # Clear the selected region (make it transparent)
             painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
             painter.fillRect(rect, QColor(0, 0, 0, 0))
-            # Draw border around selection
             painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
             pen = QPen(QColor(0, 170, 255), 2)
             painter.setPen(pen)

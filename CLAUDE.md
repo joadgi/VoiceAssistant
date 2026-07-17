@@ -35,13 +35,27 @@ Three features, in priority order:
 
 ## File map
 
-| File | Responsibility |
+The app lives in the `voiceassistant/` package (flat layout, dependencies
+point downward only); root `main.py` is a 10-line entry shim for
+run.bat/shortcuts/startup-registry compatibility.
+
+| Module | Responsibility |
 |---|---|
-| `main.py` | Entry point, PySide6 UI, all orchestration: hotkey registration, dictation flow, Win32 paste, the floating `RecordingIndicator` pill, system tray, settings dialog, and the single `HotkeyCaptureWidget`. |
-| `voice_engine.py` | `VoiceRecorder` (sounddevice mic capture) + `Transcriber` (faster-whisper). |
-| `screen_reader.py` | `ScreenCapture` (mss) + `OCREngine` (EasyOCR) + `RegionSelector` (drag-to-select overlay). |
-| `tts_engine.py` | `TTSEngine` — edge-tts → VLC playback with live speed; pyttsx3 fallback. |
-| `config.py` | `Config` + `DEFAULTS` + hotkey `normalize_hotkey` / `validate_hotkey`. |
+| `voiceassistant/app.py` | Bootstrap: crash handlers FIRST, single-instance mutex, QApplication. |
+| `voiceassistant/window.py` | `MainWindow` — all orchestration and signal wiring. Renders state + dispatches jobs; never blocks. |
+| `voiceassistant/widgets.py` | `RecordingIndicator` pill + the single `HotkeyCaptureWidget`. |
+| `voiceassistant/settings_dialog.py` / `theme.py` | Settings UI, dark stylesheet. |
+| `voiceassistant/recorder.py` | `VoiceRecorder` (sounddevice mic capture, guarded teardown). |
+| `voiceassistant/transcriber.py` | `Transcriber` + `TranscriptionResult` (faster-whisper, both-pass guards, job-bound context). |
+| `voiceassistant/tts.py` | `TTSEngine` — edge-tts → VLC (live speed), per-utterance generations, pyttsx3 fallback, bounded network waits. |
+| `voiceassistant/ocr.py` | `ScreenCapture` (mss) + `OCREngine` (EasyOCR) + `RegionSelector`. |
+| `voiceassistant/paste.py` | `Paster` — the paste worker: clipboard snapshot/restore + Win32 Ctrl+V, off the GUI thread. |
+| `voiceassistant/winapi.py` | ALL Win32/ctypes calls (foreground window, keystrokes, single-instance, startup registry). |
+| `voiceassistant/text.py` | Pure text logic: repeat collapse, cleanup chain, hallucination denylist, paste sanitizing. 100% unit-tested. |
+| `voiceassistant/config.py` | `Config` (ATOMIC saves, corrupt-file backup) + `DEFAULTS` + hotkey validation. |
+| `voiceassistant/workers.py` | `SerialWorker` — **the threading law**: every subsystem owns exactly one worker+queue; no ad-hoc `threading.Thread` anywhere. |
+| `voiceassistant/applog.py` | Privacy-safe rotating log (never logs payloads), opt-in debug, excepthooks + faulthandler. |
+| `tests/` | Characterization + fault-injection suites (fast) and the golden-audio corpus gate (local, `RUN_CORPUS=1`). |
 | `setup.bat` / `run.bat` / `create_shortcut.bat` | Env setup, silent launch (pythonw), desktop shortcut. |
 
 ## How it works (data flow)
@@ -121,10 +135,16 @@ All are editable inline — click a hotkey pill and press your combo (single key
 
 ## Reviewing / extending this codebase
 
-- **Start in** `main.py` `MainWindow` for orchestration and signal wiring.
-- **Dictation accuracy/latency** → `voice_engine.py` (`Transcriber`, VAD params, model size).
-- **Paste reliability / focus / the beep** → `paste_to_window` and the Win32 helpers in `main.py`.
-- **Playback / voices / speed** → `tts_engine.py`.
-- **Watchpoints:** the anti-duplicate guards (`_last_audio_id`, `_paste_lock`, the ~1.2s
-  identical-text guard), the silent-drop thresholds, and the VAD retry — these interact, so
-  change them deliberately and test dictation end-to-end (it can't be verified by import alone).
+- **Start in** `voiceassistant/window.py` `MainWindow` for orchestration and signal wiring.
+- **Dictation accuracy/latency** → `voiceassistant/transcriber.py` (VAD params, both-pass
+  segment guards, model size) and `voiceassistant/text.py` (cleanup chain, denylist).
+- **Paste reliability / focus / the beep** → `voiceassistant/paste.py` + `winapi.py`.
+- **Playback / voices / speed** → `voiceassistant/tts.py`.
+- **Before ANY behavior change:** run `pytest tests -q` (fast suites) and, for anything
+  touching the dictation pipeline, `RUN_CORPUS=1 pytest tests/test_corpus_gate.py`
+  (the golden-audio gate — the objective definition of "dictation still works").
+- **Watchpoints:** the job-bound target HWND (never reintroduce a shared field), the
+  monotonic job-id guard, the silent-drop thresholds, the VAD retry (its segment guards
+  must stay on BOTH passes), and the threading law (`workers.SerialWorker` — no ad-hoc
+  threads). These interact; change them deliberately and finish with a live end-to-end
+  voice test (models can't hear a human in CI).

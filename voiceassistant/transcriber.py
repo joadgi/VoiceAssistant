@@ -1,13 +1,16 @@
-"""Voice recording and Whisper transcription engine."""
+"""Transcriber — faster-whisper transcription on one owned worker.
 
-import threading
-import queue
+All model loads and transcription jobs serialize on a single SerialWorker
+(the threading law) — the old per-job daemon threads plus a lock are gone.
+"""
+
 from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
-import sounddevice as sd
 from PySide6.QtCore import QObject, Signal
+
+from .workers import SerialWorker
 
 
 @dataclass
@@ -27,88 +30,6 @@ class TranscriptionResult:
     no_speech: bool = False  # True if both passes found nothing
 
 
-class VoiceRecorder(QObject):
-    """Records audio from the microphone into a numpy buffer."""
-
-    recording_started = Signal()
-    recording_stopped = Signal(np.ndarray)  # emits the audio array
-    level_update = Signal(float)  # emits RMS level for a VU meter
-    error = Signal(str)
-
-    def __init__(self, sample_rate=16000, device=None):
-        super().__init__()
-        self.sample_rate = sample_rate
-        self.device = device  # None = system default, int = device index
-        self._is_recording = False
-        self._audio_queue = queue.Queue()
-        self._stream = None
-
-    @property
-    def is_recording(self):
-        return self._is_recording
-
-    def start(self):
-        if self._is_recording:
-            return
-        self._is_recording = True
-        self._audio_queue = queue.Queue()
-
-        try:
-            dev = self.device if self.device and self.device >= 0 else None
-            self._stream = sd.InputStream(
-                samplerate=self.sample_rate,
-                channels=1,
-                dtype="float32",
-                blocksize=1024,
-                device=dev,
-                callback=self._audio_callback,
-            )
-            self._stream.start()
-            self.recording_started.emit()
-        except Exception as e:
-            self._is_recording = False
-            self.error.emit(f"Microphone error: {e}")
-
-    def stop(self):
-        if not self._is_recording:
-            return
-        self._is_recording = False
-
-        # Guarded teardown: PortAudio raises here if the device vanished
-        # mid-recording (USB mic unplugged). That must never prevent the
-        # recording_stopped emit below — an unemitted stop wedged the whole
-        # dictation state machine (stuck "Recording" pill) and lost the audio.
-        stream, self._stream = self._stream, None
-        if stream is not None:
-            err = None
-            try:
-                stream.stop()
-            except Exception as e:
-                err = e
-            try:
-                stream.close()  # must run even when stop() raised
-            except Exception as e:
-                err = err or e
-            if err is not None:
-                self.error.emit(f"Microphone stop error: {err}")
-
-        chunks = []
-        while not self._audio_queue.empty():
-            chunks.append(self._audio_queue.get())
-
-        if chunks:
-            audio = np.concatenate(chunks, axis=0).flatten()
-            self.recording_stopped.emit(audio)
-        else:
-            self.recording_stopped.emit(np.array([], dtype="float32"))
-
-    def _audio_callback(self, indata, frames, time_info, status):
-        if self._is_recording:
-            self._audio_queue.put(indata.copy())
-            rms = float(np.sqrt(np.mean(indata ** 2)))
-            self.level_update.emit(rms)
-
-
 class Transcriber(QObject):
     """Loads faster-whisper and transcribes audio arrays."""
 
@@ -125,19 +46,18 @@ class Transcriber(QObject):
         self.compute_type = compute_type
         self.language = language
         self._model = None
-        self._lock = threading.Lock()
         self._job_seq = 0  # monotonic job ids (replaces the id(audio) guard)
+        self._worker = SerialWorker("transcriber")
 
     @property
     def is_loaded(self):
         return self._model is not None
 
     def load_model(self):
-        """Load the Whisper model in a background thread."""
-        thread = threading.Thread(target=self._load_model_worker, daemon=True)
-        thread.start()
+        """Load the Whisper model on the transcriber worker."""
+        self._worker.submit(self._load_job)
 
-    def _load_model_worker(self):
+    def _load_job(self):
         try:
             self.model_loading.emit(f"Loading Whisper {self.model_size} model...")
             from faster_whisper import WhisperModel
@@ -149,9 +69,13 @@ class Transcriber(QObject):
             )
             self.model_ready.emit()
         except Exception as e:
-            # Try CPU fallback
+            # Try CPU fallback — and record WHY the GPU path failed so a
+            # silent slow-CPU session is diagnosable.
+            from . import applog
+
+            applog.error(f"GPU model load failed ({e}); falling back to CPU int8")
             try:
-                self.model_loading.emit(f"GPU failed, falling back to CPU...")
+                self.model_loading.emit("GPU failed, falling back to CPU...")
                 from faster_whisper import WhisperModel
 
                 self._model = WhisperModel(
@@ -166,7 +90,7 @@ class Transcriber(QObject):
                 self.error.emit(f"Failed to load model: {e2}")
 
     def transcribe(self, audio_data, context=None):
-        """Transcribe audio in a background thread.
+        """Transcribe audio on the worker.
 
         `context` is carried through to the TranscriptionResult untouched —
         the dictation flow passes the target HWND captured at record time so
@@ -180,12 +104,7 @@ class Transcriber(QObject):
             return
 
         self._job_seq += 1
-        thread = threading.Thread(
-            target=self._transcribe_worker,
-            args=(audio_data, context, self._job_seq),
-            daemon=True,
-        )
-        thread.start()
+        self._worker.submit(self._transcribe_job, audio_data, context, self._job_seq)
 
     def _run_transcribe(self, audio_data, use_vad):
         """Run one transcription pass.
@@ -223,34 +142,33 @@ class Transcriber(QObject):
                 text_parts.append(seg_text)
         return " ".join(text_parts).strip()
 
-    def _transcribe_worker(self, audio_data, context, job_id):
+    def _transcribe_job(self, audio_data, context, job_id):
         try:
-            with self._lock:
-                duration = len(audio_data) / 16000
-                max_amp = float(np.max(np.abs(audio_data)))
-                self.transcription_progress.emit(
-                    f"Transcribing {duration:.1f}s audio (peak: {max_amp:.3f})..."
-                )
+            duration = len(audio_data) / 16000
+            max_amp = float(np.max(np.abs(audio_data)))
+            self.transcription_progress.emit(
+                f"Transcribing {duration:.1f}s audio (peak: {max_amp:.3f})..."
+            )
 
-                retried = False
-                full_text = self._run_transcribe(audio_data, use_vad=True)
-                if not full_text:
-                    # VAD may have judged quiet/short speech as silence. Retry
-                    # without it so real audio is never lost ("voice not
-                    # working") — with the shared segment guards still active.
-                    retried = True
-                    full_text = self._run_transcribe(audio_data, use_vad=False)
+            retried = False
+            full_text = self._run_transcribe(audio_data, use_vad=True)
+            if not full_text:
+                # VAD may have judged quiet/short speech as silence. Retry
+                # without it so real audio is never lost ("voice not
+                # working") — with the shared segment guards still active.
+                retried = True
+                full_text = self._run_transcribe(audio_data, use_vad=False)
 
-                self.transcription_ready.emit(
-                    TranscriptionResult(
-                        text=full_text,
-                        job_id=job_id,
-                        context=context,
-                        duration_s=duration,
-                        retried=retried,
-                        no_speech=not full_text,
-                    )
+            self.transcription_ready.emit(
+                TranscriptionResult(
+                    text=full_text,
+                    job_id=job_id,
+                    context=context,
+                    duration_s=duration,
+                    retried=retried,
+                    no_speech=not full_text,
                 )
+            )
         except Exception as e:
             self.error.emit(f"Transcription error: {e}")
 

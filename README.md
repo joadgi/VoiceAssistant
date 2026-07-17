@@ -56,15 +56,23 @@ Or double-click `run.bat` in File Explorer. First launch downloads Whisper + Eas
 
 ```
 VoiceAssistant/
-├── main.py              PySide6 UI, hotkey wiring, all orchestration
-├── voice_engine.py      Mic recording + Whisper transcription
-├── tts_engine.py        edge-tts streaming + VLC playback
-├── screen_reader.py     Screen capture + EasyOCR + region selector
-├── config.py            JSON settings load/save
-├── requirements.txt     Python dependencies
-├── setup.bat            First-time environment setup
-├── run.bat              Silent launcher (uses pythonw.exe)
-└── create_shortcut.bat  Creates desktop shortcut
+├── main.py                  Entry shim (the app lives in the package below)
+├── voiceassistant/          The application package
+│   ├── app.py               Bootstrap: crash handlers, single instance, Qt
+│   ├── window.py            Main window — orchestration + signal wiring
+│   ├── widgets.py           Floating pill + hotkey-capture widget
+│   ├── settings_dialog.py   Settings UI          ├── theme.py  Dark style
+│   ├── recorder.py          Mic capture          ├── transcriber.py  Whisper
+│   ├── tts.py               edge-tts + VLC       ├── ocr.py    EasyOCR + capture
+│   ├── paste.py             Paste worker (clipboard-safe)
+│   ├── winapi.py            All Win32 calls      ├── text.py   Pure cleanup logic
+│   ├── config.py            Atomic settings      ├── workers.py  Threading law
+│   └── applog.py            Privacy-safe rotating log + crash visibility
+├── tests/                   Unit + fault-injection suites, golden-audio corpus
+├── requirements.txt         Python dependencies
+├── setup.bat                First-time environment setup
+├── run.bat                  Silent launcher (uses pythonw.exe)
+└── create_shortcut.bat      Creates desktop shortcut
 ```
 
 ## Default Hotkeys
