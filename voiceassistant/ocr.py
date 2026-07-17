@@ -292,7 +292,16 @@ class RegionSelector(QWidget):
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Escape:
+            # Fully reset the selection state machine. Clearing only the
+            # positions (not _is_selecting / _start_phys) left an in-progress
+            # drag "live": the implicit mouse grab still delivers the eventual
+            # button-up to this hidden widget, so mouseReleaseEvent would fire
+            # a SECOND signal (region_selected from stale coords) after we
+            # already emitted cancelled — an unwanted OCR read of the wrong
+            # region right after the user pressed Esc to cancel.
+            self._is_selecting = False
             self.hide()
             self.cancelled.emit()
             self._start_pos = None
             self._current_pos = None
+            self._start_phys = None
