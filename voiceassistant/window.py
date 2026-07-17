@@ -90,6 +90,12 @@ class MainWindow(QMainWindow):
         self._read_target_hwnd = None  # window to refocus for read-selection copy
         self._dictation_active = self.config.get("dictation_mode", True)
         self._last_job_id = None  # duplicate-delivery guard (monotonic job ids)
+        # Every native handle THIS window has had. winId() changes when
+        # setWindowFlags recreates the handle (e.g. toggling always-on-top),
+        # so the own-window paste guard must match against ALL of them, not
+        # just the live one, or a target captured under an old handle would
+        # slip past and we could paste into ourselves.
+        self._own_hwnds = set()
 
         self._build_ui()
         self._connect_signals()
@@ -611,7 +617,7 @@ class MainWindow(QMainWindow):
 
     @Slot(np.ndarray)
     def _on_recording_stopped(self, audio):
-        duration = len(audio) / 16000.0 if len(audio) else 0
+        duration = len(audio) / float(self.recorder.sample_rate) if len(audio) else 0
         max_amp = float(np.max(np.abs(audio))) if len(audio) else 0
         applog.dbg(f"_on_recording_stopped: samples={len(audio)}  duration={duration:.2f}s  peak={max_amp:.4f}")
 
@@ -680,10 +686,12 @@ class MainWindow(QMainWindow):
             f"({len(result.text)} chars, retried={result.retried}, "
             f"dur={result.duration_s:.2f}s)"
         )
-        # Duplicate-delivery guard: monotonic job ids (the old id(audio) check
-        # could drop a REAL second dictation after CPython reused the address).
-        if self._last_job_id == result.job_id:
-            applog.dbg("  duplicate job delivery ignored")
+        # Duplicate/stale-delivery guard. Job ids are monotonic, so anything
+        # <= the last handled id is a repeat or an out-of-order straggler, not
+        # a new dictation — drop it. (Replaces the old id(audio) guard, which
+        # could discard a REAL second dictation after CPython reused an address.)
+        if self._last_job_id is not None and result.job_id <= self._last_job_id:
+            applog.dbg("  duplicate/stale job delivery ignored")
             return
         self._last_job_id = result.job_id
 
@@ -713,8 +721,8 @@ class MainWindow(QMainWindow):
             return
 
         target_hwnd = result.context
-        own_hwnd = int(self.winId())
-        is_own_window = target_hwnd is not None and target_hwnd == own_hwnd
+        self._own_hwnds.add(int(self.winId()))  # keep current handle registered
+        is_own_window = target_hwnd is not None and target_hwnd in self._own_hwnds
 
         if (self._dictation_active and self.config.get("auto_paste", True)
                 and target_hwnd and not is_own_window and text.strip()):
@@ -1144,6 +1152,9 @@ class MainWindow(QMainWindow):
         else:
             flags &= ~Qt.WindowType.WindowStaysOnTopHint
         self.setWindowFlags(flags)
+        # setWindowFlags recreates the native handle — record the new one so
+        # the own-window paste guard still recognizes us afterward.
+        self._own_hwnds.add(int(self.winId()))
         if was_visible:
             self.show()
 

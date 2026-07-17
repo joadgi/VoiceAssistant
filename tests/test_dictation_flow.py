@@ -341,6 +341,52 @@ def test_panel_record_during_ptt_hold_does_not_clobber_target(flow):
 
 
 # --------------------------------------------------------------------------- #
+def test_stale_or_duplicate_job_id_is_dropped(flow):
+    """Job ids are monotonic; a delivery with id <= the last handled id is a
+    duplicate or an out-of-order straggler and must be ignored — not just the
+    exact-equal case."""
+    mw, ft, fp = flow.mw, flow.transcribe, flow.paste
+    mw._dictation_active = True
+    mw.transcriber.transcription_ready.emit(
+        TranscriptionResult(text="first", job_id=5, context=0xABCD,
+                            duration_s=1.0, no_speech=False))
+    assert len(fp.calls) == 1
+    for stale in (5, 3):  # equal, then lower
+        mw.transcriber.transcription_ready.emit(
+            TranscriptionResult(text="stale", job_id=stale, context=0xABCD,
+                                duration_s=1.0, no_speech=False))
+    assert len(fp.calls) == 1, "a stale/duplicate job id was not dropped"
+
+
+# --------------------------------------------------------------------------- #
+def test_own_window_guard_survives_flag_toggle(flow):
+    """winId() changes when setWindowFlags recreates the native handle (e.g.
+    toggling always-on-top). A dictation whose target was our own window under
+    the OLD handle must STILL be treated as own-window (routed to the panel,
+    never pasted) after a toggle — the guard matches against all our handles."""
+    mw, ft, fp = flow.mw, flow.transcribe, flow.paste
+    mw._dictation_active = True
+    old_hwnd = int(mw.winId())
+    mw.config.set("always_on_top", not mw.config["always_on_top"])
+    mw._apply_window_flags()  # recreates the handle; new winId may differ
+    mw.transcriber.transcription_ready.emit(
+        TranscriptionResult(text="into our own window", job_id=1, context=old_hwnd,
+                            duration_s=1.0, no_speech=False))
+    assert fp.calls == [], "pasted into our own window (guard lost the pre-toggle handle)"
+    assert old_hwnd in mw._own_hwnds
+
+
+# --------------------------------------------------------------------------- #
+def test_recorder_pins_capture_rate_to_16k():
+    """Whisper requires 16 kHz; the recorder must pin to it (and every
+    duration calc derives from recorder.sample_rate) so a stray config value
+    can't desync the gate or mis-time the audio."""
+    from voiceassistant.recorder import VoiceRecorder
+    assert VoiceRecorder(sample_rate=16000).sample_rate == 16000
+    assert VoiceRecorder(sample_rate=44100).sample_rate == 16000  # coerced
+
+
+# --------------------------------------------------------------------------- #
 # 5. Job-id duplicate guard - same job_id delivered twice is ignored.
 # --------------------------------------------------------------------------- #
 def test_duplicate_job_id_is_ignored(flow):

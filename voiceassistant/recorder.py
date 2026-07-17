@@ -23,7 +23,14 @@ class VoiceRecorder(QObject):
 
     def __init__(self, sample_rate=16000, device=None, max_seconds=120.0):
         super().__init__()
-        self.sample_rate = sample_rate
+        # Whisper requires 16 kHz mono. Capturing at any other rate would feed
+        # mis-timed audio to Whisper AND desync every duration/gate calc that
+        # divides sample counts by the rate — so pin it, and say so if a caller
+        # asks for something else rather than silently honoring a broken rate.
+        if sample_rate != 16000:
+            from . import applog
+            applog.error(f"VoiceRecorder: ignoring unsupported rate {sample_rate}; Whisper needs 16000")
+        self.sample_rate = 16000
         self.device = device  # None = system default, int = device index
         self.max_seconds = max_seconds  # 0/None = no cap
         self._is_recording = False

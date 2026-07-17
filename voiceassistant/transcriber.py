@@ -12,6 +12,10 @@ from PySide6.QtCore import QObject, Signal
 
 from .workers import SerialWorker
 
+# Whisper's fixed input rate. Audio reaches this module already at 16 kHz mono
+# (the recorder is pinned to it); every sample-count → seconds calc uses this.
+SAMPLE_RATE = 16000
+
 
 @dataclass
 class TranscriptionResult:
@@ -173,7 +177,7 @@ class Transcriber(QObject):
 
     def _transcribe_job(self, audio_data, context, job_id):
         try:
-            duration = len(audio_data) / 16000
+            duration = len(audio_data) / SAMPLE_RATE
             max_amp = float(np.max(np.abs(audio_data)))
             self.transcription_progress.emit(
                 f"Transcribing {duration:.1f}s audio (peak: {max_amp:.3f})..."
