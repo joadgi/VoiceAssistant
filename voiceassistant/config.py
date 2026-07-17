@@ -60,6 +60,8 @@ DEFAULTS = {
     "sample_rate": 16000,
     "min_record_seconds": 0.2,
     "min_record_peak": 0.008,
+    "max_record_seconds": 120,  # safety cap: auto-stop a forgotten/stuck hold
+
     "light_cleanup": True,
     "debug_logging": False,
 }

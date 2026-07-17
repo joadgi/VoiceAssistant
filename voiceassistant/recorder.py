@@ -18,15 +18,20 @@ class VoiceRecorder(QObject):
     recording_started = Signal()
     recording_stopped = Signal(np.ndarray)  # emits the audio array
     level_update = Signal(float)  # emits RMS level for a VU meter
+    max_duration_reached = Signal()  # safety cap hit — GUI should stop us
     error = Signal(str)
 
-    def __init__(self, sample_rate=16000, device=None):
+    def __init__(self, sample_rate=16000, device=None, max_seconds=120.0):
         super().__init__()
         self.sample_rate = sample_rate
         self.device = device  # None = system default, int = device index
+        self.max_seconds = max_seconds  # 0/None = no cap
         self._is_recording = False
         self._audio_queue = queue.Queue()
         self._stream = None
+        self._frames_captured = 0
+        self._max_frames = 0
+        self._max_hit = False
 
     @property
     def is_recording(self):
@@ -38,6 +43,9 @@ class VoiceRecorder(QObject):
         self._is_recording = True
         self._audio_queue = queue.Queue()
         self._overflow_count = 0
+        self._frames_captured = 0
+        self._max_hit = False
+        self._max_frames = int((self.max_seconds or 0) * self.sample_rate)
 
         try:
             dev = self.device if self.device and self.device >= 0 else None
@@ -106,3 +114,14 @@ class VoiceRecorder(QObject):
             self._audio_queue.put(indata.copy())
             rms = float(np.sqrt(np.mean(indata ** 2)))
             self.level_update.emit(rms)
+
+            # Safety cap: a forgotten/stuck held hotkey would otherwise grow
+            # the buffer forever (~64 KB/s). Signal the GUI thread to stop —
+            # we must NOT call stop() here (closing the stream from inside its
+            # own callback deadlocks PortAudio). Captured audio is preserved
+            # and still transcribed; fires exactly once.
+            self._frames_captured += frames
+            if (self._max_frames and not self._max_hit
+                    and self._frames_captured >= self._max_frames):
+                self._max_hit = True
+                self.max_duration_reached.emit()

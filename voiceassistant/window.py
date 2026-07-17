@@ -53,7 +53,10 @@ class MainWindow(QMainWindow):
         self.resize(820, 600)
 
         # --- Engines ---
-        self.recorder = VoiceRecorder(sample_rate=self.config["sample_rate"])
+        self.recorder = VoiceRecorder(
+            sample_rate=self.config["sample_rate"],
+            max_seconds=self.config.get("max_record_seconds", 120),
+        )
         self.transcriber = Transcriber(
             model_size=self.config["whisper_model"],
             device=self.config["whisper_device"],
@@ -356,6 +359,7 @@ class MainWindow(QMainWindow):
         self.recorder.recording_started.connect(self._on_recording_started)
         self.recorder.recording_stopped.connect(self._on_recording_stopped)
         self.recorder.level_update.connect(self._on_level_update)
+        self.recorder.max_duration_reached.connect(self._on_max_duration)
         self.recorder.error.connect(self._on_mic_error)
 
         self.transcriber.model_loading.connect(self._on_model_loading)
@@ -536,6 +540,20 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _on_stop_record(self):
+        self.recorder.stop()
+
+    @Slot()
+    def _on_max_duration(self):
+        """Recording hit the safety cap — stop and transcribe what we have.
+
+        Clear PTT so the eventual key-release is a clean no-op (recording is
+        already stopped). The captured audio is preserved and still pasted.
+        """
+        if not self.recorder.is_recording:
+            return
+        applog.info("recording hit max-duration cap; auto-stopping")
+        self._ptt_active = False
+        self._update_status("Recording stopped (reached the maximum length)")
         self.recorder.stop()
 
     @Slot()

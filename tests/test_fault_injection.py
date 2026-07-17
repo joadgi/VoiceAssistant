@@ -79,6 +79,59 @@ class TestMicDeath:
 
 
 # ---------------------------------------------------------------------------
+# Max-record-duration safety cap (L5): a forgotten/stuck held hotkey must not
+# grow the buffer forever. Callback-level so no real device is needed.
+# ---------------------------------------------------------------------------
+class TestMaxDurationCap:
+    def _armed_recorder(self, max_seconds):
+        rec = VoiceRecorder(sample_rate=16000, max_seconds=max_seconds)
+        # Arm the counters the way start() does, without opening a device.
+        rec._is_recording = True
+        rec._overflow_count = 0
+        rec._frames_captured = 0
+        rec._max_hit = False
+        rec._max_frames = int((rec.max_seconds or 0) * rec.sample_rate)
+        return rec
+
+    def _block(self, n=1024):
+        return np.zeros((n, 1), dtype="float32")
+
+    def test_cap_fires_once_after_threshold(self):
+        rec = self._armed_recorder(max_seconds=1.0)  # 16000 frames
+        fired = []
+        rec.max_duration_reached.connect(lambda: fired.append(True))
+
+        # Feed just under the cap: 15 blocks * 1024 = 15360 < 16000.
+        for _ in range(15):
+            rec._audio_callback(self._block(), 1024, None, None)
+        assert not fired, "cap fired before threshold"
+
+        # Cross it and keep going — must fire exactly once.
+        for _ in range(10):
+            rec._audio_callback(self._block(), 1024, None, None)
+        assert fired == [True], f"cap should fire exactly once, got {len(fired)}"
+
+    def test_no_cap_when_disabled(self):
+        rec = self._armed_recorder(max_seconds=0)  # disabled
+        fired = []
+        rec.max_duration_reached.connect(lambda: fired.append(True))
+        for _ in range(200):
+            rec._audio_callback(self._block(), 1024, None, None)
+        assert not fired, "cap fired though it was disabled"
+
+    def test_capped_audio_is_preserved_not_dropped(self):
+        # Everything captured before the cap must still be delivered.
+        rec = self._armed_recorder(max_seconds=1.0)
+        for _ in range(20):
+            rec._audio_callback(self._block(), 1024, None, None)
+        delivered = []
+        rec.recording_stopped.connect(lambda a: delivered.append(a))
+        rec._stream = None  # nothing to close in this synthetic setup
+        rec.stop()
+        assert delivered and len(delivered[0]) == 20 * 1024, "capped audio lost"
+
+
+# ---------------------------------------------------------------------------
 # Corrupt settings.json: back up, reset, surface — never silently discard
 # ---------------------------------------------------------------------------
 class TestCorruptSettings:
