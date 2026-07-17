@@ -382,6 +382,7 @@ class MainWindow(QMainWindow):
         self.region_selector.cancelled.connect(lambda: self._update_status("Selection cancelled"))
 
         self.indicator.clicked.connect(self._on_indicator_clicked)
+        self.indicator.customContextMenuRequested.connect(self._on_pill_menu)
 
     # -----------------------------------------------------------------------
     # Global hotkeys — fully user-configurable (see config.py contract)
@@ -528,6 +529,39 @@ class MainWindow(QMainWindow):
         if self._dictation_active:
             self._pending_target_hwnd = winapi.get_foreground_window()
         self.recorder.start()
+
+    def _build_pill_menu(self):
+        """Right-click menu on the floating pill — full app control without
+        the main window (tray-first). Returns a QMenu (parented to self)."""
+        menu = QMenu(self)
+        act_dictate = QAction(
+            "Stop recording" if self.recorder.is_recording else "Dictate", self)
+        act_dictate.triggered.connect(self._on_indicator_clicked)
+        menu.addAction(act_dictate)
+        act_read = QAction("Read selection aloud", self)
+        act_read.triggered.connect(self._on_read_aloud_toggle)
+        menu.addAction(act_read)
+        menu.addSeparator()
+        act_pause = QAction("Pause dictation", self)
+        act_pause.setCheckable(True)
+        act_pause.setChecked(not self._dictation_active)
+        act_pause.toggled.connect(lambda paused: self.btn_dictation.setChecked(not paused))
+        menu.addAction(act_pause)
+        act_settings = QAction("Settings…", self)
+        act_settings.triggered.connect(self._on_settings)
+        menu.addAction(act_settings)
+        act_show = QAction("Show window", self)
+        act_show.triggered.connect(self.show_normal)
+        menu.addAction(act_show)
+        menu.addSeparator()
+        act_quit = QAction("Quit", self)
+        act_quit.triggered.connect(self.quit_app)
+        menu.addAction(act_quit)
+        return menu
+
+    @Slot(object)
+    def _on_pill_menu(self, pos):
+        self._build_pill_menu().exec(self.indicator.mapToGlobal(pos))
 
     @Slot()
     def _on_record(self):

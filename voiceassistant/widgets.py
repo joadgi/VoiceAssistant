@@ -215,8 +215,11 @@ class RecordingIndicator(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
         self.setWindowFlag(Qt.WindowType.WindowDoesNotAcceptFocus, True)
         self.setFixedSize(200, 40)
-        self.setToolTip("Click to start/stop dictation  •  drag to move")
+        self.setToolTip("Click to start/stop dictation  •  right-click for menu  •  drag to move")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        # Right-click menu makes the pill a self-sufficient primary surface —
+        # the window builds the menu (see MainWindow._on_pill_menu).
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
 
         lay = QHBoxLayout(self)
         lay.setContentsMargins(12, 6, 12, 6)

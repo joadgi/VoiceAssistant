@@ -7,12 +7,17 @@ this dialog covers audio, transcription, and display preferences.
 import sounddevice as sd
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QLabel,
-    QSpinBox,
+    QSpinBox, QTabWidget, QVBoxLayout, QWidget,
 )
 
 
 class SettingsDialog(QDialog):
-    """Settings dialog for configuring the assistant."""
+    """Settings dialog for configuring the assistant.
+
+    Organized into tabs (Transcription / General) so the growing set of
+    preferences stays scannable. Hotkeys have their own home — the capture
+    pills on the main window — so they are not duplicated here.
+    """
 
     def __init__(self, config, tts_engine, parent=None):
         super().__init__(parent)
@@ -22,14 +27,22 @@ class SettingsDialog(QDialog):
         self.setMinimumWidth(460)
         self._build_ui()
 
-    def _build_ui(self):
-        layout = QFormLayout(self)
-        layout.setSpacing(12)
+    @staticmethod
+    def _hint(text):
+        lbl = QLabel(text)
+        lbl.setStyleSheet("color: #6c7086; font-size: 10px;")
+        lbl.setWordWrap(True)
+        return lbl
 
-        # --- Audio Input section ---
-        section_label0 = QLabel("AUDIO INPUT")
-        section_label0.setStyleSheet("color: #89b4fa; font-weight: bold; font-size: 11px; padding-top: 4px;")
-        layout.addRow(section_label0)
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        tabs = QTabWidget()
+        root.addWidget(tabs)
+
+        # ---- Tab 1: Transcription (mic + Whisper) ----
+        trans = QWidget()
+        tlay = QFormLayout(trans)
+        tlay.setSpacing(12)
 
         self.mic_combo = QComboBox()
         self.mic_combo.addItem("System Default", -1)
@@ -48,22 +61,14 @@ class SettingsDialog(QDialog):
         idx = self.mic_combo.findData(saved_mic)
         if idx >= 0:
             self.mic_combo.setCurrentIndex(idx)
-        layout.addRow("Microphone:", self.mic_combo)
-
-        # --- Transcription section ---
-        section_label = QLabel("TRANSCRIPTION")
-        section_label.setStyleSheet("color: #89b4fa; font-weight: bold; font-size: 11px; padding-top: 8px;")
-        layout.addRow(section_label)
+        tlay.addRow("Microphone:", self.mic_combo)
 
         self.model_combo = QComboBox()
         for m in ["tiny", "base", "small", "medium", "large-v3"]:
             self.model_combo.addItem(m)
         self.model_combo.setCurrentText(self.config["whisper_model"])
-        layout.addRow("Whisper Model:", self.model_combo)
-
-        model_hint = QLabel("tiny=fastest  base=fast+accurate  medium=best accuracy")
-        model_hint.setStyleSheet("color: #6c7086; font-size: 10px;")
-        layout.addRow(model_hint)
+        tlay.addRow("Whisper Model:", self.model_combo)
+        tlay.addRow(self._hint("tiny=fastest  base=fast+accurate  medium=best accuracy"))
 
         self.lang_combo = QComboBox()
         for code, name in [("en", "English"), ("es", "Spanish"), ("fr", "French"),
@@ -73,47 +78,45 @@ class SettingsDialog(QDialog):
         idx = self.lang_combo.findData(self.config["whisper_language"])
         if idx >= 0:
             self.lang_combo.setCurrentIndex(idx)
-        layout.addRow("Language:", self.lang_combo)
+        tlay.addRow("Language:", self.lang_combo)
 
-        # --- Hotkeys live on the main window ---
-        hotkey_note = QLabel(
-            "Hotkeys are set on the main window — click any hotkey pill\n"
-            "under Dictation Mode to edit it inline."
-        )
-        hotkey_note.setStyleSheet(
-            "color: #89b4fa; font-size: 11px; font-style: italic; padding: 8px 0;"
-        )
-        layout.addRow(hotkey_note)
+        self.cleanup_check = QCheckBox("Light cleanup (fillers, casing, spacing)")
+        self.cleanup_check.setChecked(self.config.get("light_cleanup", True))
+        tlay.addRow(self.cleanup_check)
+        tabs.addTab(trans, "Transcription")
 
-        # --- Display section ---
-        section_label3 = QLabel("DISPLAY")
-        section_label3.setStyleSheet("color: #89b4fa; font-weight: bold; font-size: 11px; padding-top: 8px;")
-        layout.addRow(section_label3)
+        # ---- Tab 2: General (display + startup + diagnostics) ----
+        gen = QWidget()
+        glay = QFormLayout(gen)
+        glay.setSpacing(12)
 
         self.font_spin = QSpinBox()
         self.font_spin.setRange(9, 24)
         self.font_spin.setValue(self.config["font_size"])
-        layout.addRow("Font Size:", self.font_spin)
+        glay.addRow("Font Size:", self.font_spin)
 
         self.aot_check = QCheckBox("Always on top")
         self.aot_check.setChecked(self.config["always_on_top"])
-        layout.addRow(self.aot_check)
+        glay.addRow(self.aot_check)
 
         self.startup_check = QCheckBox("Start with Windows")
         self.startup_check.setChecked(self.config.get("start_with_windows"))
-        layout.addRow(self.startup_check)
+        glay.addRow(self.startup_check)
 
         self.start_minimized_check = QCheckBox("Start minimized to tray")
         self.start_minimized_check.setChecked(self.config.get("start_minimized", True))
-        layout.addRow(self.start_minimized_check)
-
-        self.cleanup_check = QCheckBox("Light cleanup for dictation")
-        self.cleanup_check.setChecked(self.config.get("light_cleanup", True))
-        layout.addRow(self.cleanup_check)
+        glay.addRow(self.start_minimized_check)
 
         self.debug_check = QCheckBox("Debug logging (troubleshooting only)")
         self.debug_check.setChecked(self.config.get("debug_logging", False))
-        layout.addRow(self.debug_check)
+        glay.addRow(self.debug_check)
+
+        glay.addRow(self._hint(
+            "Hotkeys (Dictate / Read / OCR) are set on the main window — click "
+            "any hotkey pill to change it. Read-aloud voice & speed are on the "
+            "main window's Playback bar."
+        ))
+        tabs.addTab(gen, "General")
 
         # --- Buttons ---
         buttons = QDialogButtonBox(
@@ -121,7 +124,7 @@ class SettingsDialog(QDialog):
         )
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
-        layout.addRow(buttons)
+        root.addWidget(buttons)
 
     def get_values(self):
         return {
