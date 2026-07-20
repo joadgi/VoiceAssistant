@@ -44,7 +44,6 @@ DEFAULTS = {
     "hotkey_record": "ctrl+shift+r",
     "hotkey_screen_read": "ctrl+shift+s",
     "hotkey_read_aloud": "ctrl+shift+t",
-    "hotkey_stop": "escape",
 
     "audio_device": -1,
     "dictation_mode": True,

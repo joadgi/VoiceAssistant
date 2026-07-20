@@ -137,8 +137,4 @@ class SettingsDialog(QDialog):
             "start_minimized": self.start_minimized_check.isChecked(),
             "light_cleanup": self.cleanup_check.isChecked(),
             "debug_logging": self.debug_check.isChecked(),
-            # Hotkeys are not edited here — keep current values
-            "hotkey_record": self.config["hotkey_record"],
-            "hotkey_read_aloud": self.config["hotkey_read_aloud"],
-            "hotkey_screen_read": self.config["hotkey_screen_read"],
         }

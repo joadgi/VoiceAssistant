@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import applog, winapi
-from .config import Config, DEFAULTS, normalize_hotkey, validate_hotkey
+from .config import Config, DEFAULTS, MODIFIER_KEYS, normalize_hotkey, validate_hotkey
 from .ocr import OCREngine, RegionSelector, ScreenCapture
 from .paste import Paster
 from .recorder import VoiceRecorder
@@ -449,7 +449,7 @@ class MainWindow(QMainWindow):
         return [part for part in normalize_hotkey(combo).split("+") if part]
 
     def _hotkey_trigger_key(self, combo):
-        non_modifiers = [part for part in self._hotkey_parts(combo) if part not in {"ctrl", "shift", "alt", "windows", "cmd", "meta"}]
+        non_modifiers = [part for part in self._hotkey_parts(combo) if part not in MODIFIER_KEYS]
         return non_modifiers[-1] if non_modifiers else self._hotkey_parts(combo)[-1]
 
     def _emit_record_press_if_active(self, combo):

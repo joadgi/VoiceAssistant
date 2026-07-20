@@ -48,13 +48,14 @@ run.bat/shortcuts/startup-registry compatibility.
 | `voiceassistant/recorder.py` | `VoiceRecorder` (sounddevice mic capture, guarded teardown). |
 | `voiceassistant/transcriber.py` | `Transcriber` + `TranscriptionResult` (faster-whisper, both-pass guards, job-bound context). |
 | `voiceassistant/tts.py` | `TTSEngine` — edge-tts → VLC (live speed), per-utterance generations, pyttsx3 fallback, bounded network waits. |
-| `voiceassistant/ocr.py` | `ScreenCapture` (mss) + `OCREngine` (EasyOCR) + `RegionSelector`. |
+| `voiceassistant/ocr.py` | `ScreenCapture` (mss) + `OCREngine` (Windows-native OCR default, EasyOCR fallback) + `RegionSelector`. |
 | `voiceassistant/paste.py` | `Paster` — the paste worker: clipboard snapshot/restore + Win32 Ctrl+V, off the GUI thread. |
 | `voiceassistant/winapi.py` | ALL Win32/ctypes calls (foreground window, keystrokes, single-instance, startup registry). |
 | `voiceassistant/text.py` | Pure text logic: repeat collapse, cleanup chain, hallucination denylist, paste sanitizing. 100% unit-tested. |
 | `voiceassistant/config.py` | `Config` (ATOMIC saves, corrupt-file backup) + `DEFAULTS` + hotkey validation. |
 | `voiceassistant/workers.py` | `SerialWorker` — **the threading law**: every subsystem owns exactly one worker+queue; no ad-hoc `threading.Thread` anywhere. |
 | `voiceassistant/applog.py` | Privacy-safe rotating log (never logs payloads), opt-in debug, excepthooks + faulthandler. |
+| `voiceassistant/selfcheck.py` | `python main.py --check` — no-GUI health probe (mic, hotkeys, CUDA, OCR, VLC, TTS). |
 | `tests/` | Characterization + fault-injection suites (fast) and the golden-audio corpus gate (local, `RUN_CORPUS=1`). |
 | `setup.bat` / `run.bat` / `create_shortcut.bat` | Env setup, silent launch (pythonw), desktop shortcut. |
 
@@ -62,9 +63,10 @@ run.bat/shortcuts/startup-registry compatibility.
 
 **Dictation (push-to-talk):**
 `hold hotkey` → capture foreground window HWND → record mic to buffer → `release` →
-`Transcriber.transcribe()` → clean up text → `paste_to_window()` copies to clipboard and
-sends Win32 `Ctrl+V` into the captured window. The floating pill mirrors each state
-(Ready → Recording → Transcribing → Pasted).
+`Transcriber.transcribe()` → clean up text → the `Paster` worker copies to the clipboard
+and sends Win32 `Ctrl+V` into the captured window (off the GUI thread; the prior clipboard
+is restored afterward). The floating pill mirrors each state (Ready → Recording →
+Transcribing → Pasted).
 
 **Read-aloud:** hotkey → refocus the prior window → Win32 `Ctrl+C` to grab the selection
 via a clipboard sentinel → `TTSEngine.speak()`.
@@ -77,14 +79,14 @@ live (no regeneration). Falls back to `pyttsx3` SAPI if neural/VLC fails.
 
 ## Key design decisions (the "why", for future reviews)
 
-- **VAD with a no-VAD retry** (`voice_engine.py` `_run_transcribe`): VAD trims silence so
+- **VAD with a no-VAD retry** (`transcriber.py` `_run_transcribe`): VAD trims silence so
   Whisper stops hallucinating repeats/junk on pauses — but if the VAD pass returns empty,
   it retries **without** VAD so quiet/short speech is never lost. This was a real
   regression once; don't remove the retry.
-- **Post-process repeat collapse** (`collapse_repeated_phrases` in `main.py`): catches
+- **Post-process repeat collapse** (`collapse_repeated_phrases` in `text.py`): catches
   word/phrase/sentence repeats as a safety net. Prefer this over aggressive transcribe-time
   filters.
-- **Paste hygiene** (`paste_to_window` / `sanitize_for_paste`): strip control chars and
+- **Paste hygiene** (`paste.py` + `sanitize_for_paste` in `text.py`): strip control chars and
   flatten newlines before paste, and **never inject `Escape`** into the target — both were
   sources of an audible Windows "ding" on single-line/chat inputs.
 - **One hotkey-capture path** (`HotkeyCaptureWidget`): two earlier duplicate implementations

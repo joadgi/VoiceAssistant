@@ -7,7 +7,7 @@ Package layout (flat; dependencies point downward only):
     widgets.py     RecordingIndicator pill, HotkeyCaptureWidget (Qt)
     settings_dialog.py  SettingsDialog (Qt)
     theme.py       dark stylesheet
-    hotkeys.py     global-hotkey registration/manager (keyboard lib)
+    selfcheck.py   `main.py --check` self-diagnostic (no GUI, no lock)
     recorder.py    VoiceRecorder (sounddevice)
     transcriber.py Transcriber + TranscriptionResult (faster-whisper)
     tts.py         TTSEngine (edge-tts + VLC; pyttsx3 fallback)
