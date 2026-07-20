@@ -214,3 +214,7 @@ class Transcriber(QObject):
             self.compute_type = compute_type
         self._model = None
         self.load_model()
+
+    def shutdown(self):
+        """Stop the transcription worker (bounded). Called on app exit."""
+        self._worker.shutdown()

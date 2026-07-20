@@ -24,12 +24,12 @@ from .config import Config, DEFAULTS, MODIFIER_KEYS, normalize_hotkey, validate_
 from .ocr import OCREngine, RegionSelector, ScreenCapture
 from .paste import Paster
 from .recorder import VoiceRecorder
+from .selection import SelectionReader
 from .settings_dialog import SettingsDialog
 from .text import clean_transcript, is_probable_hallucination
 from .transcriber import Transcriber
 from .tts import TTSEngine
 from .widgets import HotkeyCaptureWidget, RecordingIndicator
-from .workers import SerialWorker
 
 
 class MainWindow(QMainWindow):
@@ -69,16 +69,13 @@ class MainWindow(QMainWindow):
             gpu=self.config["ocr_gpu"],
             backend=self.config.get("ocr_backend", "auto"),
         )
-        self.tts = TTSEngine(
-            rate=self.config["tts_rate"],
-            volume=self.config["tts_volume"],
-        )
+        self.tts = TTSEngine(volume=self.config["tts_volume"])
         self.tts.set_speed(self.config.get("tts_speed", 1.0))
         self.tts.set_voice(self.config.get("tts_voice", "en-US-AndrewNeural"))
         self.region_selector = RegionSelector()
         self.indicator = RecordingIndicator()
         self.paster = Paster()
-        self._read_worker = SerialWorker("read-selection")
+        self._selection_reader = SelectionReader()
 
         # Dictation state.
         # _pending_target_hwnd is only a hand-off between record-START (where
@@ -848,88 +845,13 @@ class MainWindow(QMainWindow):
 
         self._read_in_flight = True
         self._update_status("Capturing selection...")
-        self._read_worker.submit(self._read_selection_job)
-
-    def _read_selection_job(self):
-        """Runs on the read-selection worker: wait for modifier release,
-        refocus target, copy selection via clipboard sentinel, emit result.
-        Always emits (try/finally) so _read_in_flight can never wedge."""
-        try:
-            text = self._capture_selection()
-        except Exception:
-            applog.exception("read-selection capture failed")
-            text = ""
-        finally:
-            self._sig_read_text_ready.emit(text if isinstance(text, str) else "")
-
-    def _capture_selection(self):
-        # Wait for ALL keys in the hotkey combo to be released (up to 1 second)
-        hotkey_keys = self.config["hotkey_read_aloud"].lower().split("+")
-        for _ in range(200):
-            if not any(kb.is_pressed(k) for k in hotkey_keys if k):
-                break
-            time.sleep(0.005)
-
-        # Escape is ONLY needed when the hotkey involves the Windows key (to
-        # dismiss the Start menu it opened). Injecting Esc into an ordinary
-        # target app deselects text in spreadsheets/editors (breaking the
-        # copy) and can trigger the Windows "ding" — never send it otherwise.
-        if "windows" in self.config["hotkey_read_aloud"].lower():
-            time.sleep(0.05)
-            winapi.send_escape()
-            time.sleep(0.05)
-
-        # Refocus the source window (where the user had text selected). HONOR
-        # the return value: set_foreground_window verifies the switch actually
-        # took and returns False under the Windows foreground lock. If it
-        # didn't take we must NOT send Ctrl+C — it would copy from whatever
-        # window is really in front and read the WRONG selection aloud.
-        # (The paste path bails the same way.) Bail here, before touching the
-        # clipboard, so there is nothing to undo.
-        target = self._read_target_hwnd
-        if target:
-            if not winapi.set_foreground_window(target):
-                applog.dbg("read-aloud: refocus of source window failed; aborting capture")
-                return ""
-            time.sleep(0.1)
-
-        # Save current clipboard and write a sentinel
-        try:
-            old_clipboard = pyperclip.paste()
-        except Exception:
-            old_clipboard = ""
-
-        SENTINEL = "\x00__VA_CLIP_SENTINEL__\x00"
-        try:
-            pyperclip.copy(SENTINEL)
-        except Exception:
-            pass
-
-        time.sleep(0.05)
-        winapi.send_ctrl_c()
-
-        # Poll clipboard for up to 1.5 seconds — Gmail/Chrome can be slow
-        text = ""
-        for _ in range(150):
-            time.sleep(0.01)
-            try:
-                current = pyperclip.paste()
-                if current != SENTINEL:
-                    text = current
-                    break
-            except Exception:
-                pass
-
-        # Always restore the user's clipboard — read-aloud speaks `text`; it
-        # never needs the clipboard afterward. Restoring unconditionally (a)
-        # clears the NUL sentinel even when the prior clipboard was empty, and
-        # (b) no longer leaves the grabbed selection sitting on the clipboard
-        # on the success path (matches the paste subsystem's restore).
-        try:
-            pyperclip.copy(old_clipboard)
-        except Exception:
-            pass
-        return text if text.strip() else ""
+        # Capture runs on the SelectionReader's own worker; it calls back with
+        # the text via our signal, which marshals to the GUI thread.
+        self._selection_reader.capture(
+            self.config["hotkey_read_aloud"],
+            self._read_target_hwnd,
+            self._sig_read_text_ready.emit,
+        )
 
     @Slot(str)
     def _on_read_text_ready(self, text):
@@ -1178,14 +1100,15 @@ class MainWindow(QMainWindow):
                 self.recorder.stop()
             except Exception:
                 pass
-        try:
-            self.tts.shutdown()   # stop + drain worker + release VLC + rm temp dir
-        except Exception:
-            pass
-        try:
-            self.paster.shutdown()
-        except Exception:
-            pass
+        # Stop every owned worker so no daemon thread outlives the window.
+        # tts.shutdown also releases VLC + removes the temp dir.
+        for closer in (self.tts.shutdown, self.paster.shutdown,
+                       self._selection_reader.shutdown,
+                       self.transcriber.shutdown, self.ocr.shutdown):
+            try:
+                closer()
+            except Exception:
+                pass
         winapi.release_single_instance_lock()
         self.config.flush()
         self.config.save()

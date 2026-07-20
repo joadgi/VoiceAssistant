@@ -13,6 +13,7 @@ Package layout (flat; dependencies point downward only):
     tts.py         TTSEngine (edge-tts + VLC; pyttsx3 fallback)
     ocr.py         ScreenCapture + OCREngine + RegionSelector
     paste.py       Paster — the paste worker (clipboard + Ctrl+V)
+    selection.py   SelectionReader — read-aloud selection grab (Ctrl+C)
     winapi.py      ALL Win32/ctypes calls live here
     text.py        pure text logic (cleanup, collapse, denylist) — no Qt/IO
     config.py      settings persistence (atomic), hotkey validation

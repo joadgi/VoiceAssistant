@@ -50,6 +50,7 @@ run.bat/shortcuts/startup-registry compatibility.
 | `voiceassistant/tts.py` | `TTSEngine` — edge-tts → VLC (live speed), per-utterance generations, pyttsx3 fallback, bounded network waits. |
 | `voiceassistant/ocr.py` | `ScreenCapture` (mss) + `OCREngine` (Windows-native OCR default, EasyOCR fallback) + `RegionSelector`. |
 | `voiceassistant/paste.py` | `Paster` — the paste worker: clipboard snapshot/restore + Win32 Ctrl+V, off the GUI thread. |
+| `voiceassistant/selection.py` | `SelectionReader` — read-aloud's selection grab (Ctrl+C sentinel + refocus), off the GUI thread (mirrors `Paster`). |
 | `voiceassistant/winapi.py` | ALL Win32/ctypes calls (foreground window, keystrokes, single-instance, startup registry). |
 | `voiceassistant/text.py` | Pure text logic: repeat collapse, cleanup chain, hallucination denylist, paste sanitizing. 100% unit-tested. |
 | `voiceassistant/config.py` | `Config` (ATOMIC saves, corrupt-file backup) + `DEFAULTS` + hotkey validation. |

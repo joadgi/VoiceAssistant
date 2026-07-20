@@ -172,7 +172,7 @@ def flow(qapp, monkeypatch):
     for closer in (
         lambda: mw._show_request_timer.stop(),
         lambda: mw.transcriber._worker.shutdown(),
-        lambda: mw._read_worker.shutdown(),
+        lambda: mw._selection_reader.shutdown(),
         lambda: getattr(mw.ocr, "_worker", None) and mw.ocr._worker.shutdown(),
         lambda: mw.tts.shutdown(),
         lambda: mw.paster.shutdown(),

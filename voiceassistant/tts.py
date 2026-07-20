@@ -56,6 +56,9 @@ NEURAL_VOICES = [
 ]
 
 
+BASE_RATE_WPM = 175  # SAPI/offline base words-per-minute; scaled by _speed
+
+
 class TTSEngine(QObject):
     """Neural TTS with real-time speed control via VLC."""
 
@@ -67,9 +70,8 @@ class TTSEngine(QObject):
     FIRST_AUDIO_TIMEOUT = 6.0   # no first chunk in time -> raise -> offline fallback
     STALL_TIMEOUT = 30.0        # mid-stream stall -> truncate, don't re-read
 
-    def __init__(self, rate=175, volume=1.0):
+    def __init__(self, volume=1.0):
         super().__init__()
-        self._rate = rate  # kept for backwards compat; we use speed multiplier
         self._speed = 1.0  # playback speed multiplier (0.5 to 3.0)
         self._volume = volume
         self._speaking = False
@@ -90,7 +92,7 @@ class TTSEngine(QObject):
         try:
             import pyttsx3
             self._pyttsx_engine = pyttsx3.init()
-            self._pyttsx_engine.setProperty("rate", int(175 * self._speed))
+            self._pyttsx_engine.setProperty("rate", int(BASE_RATE_WPM * self._speed))
             self._pyttsx_engine.setProperty("volume", self._volume)
         except Exception:
             pass
@@ -138,7 +140,7 @@ class TTSEngine(QObject):
             except Exception:
                 pass
         if self._pyttsx_engine:
-            self._pyttsx_engine.setProperty("rate", int(175 * self._speed))
+            self._pyttsx_engine.setProperty("rate", int(BASE_RATE_WPM * self._speed))
 
     # ------------------------------------------------------------------ #
     # Speak / stop
@@ -366,7 +368,7 @@ class TTSEngine(QObject):
         import pyttsx3
 
         engine = pyttsx3.init()
-        engine.setProperty("rate", int(175 * self._speed))
+        engine.setProperty("rate", int(BASE_RATE_WPM * self._speed))
         engine.setProperty("volume", self._volume)
         if self._voice_id:
             engine.setProperty("voice", self._voice_id)

@@ -217,7 +217,7 @@ def _run_capture(qapp, mw, timeout=8.0):
 
     def worker():
         try:
-            out["text"] = mw._capture_selection()
+            out["text"] = mw._selection_reader._capture(mw.config["hotkey_read_aloud"], mw._read_target_hwnd)
         except Exception as e:  # surfaced to the test after join
             out["exc"] = e
         finally:
@@ -389,13 +389,13 @@ def test_escape_only_injected_for_windows_hotkey(qapp, mw, monkeypatch):
 
     # NON-windows hotkey -> Escape must NOT be injected.
     mw.config.set("hotkey_read_aloud", "ctrl+m")
-    assert mw._capture_selection() == "READ-LIVE-SEL"
+    assert mw._selection_reader._capture(mw.config["hotkey_read_aloud"], mw._read_target_hwnd) == "READ-LIVE-SEL"
     assert calls["escape"] == 0, "Escape injected for a non-windows hotkey (M2 regression)"
 
     # Windows-key hotkey -> Escape IS injected (dismiss the Start menu).
     calls["escape"] = 0
     mw.config.set("hotkey_read_aloud", "windows+m")
-    assert mw._capture_selection() == "READ-LIVE-SEL"
+    assert mw._selection_reader._capture(mw.config["hotkey_read_aloud"], mw._read_target_hwnd) == "READ-LIVE-SEL"
     assert calls["escape"] == 1, "Escape NOT injected for a windows-key hotkey (M2 broken)"
 
 
@@ -414,45 +414,50 @@ def test_original_clipboard_restored_when_nothing_captured(qapp, mw, monkeypatch
     seed = "USER-ORIGINAL-CLIPBOARD::read-restore-case"
     _seed_clipboard(seed)
 
-    out = mw._capture_selection()  # ~1.5s sentinel-poll timeout, then restore
+    out = mw._selection_reader._capture(mw.config["hotkey_read_aloud"], mw._read_target_hwnd)  # ~1.5s sentinel-poll timeout, then restore
 
     assert out == "", f"expected empty capture, got {out!r}"
     assert pyperclip.paste() == seed, "user's original clipboard was not restored"
 
 
 # --------------------------------------------------------------------------- #
-# Case 4 — the _read_selection_job doorway ALWAYS emits (can't wedge)
+# Case 4 — the capture result is wired through to TTS and clears in-flight.
+# (SelectionReader._job always calls back; MainWindow's _on_read_text_ready
+# slot must speak the text and reset _read_in_flight — even on a capture error.)
 # --------------------------------------------------------------------------- #
-def test_read_job_emits_captured_text_on_success(qapp, mw, monkeypatch):
+def test_read_result_wired_to_tts_on_success(qapp, mw, monkeypatch):
     from PySide6.QtCore import Qt
 
     got = []
     mw._sig_read_text_ready.connect(got.append, Qt.ConnectionType.DirectConnection)
     spoken = []
     monkeypatch.setattr(mw.tts, "speak", lambda t: spoken.append(t))
-    monkeypatch.setattr(mw, "_capture_selection", lambda: "hello from selection")
+    monkeypatch.setattr(mw._selection_reader, "_capture",
+                        lambda combo, hwnd: "hello from selection")
 
     mw._read_in_flight = True
-    mw._read_selection_job()  # main thread; Direct/Auto connections fire synchronously
+    mw._selection_reader._job(mw.config["hotkey_read_aloud"],
+                              mw._read_target_hwnd, mw._sig_read_text_ready.emit)
 
     assert got == ["hello from selection"], got
     assert spoken == ["hello from selection"], "captured text not wired through to TTS"
     assert mw._read_in_flight is False, "read-in-flight flag left wedged"
 
 
-def test_read_job_emits_empty_on_capture_exception(qapp, mw, monkeypatch):
+def test_read_result_empty_on_capture_exception(qapp, mw, monkeypatch):
     from PySide6.QtCore import Qt
 
     got = []
     mw._sig_read_text_ready.connect(got.append, Qt.ConnectionType.DirectConnection)
 
-    def boom():
+    def boom(combo, hwnd):
         raise RuntimeError("capture blew up")
 
-    monkeypatch.setattr(mw, "_capture_selection", boom)
+    monkeypatch.setattr(mw._selection_reader, "_capture", boom)
 
     mw._read_in_flight = True
-    mw._read_selection_job()  # try/finally must still emit ""
+    mw._selection_reader._job(mw.config["hotkey_read_aloud"],
+                              mw._read_target_hwnd, mw._sig_read_text_ready.emit)
 
     assert got == [""], got
     assert mw._read_in_flight is False, "read-in-flight flag left wedged after an error"

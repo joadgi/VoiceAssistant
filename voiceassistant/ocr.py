@@ -211,6 +211,10 @@ class OCREngine(QObject):
         lines = [text for (_, text, conf) in results if conf > 0.3]
         return "\n".join(lines).strip()
 
+    def shutdown(self):
+        """Stop the OCR worker (bounded). Called on app exit."""
+        self._worker.shutdown()
+
 
 class RegionSelector(QWidget):
     """Transparent fullscreen overlay for selecting a screen region by click-drag."""

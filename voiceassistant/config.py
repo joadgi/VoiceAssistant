@@ -29,7 +29,6 @@ DEFAULTS = {
     "whisper_device": "cuda",
     "whisper_compute_type": "float16",
 
-    "tts_rate": 175,
     "tts_speed": 1.0,
     "tts_voice": "en-US-AndrewNeural",
     "tts_volume": 1.0,
