@@ -13,7 +13,9 @@ Two tiers:
     * Config round-trip on a tmp settings.json (never touches the real one)
     * load-time sanitize_settings reset + cross-action dedupe
     * MainWindow._set_hotkey_if_valid accept/reject/persist (headless Qt)
-    * MainWindow._hotkey_trigger_key derivation
+    * push-to-talk hook registration: EVERY combo key gets press+release
+      hooks, `ctrl+alt` starts in either press order, and the lost-keyup
+      watchdog ends a hold whose keyup never arrived (regression tier)
     validate_hotkey consults keyboard.key_to_scan_codes, a read-only key-table
     lookup — it registers NO hooks — so the safe tier is side-effect-free.
 
@@ -71,21 +73,30 @@ INVALID_COMBOS = ["a", "7", "space", ".", "ctrl", "shift", "escape", "banana", "
 
 _MODIFIERS = {"ctrl", "shift", "alt", "windows", "cmd", "meta"}
 
+# Captured at import time — BEFORE the main_window fixture no-ops it on the
+# class. The hook-registration tests below need the genuine implementation,
+# driven against a fake `keyboard` module.
+try:
+    from voiceassistant.window import MainWindow as _MainWindowClass  # noqa: E402
+
+    _REAL_SETUP_HOTKEYS = _MainWindowClass._setup_hotkeys
+except Exception:  # PySide6/keyboard unavailable — those tests skip
+    _REAL_SETUP_HOTKEYS = None
+
 
 def _parts(combo):
     """Mirror of MainWindow._hotkey_parts (asserted equivalent below)."""
     return [p for p in normalize_hotkey(combo).split("+") if p]
 
 
-def _trigger_key(combo):
-    """Mirror of MainWindow._hotkey_trigger_key (asserted equivalent below).
+def _hook_keys(combo):
+    """The keys the app installs press+release hooks on for push-to-talk.
 
-    Kept local so the registration tier depends only on `keyboard`, not on a
-    fully constructed Qt MainWindow. test_trigger_key_matches_mainwindow ties
-    this mirror to the real method so it can never silently drift.
+    EVERY key in the combo, not a single derived "trigger" key — see
+    test_every_combo_key_gets_a_press_hook for why that distinction is the
+    whole difference between working and broken dictation.
     """
-    non_mod = [p for p in _parts(combo) if p not in _MODIFIERS]
-    return non_mod[-1] if non_mod else _parts(combo)[-1]
+    return list(dict.fromkeys(_parts(combo)))
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +141,10 @@ def main_window(qapp, monkeypatch, tmp_path):
     monkeypatch.setattr(winapi, "set_start_with_windows", lambda *a, **k: True)
     monkeypatch.setattr(MainWindow, "_setup_hotkeys", lambda self: None)
     monkeypatch.setattr(MainWindow, "_setup_tray", lambda self: None)
+    # The mic stream is opened once at startup now — don't grab a real device.
+    import voiceassistant.recorder as rec_mod
+    monkeypatch.setattr(rec_mod.VoiceRecorder, "open_stream", lambda self: True)
+    monkeypatch.setattr(rec_mod.VoiceRecorder, "close_stream", lambda self: None)
 
     w = MainWindow(entry_script="main.py")
     yield w
@@ -267,16 +282,186 @@ def test_set_hotkey_if_valid_accepts_and_persists(main_window):
 
 
 # ---------------------------------------------------------------------------
-# 4. TRIGGER-KEY logic
+# 4. PUSH-TO-TALK HOOK REGISTRATION  (regression: the ctrl+alt start failure)
 # ---------------------------------------------------------------------------
-def test_trigger_key_matches_mainwindow(main_window):
+class _FakeKb:
+    """Records what the app hooks, and lets a test drive those callbacks."""
+
+    def __init__(self, held=()):
+        self.press = {}       # key -> callback
+        self.release = {}     # key -> callback
+        self.suppressed = {}  # key -> whether it was hooked with suppress=True
+        self.hotkeys = []
+        self.held = set(held)
+
+    # --- the API surface _setup_hotkeys uses ---
+    def unhook_all(self):
+        pass
+
+    def on_press_key(self, key, cb, *a, **k):
+        self.press[key] = cb
+        self.suppressed[key] = bool(k.get("suppress", False))
+
+    def on_release_key(self, key, cb, *a, **k):
+        self.release[key] = cb
+        self.suppressed[key] = bool(k.get("suppress", False))
+
+    def add_hotkey(self, combo, cb, *a, **k):
+        self.hotkeys.append(combo)
+
+    def is_pressed(self, key):
+        return key in self.held
+
+    # --- test helpers ---
+    def press_key(self, key):
+        self.held.add(key)
+        if key in self.press:
+            self.press[key](None)
+
+    def release_key(self, key):
+        self.held.discard(key)
+        if key in self.release:
+            self.release[key](None)
+
+
+@pytest.fixture
+def fake_kb(main_window, monkeypatch):
+    if _REAL_SETUP_HOTKEYS is None:
+        pytest.skip("MainWindow unavailable at import time")
+    import voiceassistant.window as win_mod
+
+    fk = _FakeKb()
+    monkeypatch.setattr(win_mod, "kb", fk)
+    return fk
+
+
+@pytest.mark.parametrize("combo", ["ctrl+alt", "ctrl+shift+r", "f9", "ctrl+shift"])
+def test_every_combo_key_gets_a_press_hook(main_window, fake_kb, combo):
+    """REGRESSION — this is the bug that made dictation feel unreliable.
+
+    The app used to hook ONE derived "trigger" key. For the modifier-only
+    combo `ctrl+alt` that trigger was `alt`, so Ctrl's keydown was never
+    hooked at all. Pressing Alt before Ctrl therefore did nothing: Alt's hook
+    fired while Ctrl was not yet down (combo incomplete -> no start), and the
+    later Ctrl keydown had no hook to fire. Two keys pressed together land in
+    arbitrary order, so dictation silently failed to start about half the time.
+    """
     w = main_window
-    assert w._hotkey_trigger_key("ctrl+shift+r") == "r"       # real key wins
-    assert w._hotkey_trigger_key("f9") == "f9"                # single key
-    assert w._hotkey_trigger_key("ctrl+alt") == "alt"         # modifier-only -> last part
-    # Tie the registration tier's local mirror to the real method.
-    for combo in VALID_COMBOS:
-        assert _trigger_key(combo) == w._hotkey_trigger_key(combo)
+    w.config.set("hotkey_record", combo)
+    _REAL_SETUP_HOTKEYS(w)
+
+    expected = _hook_keys(combo)
+    assert set(fake_kb.press) == set(expected), (
+        f"{combo}: press hooks {sorted(fake_kb.press)} != every combo key {sorted(expected)}"
+    )
+    assert set(fake_kb.release) == set(expected), (
+        f"{combo}: a release on ANY combo key must end the hold"
+    )
+
+
+def test_modifier_only_combo_starts_in_either_press_order(main_window, fake_kb):
+    """`ctrl+alt` must start dictation whichever key lands first."""
+    w = main_window
+    w.config.set("hotkey_record", "ctrl+alt")
+    _REAL_SETUP_HOTKEYS(w)
+
+    for first, second in (("ctrl", "alt"), ("alt", "ctrl")):
+        starts = []
+        w._sig_hotkey_press.connect(lambda: starts.append(True))
+        fake_kb.held.clear()
+
+        fake_kb.press_key(first)
+        assert starts == [], f"{first} alone must not start dictation"
+        fake_kb.press_key(second)
+        assert starts == [True], (
+            f"pressing {first} then {second} did not start dictation "
+            "(this is the exact half-the-time failure users hit)"
+        )
+        w._sig_hotkey_press.disconnect()
+        fake_kb.release_key(first)
+        fake_kb.release_key(second)
+
+
+@pytest.mark.parametrize("combo,want_suppress", [
+    ("caps lock", True),      # dedicated solo key: swallow the caps toggle
+    ("insert", True),         # ...and the overtype toggle
+    ("scroll lock", True),    # ...and Excel's arrow-key mode
+    ("f9", False),            # harmless to pass through
+    ("ctrl+alt", False),      # NEVER suppress a modifier
+    ("ctrl+shift+r", False),
+])
+def test_only_dedicated_solo_keys_are_suppressed(main_window, fake_kb, combo, want_suppress):
+    """Caps Lock only works as push-to-talk if the app swallows the keypress,
+    or every dictation flips the caps state. But suppressing a MODIFIER would
+    break Ctrl/Alt system-wide, so the rule must stay narrow."""
+    from voiceassistant.config import should_suppress_hotkey
+
+    assert should_suppress_hotkey(combo) is want_suppress
+
+    w = main_window
+    w.config.set("hotkey_record", combo)
+    _REAL_SETUP_HOTKEYS(w)
+    assert fake_kb.press, f"{combo}: nothing registered"
+    for key, suppressed in fake_kb.suppressed.items():
+        assert suppressed is want_suppress, (
+            f"{combo}: key {key!r} suppress={suppressed}, expected {want_suppress}"
+        )
+
+
+def test_suppressing_callbacks_return_falsy_so_the_key_is_blocked(main_window, fake_kb):
+    """keyboard blocks a suppressed event only when the callback returns a
+    FALSY value (see _KeyboardListener.direct_callback). If a callback ever
+    starts returning something truthy, Caps Lock would silently start
+    toggling caps again — so pin it."""
+    w = main_window
+    w.config.set("hotkey_record", "caps lock")
+    _REAL_SETUP_HOTKEYS(w)
+    for cb in list(fake_kb.press.values()) + list(fake_kb.release.values()):
+        assert not cb(None), "callback returned truthy — the key would NOT be blocked"
+
+
+def test_release_of_any_combo_key_stops(main_window, fake_kb):
+    """Releasing the FIRST-pressed key must stop, not wait for the other one."""
+    w = main_window
+    w.config.set("hotkey_record", "ctrl+alt")
+    _REAL_SETUP_HOTKEYS(w)
+    stops = []
+    w._sig_hotkey_release.connect(lambda: stops.append(True))
+
+    fake_kb.press_key("ctrl")
+    fake_kb.press_key("alt")
+    fake_kb.release_key("ctrl")  # Ctrl first, Alt still down
+    assert stops, "releasing ctrl left the recording running until alt came up"
+
+
+def test_ptt_watchdog_stops_when_keyup_was_lost(main_window, fake_kb):
+    """A dropped keyup must cost ~100ms, not the 120s max-duration runaway
+    seen three times in debug.log (Windows silently unhooks a low-level
+    keyboard hook whose callback exceeds LowLevelHooksTimeout)."""
+    w = main_window
+    w.config.set("hotkey_record", "ctrl+alt")
+    _REAL_SETUP_HOTKEYS(w)
+
+    class _Rec:
+        is_recording = True
+
+        def __init__(self):
+            self.stopped = False
+
+        def stop(self):
+            self.stopped = True
+
+    w.recorder = _Rec()
+    w._ptt_active = True
+    fake_kb.held = {"ctrl", "alt"}
+
+    w._on_ptt_watchdog()
+    assert not w.recorder.stopped, "watchdog stopped while the combo was still held"
+
+    fake_kb.held.clear()  # the keyup never arrived; keys are physically up
+    w._on_ptt_watchdog()
+    assert w.recorder.stopped, "watchdog did not rescue a lost keyup"
+    assert w._ptt_active is False
 
 
 # ---------------------------------------------------------------------------
@@ -307,11 +492,11 @@ def test_real_registration_of_user_combo(combo):
     def cb(*_a, **_k):
         state["fired"] = True
 
-    trigger = _trigger_key(combo)
     try:
-        # (a) Record / push-to-talk path: watch the trigger key press + release.
-        kb.on_press_key(trigger, cb)
-        kb.on_release_key(trigger, cb)
+        # (a) Record / push-to-talk path: press + release on EVERY combo key.
+        for key in _hook_keys(combo):
+            kb.on_press_key(key, cb)
+            kb.on_release_key(key, cb)
         # (b) Read / OCR path: bind the whole combo. Mirror the app's
         #     suppress-iff-Windows-key with a no-suppress fallback so a
         #     Windows-key combo can't spuriously fail here.

@@ -64,11 +64,20 @@ class SettingsDialog(QDialog):
         tlay.addRow("Microphone:", self.mic_combo)
 
         self.model_combo = QComboBox()
+        # NOTE: the distil-* models are deliberately NOT offered. distil-large-v3
+        # fails this app's hallucination gate — on pure room noise it invents
+        # "Thank you." with no_speech_prob ~0.09-0.16, i.e. it is CONFIDENT the
+        # noise is speech, so no threshold can filter it and the text gets pasted.
+        # (`medium` reports 0.88-0.96 on the same audio and is correctly dropped.)
+        # Verified: RUN_CORPUS=1 CORPUS_MODEL=distil-large-v3 -> 3 failures.
         for m in ["tiny", "base", "small", "medium", "large-v3"]:
             self.model_combo.addItem(m)
         self.model_combo.setCurrentText(self.config["whisper_model"])
         tlay.addRow("Whisper Model:", self.model_combo)
-        tlay.addRow(self._hint("tiny=fastest  base=fast+accurate  medium=best accuracy"))
+        tlay.addRow(self._hint(
+            "tiny/base=fastest  medium=good balance  large-v3=most accurate"
+        ))
+        tlay.addRow(self._hint("Changing model downloads it once (~1-3 GB)."))
 
         self.lang_combo = QComboBox()
         for code, name in [("en", "English"), ("es", "Spanish"), ("fr", "French"),

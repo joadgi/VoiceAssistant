@@ -14,6 +14,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import voiceassistant.config as config_mod
+import voiceassistant.recorder as rec_mod
 from voiceassistant.config import Config, DEFAULTS
 from voiceassistant.recorder import VoiceRecorder
 from voiceassistant.workers import SerialWorker
@@ -40,42 +41,122 @@ class _DyingStream:
             raise RuntimeError("simulated: close failed too")
 
 
+class _DummyStream:
+    """A stream that is alive as far as teardown is concerned."""
+
+    def __init__(self):
+        self.closed = False
+
+    def stop(self):
+        pass
+
+    def close(self):
+        self.closed = True
+
+
+def _armed(max_seconds=120.0, stream=None, preroll_ms=0):
+    """A recorder mid-capture without touching a real device.
+
+    Mirrors what start() sets up: the capture start offset into the always-on
+    ring, plus an open stream.
+    """
+    rec = VoiceRecorder(max_seconds=max_seconds, preroll_ms=preroll_ms)
+    rec._stream = stream if stream is not None else _DummyStream()
+    rec._alive = True
+    rec._is_recording = True
+    rec._capture_start = rec._frames_written
+    return rec
+
+
+def _block(n=1024, amp=0.0):
+    return np.full((n, 1), amp, dtype="float32")
+
+
 class TestMicDeath:
-    def _recorder_with_dying_stream(self, **kw):
-        rec = VoiceRecorder()
-        rec._is_recording = True
-        rec._stream = _DyingStream(**kw)
-        return rec
+    """The mic stream is now opened once and kept open, so 'mic death' is no
+    longer a failure of stop() — it is a failure of the LIVE stream. The
+    guarantees are the same: never raise out of teardown, never leak the
+    handle, never lose captured audio, and never leave the user recording
+    into a dead device without telling them."""
 
-    def test_stop_still_emits_recording_stopped(self):
-        rec = self._recorder_with_dying_stream()
-        stopped = []
-        errors = []
-        rec.recording_stopped.connect(lambda audio: stopped.append(audio))
-        rec.error.connect(lambda msg: errors.append(msg))
-
-        rec.stop()  # must NOT raise
-
-        assert len(stopped) == 1, "recording_stopped did not emit — dictation wedged"
-        assert isinstance(stopped[0], np.ndarray)
-        assert errors and "Microphone stop error" in errors[0]
+    def test_close_stream_never_raises_and_releases_handle(self):
+        rec = _armed(stream=_DyingStream())
+        rec.close_stream()  # must NOT raise even though stop() AND close() do
         assert rec._stream is None, "dead stream not released"
         assert rec.is_recording is False
 
     def test_close_runs_even_when_stop_raises(self):
-        rec = self._recorder_with_dying_stream(fail_stop=True, fail_close=False)
-        stream = rec._stream
-        rec.recording_stopped.connect(lambda audio: None)
-        rec.stop()
+        stream = _DyingStream(fail_stop=True, fail_close=False)
+        rec = _armed(stream=stream)
+        rec.close_stream()
         assert stream.closed, "stream.close() skipped after stop() raised (leak)"
 
-    def test_partial_audio_still_delivered(self):
-        rec = self._recorder_with_dying_stream()
-        rec._audio_queue.put(np.ones((1024, 1), dtype="float32") * 0.1)
+    def test_captured_audio_is_delivered_from_the_ring(self):
+        rec = _armed()
+        for _ in range(3):
+            rec._audio_callback(_block(amp=0.1), 1024, None, None)
         got = []
         rec.recording_stopped.connect(lambda audio: got.append(audio))
-        rec.stop()
-        assert got and len(got[0]) == 1024, "captured audio lost on device death"
+        rec._finish_capture()  # the tail timer's slot, driven directly
+        assert got and len(got[0]) == 3 * 1024, "captured audio lost"
+        assert float(np.max(np.abs(got[0]))) > 0.05, "delivered audio is silent"
+
+    def test_stalled_stream_is_surfaced_not_silently_recorded(self, monkeypatch):
+        """A stream that stops delivering is the WORST failure mode: recording
+        silence looks exactly like success until the empty transcript. The
+        watchdog must notice, tell the user, and end the capture."""
+        rec = _armed()
+        states, errors = [], []
+        rec.stream_state.connect(lambda ok, msg: states.append(ok))
+        rec.error.connect(lambda m: errors.append(m))
+        # Recovery must not reach for a real device in tests.
+        monkeypatch.setattr(VoiceRecorder, "open_stream", lambda self: False)
+
+        ticks = int(rec_mod._STALL_SECONDS / (rec_mod._TICK_MS / 1000.0)) + 2
+        for _ in range(ticks):
+            rec._on_tick()  # no frames ever arrive
+
+        assert False in states, "dead mic never surfaced to the UI"
+        assert errors, "user not told the mic dropped out mid-recording"
+        assert rec.is_recording is False, "left recording into a dead stream"
+
+    def test_unavailable_device_is_retried_slowly_and_reported_once(self, monkeypatch):
+        """With no usable mic the tick fires 20x/second. Retrying the open on
+        every tick would spin PortAudio and write the same error line to
+        debug.log 20x/second, so retries are throttled and the outage is
+        reported once — not once per attempt."""
+        attempts = []
+
+        def boom(*a, **k):
+            attempts.append(1)
+            raise RuntimeError("simulated: no capture device")
+
+        monkeypatch.setattr(rec_mod.sd, "InputStream", boom)
+        rec = VoiceRecorder()
+        states = []
+        rec.stream_state.connect(lambda ok, msg: states.append(ok))
+
+        assert rec.open_stream() is False
+        for _ in range(rec_mod._REOPEN_COOLDOWN_TICKS * 2 + 4):
+            rec._on_tick()
+
+        assert len(attempts) <= 4, f"hot retry loop: {len(attempts)} opens in ~4s"
+        assert attempts, "never retried at all"
+        assert states.count(False) == 1, (
+            f"outage reported {states.count(False)}x — should be once per outage"
+        )
+
+    def test_healthy_stream_is_not_declared_dead(self):
+        """The watchdog must not misfire on a working mic."""
+        rec = _armed()
+        states = []
+        rec.stream_state.connect(lambda ok, msg: states.append(ok))
+        ticks = int(rec_mod._STALL_SECONDS / (rec_mod._TICK_MS / 1000.0)) + 5
+        for _ in range(ticks):
+            rec._audio_callback(_block(amp=0.1), 1024, None, None)
+            rec._on_tick()
+        assert False not in states, "healthy mic wrongly declared dead"
+        assert rec.is_recording is True
 
 
 # ---------------------------------------------------------------------------
@@ -83,52 +164,64 @@ class TestMicDeath:
 # grow the buffer forever. Callback-level so no real device is needed.
 # ---------------------------------------------------------------------------
 class TestMaxDurationCap:
-    def _armed_recorder(self, max_seconds):
-        rec = VoiceRecorder(sample_rate=16000, max_seconds=max_seconds)
-        # Arm the counters the way start() does, without opening a device.
-        rec._is_recording = True
-        rec._overflow_count = 0
-        rec._frames_captured = 0
-        rec._max_hit = False
-        rec._max_frames = int((rec.max_seconds or 0) * rec.sample_rate)
-        return rec
-
-    def _block(self, n=1024):
-        return np.zeros((n, 1), dtype="float32")
+    """The cap is now evaluated on the GUI-thread tick rather than inside the
+    audio callback (the callback must stay minimal — emitting signals at audio
+    rate contributed to the logged input overflows)."""
 
     def test_cap_fires_once_after_threshold(self):
-        rec = self._armed_recorder(max_seconds=1.0)  # 16000 frames
+        rec = _armed(max_seconds=1.0)  # 16000 frames
         fired = []
         rec.max_duration_reached.connect(lambda: fired.append(True))
 
         # Feed just under the cap: 15 blocks * 1024 = 15360 < 16000.
         for _ in range(15):
-            rec._audio_callback(self._block(), 1024, None, None)
+            rec._audio_callback(_block(), 1024, None, None)
+        rec._on_tick()
         assert not fired, "cap fired before threshold"
 
-        # Cross it and keep going — must fire exactly once.
+        # Cross it and keep ticking — must fire exactly once.
         for _ in range(10):
-            rec._audio_callback(self._block(), 1024, None, None)
+            rec._audio_callback(_block(), 1024, None, None)
+        for _ in range(5):
+            rec._on_tick()
         assert fired == [True], f"cap should fire exactly once, got {len(fired)}"
 
     def test_no_cap_when_disabled(self):
-        rec = self._armed_recorder(max_seconds=0)  # disabled
+        rec = _armed(max_seconds=0)  # disabled
         fired = []
         rec.max_duration_reached.connect(lambda: fired.append(True))
         for _ in range(200):
-            rec._audio_callback(self._block(), 1024, None, None)
+            rec._audio_callback(_block(), 1024, None, None)
+            rec._on_tick()
         assert not fired, "cap fired though it was disabled"
 
     def test_capped_audio_is_preserved_not_dropped(self):
         # Everything captured before the cap must still be delivered.
-        rec = self._armed_recorder(max_seconds=1.0)
+        rec = _armed(max_seconds=1.0)
         for _ in range(20):
-            rec._audio_callback(self._block(), 1024, None, None)
+            rec._audio_callback(_block(amp=0.2), 1024, None, None)
         delivered = []
         rec.recording_stopped.connect(lambda a: delivered.append(a))
-        rec._stream = None  # nothing to close in this synthetic setup
-        rec.stop()
+        rec._finish_capture()
         assert delivered and len(delivered[0]) == 20 * 1024, "capped audio lost"
+
+    def test_ring_never_returns_interleaved_garbage_on_overrun(self):
+        """A capture longer than the ring must degrade to 'most recent audio',
+        never to a wrapped/interleaved buffer that would transcribe as noise."""
+        rec = _armed(max_seconds=1.0)  # ring = 1s + headroom
+        size = len(rec._ring)
+        for _ in range(int(size / 1024) + 40):
+            rec._audio_callback(_block(amp=0.3), 1024, None, None)
+        got = []
+        rec.recording_stopped.connect(lambda a: delivered_append(got, a))
+        rec._finish_capture()
+        assert got, "no audio delivered on overrun"
+        assert len(got[0]) <= size, "returned more audio than the ring holds"
+        assert np.allclose(got[0], 0.3), "overrun produced discontinuous audio"
+
+
+def delivered_append(bucket, audio):
+    bucket.append(audio)
 
 
 # ---------------------------------------------------------------------------

@@ -20,7 +20,10 @@ from PySide6.QtWidgets import (
 )
 
 from . import applog, winapi
-from .config import Config, DEFAULTS, MODIFIER_KEYS, normalize_hotkey, validate_hotkey
+from .config import (
+    Config, DEFAULTS, MODIFIER_KEYS, normalize_hotkey, should_suppress_hotkey,
+    validate_hotkey,
+)
 from .ocr import OCREngine, RegionSelector, ScreenCapture
 from .paste import Paster
 from .recorder import VoiceRecorder
@@ -53,15 +56,19 @@ class MainWindow(QMainWindow):
         self.resize(820, 600)
 
         # --- Engines ---
+        dev = self.config.get("audio_device", -1)
         self.recorder = VoiceRecorder(
             sample_rate=self.config["sample_rate"],
+            device=dev if dev is not None and dev >= 0 else None,
             max_seconds=self.config.get("max_record_seconds", 120),
+            preroll_ms=self.config.get("preroll_ms", 300),
         )
         self.transcriber = Transcriber(
             model_size=self.config["whisper_model"],
             device=self.config["whisper_device"],
             compute_type=self.config["whisper_compute_type"],
             language=self.config["whisper_language"],
+            initial_prompt=self.config.get("whisper_prompt", ""),
         )
         self.screen_capture = ScreenCapture()
         self.ocr = OCREngine(
@@ -103,6 +110,11 @@ class MainWindow(QMainWindow):
         self._force_quit = False
         # Debounce flag for read-aloud hotkey
         self._read_in_flight = False
+        # Polls real key state while PTT is held, so a dropped keyup can't
+        # wedge the recording open (see _on_ptt_watchdog).
+        self._ptt_watchdog = QTimer(self)
+        self._ptt_watchdog.setInterval(100)
+        self._ptt_watchdog.timeout.connect(self._on_ptt_watchdog)
 
         # Wire hotkey signals BEFORE registering hotkeys
         self._sig_hotkey_press.connect(self._hotkey_press_handler)
@@ -121,6 +133,11 @@ class MainWindow(QMainWindow):
             self.config.get("start_with_windows"), self._entry_script
         )
         self._apply_window_flags()
+
+        # Open the microphone ONCE and keep it open for the life of the app.
+        # Opening per-recording cost 117-137ms of lost speech at the head of
+        # every dictation (measured on this machine); see recorder.py.
+        self.recorder.open_stream()
 
         # Load models in background (each engine's own worker)
         self.transcriber.load_model()
@@ -364,6 +381,7 @@ class MainWindow(QMainWindow):
         self.recorder.level_update.connect(self._on_level_update)
         self.recorder.max_duration_reached.connect(self._on_max_duration)
         self.recorder.error.connect(self._on_mic_error)
+        self.recorder.stream_state.connect(self._on_mic_stream_state)
 
         self.transcriber.model_loading.connect(self._on_model_loading)
         self.transcriber.model_ready.connect(self._on_model_ready)
@@ -402,16 +420,54 @@ class MainWindow(QMainWindow):
         errors = []
 
         try:
-            # Watch the trigger key for press (start) and release (stop). The press
-            # callback only fires recording when the FULL combo is held, so typing
-            # the trigger letter alone never starts dictation. Works for single-key
-            # hotkeys (e.g. f9) too. The release handler is a no-op unless PTT is on.
-            trigger_key = self._hotkey_trigger_key(hk_record)
-            kb.on_press_key(
-                trigger_key,
-                lambda e, combo=hk_record: self._emit_record_press_if_active(combo),
-            )
-            kb.on_release_key(trigger_key, lambda e: self._sig_hotkey_release.emit())
+            # Hook press AND release on EVERY key in the combo — not just a
+            # single "trigger" key.
+            #
+            # THIS WAS THE BUG that made dictation feel broken. With a
+            # modifier-only combo like `ctrl+alt` (the saved setting), the old
+            # code picked ONE trigger key (`alt`) and only hooked that. So:
+            #   press Ctrl then Alt -> Alt's hook fires, both held, records. OK.
+            #   press Alt then Ctrl -> Alt's hook fires while Ctrl is NOT yet
+            #                          down (no start), and Ctrl's press was
+            #                          never hooked at all -> NOTHING HAPPENS.
+            # Two keys pressed near-simultaneously land in arbitrary order, so
+            # dictation silently failed to start roughly half the time. That is
+            # exactly "it doesn't stay listening and I have to repeat myself."
+            # Hooking every key means whichever one lands LAST completes the
+            # combo and starts the recording.
+            #
+            # Releasing ANY key of the combo means it is no longer held, so
+            # every key gets a release hook too (previously, releasing Ctrl
+            # first left the recording running until Alt happened to come up).
+            #
+            # A dedicated solo key (Caps Lock etc.) is SUPPRESSED so pressing it
+            # doesn't also toggle caps / overtype / Excel's scroll mode on every
+            # dictation. Modifiers are never suppressed — swallowing `ctrl` would
+            # break Ctrl system-wide.
+            #
+            # CAREFUL: these callbacks must return a FALSY value. `keyboard`
+            # blocks a suppressed event only when the handler returns falsy, and
+            # in PySide6 `Signal.emit()` returns **True** — so
+            # `lambda e: sig.emit()` would quietly stop suppressing and Caps Lock
+            # would start toggling caps again. Hence explicit functions that emit
+            # as a statement and fall off the end (returning None).
+            suppress_record = should_suppress_hotkey(hk_record)
+
+            def press_cb(_event, combo=hk_record):
+                self._emit_record_press_if_active(combo)
+
+            def release_cb(_event):
+                self._sig_hotkey_release.emit()
+
+            for key in dict.fromkeys(self._hotkey_parts(hk_record)):
+                try:
+                    kb.on_press_key(key, press_cb, suppress=suppress_record)
+                    kb.on_release_key(key, release_cb, suppress=suppress_record)
+                except Exception:
+                    # Suppression can be refused; a working un-suppressed hotkey
+                    # beats no hotkey at all.
+                    kb.on_press_key(key, press_cb)
+                    kb.on_release_key(key, release_cb)
         except Exception as e:
             errors.append(f"Record hotkey ({hk_record}): {e}")
 
@@ -445,10 +501,6 @@ class MainWindow(QMainWindow):
     def _hotkey_parts(self, combo):
         return [part for part in normalize_hotkey(combo).split("+") if part]
 
-    def _hotkey_trigger_key(self, combo):
-        non_modifiers = [part for part in self._hotkey_parts(combo) if part not in MODIFIER_KEYS]
-        return non_modifiers[-1] if non_modifiers else self._hotkey_parts(combo)[-1]
-
     def _emit_record_press_if_active(self, combo):
         """Fire the record signal only when every key in the combo is held."""
         try:
@@ -477,31 +529,73 @@ class MainWindow(QMainWindow):
         """Hotkey pressed — start recording.
 
         NOTE: OS key-autorepeat re-fires this at ~30Hz for the whole time the
-        hotkey is held. Keep the debounce path silent and log only when we
-        actually act.
+        hotkey is held. Autorepeat is absorbed by the state check below, NOT by
+        the time debounce — the debounce timestamp only advances when we
+        actually start. (It used to advance on every autorepeat tick, which
+        meant a genuine second dictation started within 250ms of the previous
+        hold was silently swallowed: another "I pressed it and nothing
+        happened" path.)
         """
+        if self.recorder.is_recording or self._ptt_active:
+            return  # autorepeat during an active hold — silent no-op
         now = time.monotonic()
-        if now - self._last_hotkey_press_time < 0.25:
-            return  # autorepeat / double-fire — ignore silently
+        if now - self._last_hotkey_press_time < 0.15:
+            return  # true double-fire immediately after a stop
         self._last_hotkey_press_time = now
-        if not self.recorder.is_recording and not self._ptt_active:
-            applog.dbg("_hotkey_press_handler: starting PTT")
-            self._ptt_active = True
-            self._on_record_from_hotkey()
+        applog.dbg("_hotkey_press_handler: starting PTT")
+        self._ptt_active = True
+        self._on_record_from_hotkey()
 
     @Slot()
     def _hotkey_release_handler(self):
-        """Trigger key released — stop recording if push-to-talk is active."""
+        """A combo key was released — stop recording if push-to-talk is active."""
         # No-op (and no logging) unless PTT is active — this fires on every
-        # trigger-letter release during normal typing.
+        # combo-key release during normal typing.
         if not self._ptt_active:
             return
         applog.dbg(f"_hotkey_release_handler: recording={self.recorder.is_recording}")
-        if self._ptt_active and self.recorder.is_recording:
-            self._ptt_active = False
+        self._ptt_active = False
+        self._stop_ptt_watchdog()
+        if self.recorder.is_recording:
             self._on_stop_record()
-        elif self._ptt_active:
+
+    # --- lost-keyup watchdog -------------------------------------------- #
+    # A keyup is not guaranteed to arrive. Windows silently drops the
+    # low-level keyboard hook when a callback exceeds LowLevelHooksTimeout
+    # (~300ms), and a UAC-elevated foreground window or a secure-desktop
+    # switch eats events outright. When that happened the release never fired
+    # and the recording ran to the 120s safety cap — debug.log shows this
+    # three times (08-08, 08-13, 08-17), once alongside "audio input overflow
+    # x29 ... system under load", which is exactly the hook-timeout condition.
+    #
+    # So we never rely on the keyup alone: while PTT is active, poll the real
+    # key state. A dropped keyup now costs ~100ms of extra recording instead
+    # of a two-minute runaway and a wall of garbage text.
+    def _start_ptt_watchdog(self):
+        self._ptt_watchdog.start()
+
+    def _stop_ptt_watchdog(self):
+        self._ptt_watchdog.stop()
+
+    @Slot()
+    def _on_ptt_watchdog(self):
+        if not self._ptt_active:
+            self._stop_ptt_watchdog()
+            return
+        try:
+            parts = self._hotkey_parts(self.config["hotkey_record"])
+            still_held = all(kb.is_pressed(p) for p in parts)
+        except Exception as e:
+            # Can't read key state — do NOT cut the user off mid-sentence.
+            # The max-duration cap remains the backstop.
+            applog.dbg(f"ptt watchdog state check failed: {e}")
+            return
+        if not still_held:
+            applog.info("PTT watchdog: hotkey no longer held (keyup was lost) — stopping")
             self._ptt_active = False
+            self._stop_ptt_watchdog()
+            if self.recorder.is_recording:
+                self._on_stop_record()
 
     # -----------------------------------------------------------------------
     # Recording handlers
@@ -511,12 +605,20 @@ class MainWindow(QMainWindow):
         """Start recording via hotkey — capture the currently focused window first."""
         applog.dbg(f"_on_record_from_hotkey: transcriber_loaded={self.transcriber.is_loaded}")
         if not self.transcriber.is_loaded:
+            # Clear PTT — leaving it set meant the next press was treated as
+            # "already active" and silently ignored.
+            self._ptt_active = False
             self._update_status("Whisper model still loading, please wait...")
+            self.indicator.show_error("Model still loading…")
             return
         if self._dictation_active:
             self._pending_target_hwnd = winapi.get_foreground_window()
             applog.dbg(f"  target_hwnd captured: {self._pending_target_hwnd}")
         self.recorder.start()
+        if self.recorder.is_recording:
+            self._start_ptt_watchdog()
+        else:
+            self._ptt_active = False  # start() failed (dead mic) — don't wedge
 
     @Slot()
     def _on_indicator_clicked(self):
@@ -597,6 +699,7 @@ class MainWindow(QMainWindow):
             return
         applog.info("recording hit max-duration cap; auto-stopping")
         self._ptt_active = False
+        self._stop_ptt_watchdog()
         self._update_status("Recording stopped (reached the maximum length)")
         self.recorder.stop()
 
@@ -632,12 +735,30 @@ class MainWindow(QMainWindow):
         target_hwnd = self._pending_target_hwnd
         self._pending_target_hwnd = None
 
+        # The captured slice now includes the pre-roll and the tail drain, so
+        # measure the user's ACTUAL hold time against the minimum-length gate
+        # — otherwise the padding alone would clear the floor and every stray
+        # tap would go to Whisper.
+        pad = (self.recorder.preroll_ms / 1000.0) + 0.16
+        hold_duration = max(0.0, duration - pad)
+
         min_seconds = float(self.config.get("min_record_seconds", 0.2))
         min_peak = float(self.config.get("min_record_peak", 0.008))
-        if duration < min_seconds or max_amp < min_peak:
-            applog.dbg("  ignored - too short or too quiet for reliable dictation")
-            self._update_status("Recording ignored - too short or too quiet")
-            self.indicator.show_idle()
+        # Silent drops were invisible: the app normally lives in the tray, so a
+        # status-bar message nobody can see read as "it just didn't work".
+        # The pill is always on screen — say why, on the pill.
+        if hold_duration < min_seconds:
+            applog.dbg(f"  ignored - hold too short ({hold_duration:.2f}s < {min_seconds}s)")
+            self._update_status("Ignored — hotkey tapped, not held. Hold it while you speak.")
+            self.indicator.show_error("Too short — hold to talk")
+            return
+        if max_amp < min_peak:
+            applog.dbg(f"  ignored - too quiet (peak {max_amp:.4f} < {min_peak})")
+            self._update_status(
+                f"Ignored — no sound detected (peak {max_amp:.3f}). "
+                "Check the mic is unmuted and selected in Settings."
+            )
+            self.indicator.show_error("No sound — check mic")
             return
 
         if len(audio) > 0:
@@ -946,7 +1067,9 @@ class MainWindow(QMainWindow):
             vals = dlg.get_values()
             new_dev = vals.get("audio_device", -1)
             self.config.set("audio_device", new_dev)
-            self.recorder.device = new_dev if new_dev >= 0 else None
+            # set_device reopens the always-on stream; assigning .device alone
+            # would leave the OLD device's stream running forever.
+            self.recorder.set_device(new_dev if new_dev >= 0 else None)
 
             if vals["whisper_model"] != self.config["whisper_model"]:
                 self.config.set("whisper_model", vals["whisper_model"])
@@ -1000,7 +1123,21 @@ class MainWindow(QMainWindow):
         """Recorder failure: clear dictation hand-off state, then report."""
         self._pending_target_hwnd = None
         self._ptt_active = False
+        self._stop_ptt_watchdog()
         self._on_error(msg)
+
+    @Slot(bool, str)
+    def _on_mic_stream_state(self, alive, reason):
+        """Mic came up / went away. A dead mic must be visible, not silent —
+        recording into a stream that delivers nothing looks identical to
+        success right up until the empty transcript."""
+        if alive:
+            applog.dbg(f"mic stream alive: {reason}")
+            self._update_status(reason)
+        else:
+            applog.error(f"mic stream down: {reason}")
+            self._update_status(reason)
+            self.indicator.show_error("Mic unavailable")
 
     @Slot(str)
     def _on_error(self, msg):
@@ -1091,15 +1228,16 @@ class MainWindow(QMainWindow):
             kb.unhook_all()
         except Exception:
             pass
-        try:
-            self._show_request_timer.stop()
-        except Exception:
-            pass
-        if self.recorder.is_recording:
+        for timer in (self._show_request_timer, self._ptt_watchdog):
             try:
-                self.recorder.stop()
+                timer.stop()
             except Exception:
                 pass
+        # Closes the always-on capture stream (and its tick timer).
+        try:
+            self.recorder.close_stream()
+        except Exception:
+            pass
         # Stop every owned worker so no daemon thread outlives the window.
         # tts.shutdown also releases VLC + removes the temp dir.
         for closer in (self.tts.shutdown, self.paster.shutdown,

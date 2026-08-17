@@ -35,12 +35,19 @@ def load_wav(path):
 
 
 def build_transcriber():
-    """Load the model the same way the app does (CUDA -> CPU int8 fallback)."""
+    """Load the model the same way the app does (CUDA -> CPU int8 fallback).
+
+    Defaults to DEFAULTS["whisper_model"] so the gate stays hermetic, but
+    CORPUS_MODEL overrides it — a user running a different model than the
+    factory default (e.g. distil-large-v3) needs to be able to put THAT model
+    through the same objective gate before trusting it:
+        set CORPUS_MODEL=distil-large-v3 && set RUN_CORPUS=1 && pytest ...
+    """
     from voiceassistant.config import DEFAULTS
     from voiceassistant.transcriber import Transcriber
 
     t = Transcriber(
-        model_size=DEFAULTS["whisper_model"],
+        model_size=os.environ.get("CORPUS_MODEL") or DEFAULTS["whisper_model"],
         device=DEFAULTS["whisper_device"],
         compute_type=DEFAULTS["whisper_compute_type"],
         language=DEFAULTS["whisper_language"],

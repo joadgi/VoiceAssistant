@@ -28,6 +28,9 @@ DEFAULTS = {
     "whisper_language": "en",
     "whisper_device": "cuda",
     "whisper_compute_type": "float16",
+    # Optional vocabulary/style bias for Whisper (proper nouns, product names,
+    # casing). Empty = off, because a prompt can leak into the transcript.
+    "whisper_prompt": "",
 
     "tts_speed": 1.0,
     "tts_voice": "en-US-AndrewNeural",
@@ -59,6 +62,11 @@ DEFAULTS = {
     "min_record_seconds": 0.2,
     "min_record_peak": 0.008,
     "max_record_seconds": 120,  # safety cap: auto-stop a forgotten/stuck hold
+    # How much audio from BEFORE the hotkey press is kept. The mic stream runs
+    # continuously into a ring buffer, so this is free — and it is what makes
+    # the first word survive when you start talking as you press (the old
+    # open-a-stream-per-recording design lost a measured 117-137ms here).
+    "preroll_ms": 300,
 
     "light_cleanup": True,
     "debug_logging": False,
@@ -67,6 +75,28 @@ DEFAULTS = {
 
 MODIFIER_KEYS = {"ctrl", "shift", "alt", "windows", "cmd", "meta"}
 HOTKEY_KEYS = ("hotkey_record", "hotkey_screen_read", "hotkey_read_aloud")
+
+# Single keys worth DEDICATING to push-to-talk. Each was checked against
+# `keyboard`'s scan-code tables: these are the only keys whose codes do NOT
+# overlap anything used in normal typing, so they can never fire mid-sentence
+# (unlike `ctrl+alt`, whose codes are shared with every Ctrl/Alt shortcut, or
+# `right ctrl`/`right alt`, which resolve to the SAME scan-code set as the
+# generic modifier and so fire on the left key too).
+#
+# Each also has a native side effect that must be swallowed when bound, or
+# every dictation would flip machine state (caps on/off, Excel arrow-key mode,
+# overtype, a popped-up context menu). So when the record hotkey is exactly one
+# of these, it is hooked with suppress=True — the app consumes the key and
+# Windows never sees it. NEVER suppress a modifier: suppressing `ctrl` would
+# break Ctrl system-wide.
+DEDICATED_SOLO_KEYS = {"caps lock", "scroll lock", "insert", "menu", "num lock"}
+
+
+def should_suppress_hotkey(combo):
+    """True when `combo` is a single dedicated key whose OS side effect we must
+    swallow (see DEDICATED_SOLO_KEYS)."""
+    parts = [p for p in normalize_hotkey(combo).split("+") if p]
+    return len(parts) == 1 and parts[0] in DEDICATED_SOLO_KEYS
 
 # Bare keys we refuse to bind alone — you type these constantly, so a single-key
 # hotkey on one of them would fire during normal typing.

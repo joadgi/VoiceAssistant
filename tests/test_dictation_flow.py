@@ -138,6 +138,7 @@ def flow(qapp, monkeypatch):
     import voiceassistant.config as cfg
     import voiceassistant.transcriber as tr
     import voiceassistant.ocr as ocr
+    import voiceassistant.recorder as rec_mod
     import voiceassistant.winapi as winapi
     from voiceassistant.window import MainWindow
 
@@ -150,6 +151,10 @@ def flow(qapp, monkeypatch):
     monkeypatch.setattr(winapi, "set_start_with_windows", lambda *a, **k: True)
     monkeypatch.setattr(MainWindow, "_setup_hotkeys", lambda self: None)
     monkeypatch.setattr(MainWindow, "_setup_tray", lambda self: None)
+    # The mic stream is now opened once at startup and kept open. Don't grab a
+    # real capture device in tests (no device on CI, and repeated real
+    # open/close churn is not what these tests are about).
+    monkeypatch.setattr(rec_mod.VoiceRecorder, "open_stream", lambda self: True)
 
     mw = MainWindow(entry_script="main.py")
     h = _Harness(mw, None, None)
@@ -272,7 +277,8 @@ def test_record_gate_drops_short_and_quiet(flow):
     Covers BOTH gate branches: duration (short) and peak (quiet)."""
     mw, ft, fp = flow.mw, flow.transcribe, flow.paste
     mw._dictation_active = True
-    for buf, label in ((TOO_SHORT, "short"), (TOO_QUIET, "quiet")):
+    for buf, label, want in ((TOO_SHORT, "short", "short"),
+                             (TOO_QUIET, "quiet", "sound")):
         ft.calls.clear()
         mw._pending_target_hwnd = 0x1234  # a target that must be discarded
         mw.recorder.recording_stopped.emit(buf)
@@ -280,7 +286,13 @@ def test_record_gate_drops_short_and_quiet(flow):
         assert ft.calls == [], f"{label}: gate must drop before transcribe"
         assert fp.calls == [], f"{label}: nothing pasted"
         assert "ignored" in mw.status_bar.currentMessage().lower(), label
-        assert _idle(mw), f"{label}: pill returns to idle"
+        # A drop must be VISIBLE. The app normally lives in the tray, so a
+        # status-bar-only message read as "it just didn't work" — which is a
+        # large part of why dictation felt unreliable. The pill is always on
+        # screen, so it now names the reason instead of going quietly idle.
+        pill = mw.indicator._label.text().lower()
+        assert not _idle(mw), f"{label}: silent drop — pill went idle with no reason"
+        assert want in pill, f"{label}: pill does not say why ({pill!r})"
         assert mw._pending_target_hwnd is None, f"{label}: pending target cleared"
 
 

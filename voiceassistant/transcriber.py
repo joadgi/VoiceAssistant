@@ -43,12 +43,14 @@ class Transcriber(QObject):
     transcription_progress = Signal(str)  # partial results
     error = Signal(str)
 
-    def __init__(self, model_size="medium", device="cuda", compute_type="float16", language="en"):
+    def __init__(self, model_size="medium", device="cuda", compute_type="float16",
+                 language="en", initial_prompt=""):
         super().__init__()
         self.model_size = model_size
         self.device = device
         self.compute_type = compute_type
         self.language = language
+        self.initial_prompt = initial_prompt or ""
         self._model = None
         self._job_seq = 0  # monotonic job ids (replaces the id(audio) guard)
         self._worker = SerialWorker("transcriber")
@@ -150,16 +152,30 @@ class Transcriber(QObject):
         retry needs the guards the most. (Confirmed live: unguarded retry
         turned a 0.35s breath/click into "you" — see tests/fixtures/baseline.)
         """
+        # beam_size/best_of=5 + the temperature ladder are faster-whisper's own
+        # defaults, and they are here on purpose. This used to run greedy
+        # (beam_size=1, best_of=1, temperature=0.0), which is the fastest and
+        # least accurate configuration there is: greedy decoding commits to the
+        # first token every step, and pinning temperature to 0.0 DISABLES the
+        # fallback ladder — so when a decode tripped the compression/logprob
+        # thresholds there was no retry, the bad text just shipped. On a 3070
+        # the beam search costs tens of milliseconds on dictation-length clips;
+        # that is a trade worth making for a tool that has to be trusted.
         kwargs = dict(
             language=self.language,
-            beam_size=1,
-            best_of=1,
-            temperature=0.0,
+            beam_size=5,
+            best_of=5,
+            temperature=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
             condition_on_previous_text=False,
             word_timestamps=False,
             no_speech_threshold=0.6,
             compression_ratio_threshold=2.4,
+            log_prob_threshold=-1.0,
         )
+        # Optional vocabulary/style bias (proper nouns, jargon, casing). Off by
+        # default: a prompt can leak into the output, so it is opt-in per user.
+        if self.initial_prompt:
+            kwargs["initial_prompt"] = self.initial_prompt
         if use_vad:
             kwargs.update(
                 vad_filter=True,

@@ -180,6 +180,7 @@ def main_window(qapp, monkeypatch, tmp_path):
     """
     import voiceassistant.config as cfg
     import voiceassistant.ocr as ocr
+    import voiceassistant.recorder as rec_mod
     import voiceassistant.transcriber as tr
     import voiceassistant.winapi as winapi
     from voiceassistant.window import MainWindow
@@ -193,6 +194,12 @@ def main_window(qapp, monkeypatch, tmp_path):
     monkeypatch.setattr(winapi, "set_start_with_windows", lambda *a, **k: True)
     monkeypatch.setattr(MainWindow, "_setup_hotkeys", lambda self: None)
     monkeypatch.setattr(MainWindow, "_setup_tray", lambda self: None)
+    # Never open a real capture device in tests. (Before this stub the live
+    # PortAudio stream outlived the fixture and segfaulted the interpreter —
+    # which is what surfaced the recorder<->stream reference cycle now handled
+    # by VoiceRecorder.__del__.)
+    monkeypatch.setattr(rec_mod.VoiceRecorder, "open_stream", lambda self: True)
+    monkeypatch.setattr(rec_mod.VoiceRecorder, "close_stream", lambda self: None)
 
     w = MainWindow(entry_script="main.py")
     yield w
@@ -227,6 +234,7 @@ class _FakeRecorder:
     def __init__(self, recording):
         self._recording = recording
         self.stop_called = False
+        self.close_stream_called = False
 
     @property
     def is_recording(self):
@@ -234,6 +242,13 @@ class _FakeRecorder:
 
     def stop(self):
         self.stop_called = True
+
+    def close_stream(self):
+        # The mic stream is now always-on, so quitting closes the STREAM
+        # (which also ends any active capture) rather than just stopping a
+        # per-recording stream.
+        self.close_stream_called = True
+        self._recording = False
 
 
 class _FakeCloseEvent:
@@ -408,9 +423,12 @@ class TestCloseEventTeardown:
         assert tts.shutdown_called is True, "tts worker not shut down (zombie)"
         assert paster.shutdown_called is True, "paste worker not shut down (zombie)"
         assert unhook_calls, "kb.unhook_all not attempted"
-        assert mw.recorder.stop_called is True, "active recording not stopped"
+        assert mw.recorder.close_stream_called is True, \
+            "mic stream not closed on quit (live PortAudio callback would outlive the app)"
+        assert mw.recorder.is_recording is False, "active recording not ended"
         assert save_calls, "config not saved on quit"
         assert mw._show_request_timer.isActive() is False, "show-request timer left running"
+        assert mw._ptt_watchdog.isActive() is False, "PTT watchdog left running"
         assert ev.accepted is True, "quit must accept() the close event"
         assert ev.ignored is False
 

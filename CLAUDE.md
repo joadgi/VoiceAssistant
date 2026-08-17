@@ -45,7 +45,7 @@ run.bat/shortcuts/startup-registry compatibility.
 | `voiceassistant/window.py` | `MainWindow` — all orchestration and signal wiring. Renders state + dispatches jobs; never blocks. |
 | `voiceassistant/widgets.py` | `RecordingIndicator` pill + the single `HotkeyCaptureWidget`. |
 | `voiceassistant/settings_dialog.py` / `theme.py` | Settings UI, dark stylesheet. |
-| `voiceassistant/recorder.py` | `VoiceRecorder` (sounddevice mic capture, guarded teardown). |
+| `voiceassistant/recorder.py` | `VoiceRecorder` — **always-open** mic stream + pre-roll ring buffer; GUI-thread tick owns metering/duration-cap/mic-health. |
 | `voiceassistant/transcriber.py` | `Transcriber` + `TranscriptionResult` (faster-whisper, both-pass guards, job-bound context). |
 | `voiceassistant/tts.py` | `TTSEngine` — edge-tts → VLC (live speed), per-utterance generations, pyttsx3 fallback, bounded network waits. |
 | `voiceassistant/ocr.py` | `ScreenCapture` (mss) + `OCREngine` (Windows-native OCR default, EasyOCR fallback) + `RegionSelector`. |
@@ -63,11 +63,13 @@ run.bat/shortcuts/startup-registry compatibility.
 ## How it works (data flow)
 
 **Dictation (push-to-talk):**
-`hold hotkey` → capture foreground window HWND → record mic to buffer → `release` →
+The mic stream is **already open** (opened once at launch) and continuously filling a ring
+buffer. `hold hotkey` → capture foreground window HWND → mark the ring offset
+`preroll_ms` BEFORE the press → `release` → after a short tail drain, slice the ring →
 `Transcriber.transcribe()` → clean up text → the `Paster` worker copies to the clipboard
 and sends Win32 `Ctrl+V` into the captured window (off the GUI thread; the prior clipboard
 is restored afterward). The floating pill mirrors each state (Ready → Recording →
-Transcribing → Pasted).
+Transcribing → Pasted), **and names the reason when a clip is dropped**.
 
 **Read-aloud:** hotkey → refocus the prior window → Win32 `Ctrl+C` to grab the selection
 via a clipboard sentinel → `TTSEngine.speak()`.
@@ -80,10 +82,76 @@ live (no regeneration). Falls back to `pyttsx3` SAPI if neural/VLC fails.
 
 ## Key design decisions (the "why", for future reviews)
 
+- **The mic stream is ALWAYS OPEN; recordings are ring-buffer slices**
+  (`recorder.py`). Opening a stream per recording cost a **measured 117–137 ms
+  before the first sample arrived** on this hardware (Yeti/MME) — the leading edge
+  of the first word, lost on every single dictation, and short words ("yes") lost
+  enough to fall under `min_record_seconds` and be dropped outright. That was the
+  bulk of the "it doesn't hear me / I have to repeat myself" complaint. Now
+  `start()` just marks an offset (**~30 µs measured**) `preroll_ms` in the PAST, so
+  the first word survives even if you speak slightly before pressing, and `stop()`
+  drains a short tail so the last syllable survives too. Verified live: a 1000 ms
+  hold delivers ~1450 ms of audio (300 pre-roll + hold + ~150 tail).
+  **Do not go back to opening a stream per recording.**
+- **The audio callback does the minimum and emits NOTHING.** It downmixes, writes
+  the ring, and tracks a peak. Metering, the duration cap and mic-health all run on
+  a GUI-thread `QTimer`. The old per-block `level_update.emit()` from the audio
+  thread contributed to the logged `audio input overflow x29`.
+- **Recorder teardown is guaranteed three ways** — `close_stream()` (app exit /
+  device change), `__del__`, and a **weakref** `atexit` hook. Recorder↔stream is a
+  reference cycle, and letting the cycle collector reclaim it while PortAudio was
+  still inside the callback **segfaulted the interpreter** (hit while running the
+  suite). The `atexit` registration must stay a weakref: a bound method would pin
+  every recorder forever and `__del__` would never run.
+- **Push-to-talk hooks EVERY key in the combo, not one "trigger" key**
+  (`_setup_hotkeys`). This was the headline reliability bug: with the modifier-only
+  combo `ctrl+alt`, the derived trigger was `alt`, so Ctrl's keydown had no hook at
+  all — pressing **Alt before Ctrl did nothing**, and since two keys pressed together
+  land in arbitrary order, dictation silently failed to start about half the time.
+  Releasing *any* combo key now ends the hold too. Locked down by
+  `tests/integration/test_hotkey_register.py` (those tests fail against the old logic).
+- **A dedicated solo key is SUPPRESSED; a modifier never is** (`DEDICATED_SOLO_KEYS`,
+  `should_suppress_hotkey`). Caps Lock is the best push-to-talk key available — home row,
+  huge, and its scan code (58) is the only kind that does **not** overlap anything used in
+  normal typing — but binding it un-suppressed would toggle caps on every dictation. So a
+  single dedicated key (caps lock / scroll lock / insert / menu / num lock) is hooked with
+  `suppress=True` and the app swallows it. Modifiers must never be suppressed —
+  swallowing `ctrl` would break Ctrl system-wide.
+  - **The suppressing callbacks MUST return falsy.** `keyboard` blocks a suppressed event
+    only when the handler returns a falsy value, and in **PySide6 `Signal.emit()` returns
+    `True`** — so the obvious `lambda e: sig.emit()` silently stops suppressing and Caps
+    Lock starts toggling caps again. `_setup_hotkeys` uses explicit `def`s that emit as a
+    statement; a test pins the falsy return.
+  - **Right-hand modifiers are NOT usable as solo keys:** `keyboard.key_to_scan_codes`
+    maps `right ctrl` → `(57629, 29, 57373)` — the *same set* as generic `ctrl` — and
+    `hook_key` registers under every one, so `right ctrl` fires on LEFT Ctrl (every
+    Ctrl+C would start a dictation). Same for `right alt`. `pause` shares a code with
+    `ctrl` too. Don't "fix" this by re-adding them.
+  - Note when testing hooks: `keyboard` passes its **own injected** events straight
+    through (`is_replaying`), so `kb.press(scan_code)` does NOT fire your hooks. Synthetic
+    keypresses cannot verify hook behavior here — reason from the scan-code tables.
+- **Never trust a keyup — poll the key state** (`_on_ptt_watchdog`, 100 ms). Windows
+  silently drops a low-level keyboard hook whose callback exceeds
+  `LowLevelHooksTimeout`, and elevated/secure-desktop windows eat events. When that
+  happened the release never fired and recording ran to the 120 s cap — `debug.log`
+  shows it three times (08-08, 08-13, 08-17), once next to the overflow message,
+  i.e. exactly the under-load hook-timeout case. A lost keyup now costs ~100 ms.
+- **A dead mic must be loud, not silent.** The tick watchdog notices a stream that
+  stopped delivering, reports it (`stream_state`), and reopens. Recording into a
+  dead device looks identical to success until the empty transcript arrives.
+- **Silent drops are surfaced on the pill.** The app lives in the tray, so a
+  status-bar-only "Recording ignored" was invisible and read as "it just didn't
+  work". The gate also measures the user's **hold** time, not the padded slice.
 - **VAD with a no-VAD retry** (`transcriber.py` `_run_transcribe`): VAD trims silence so
   Whisper stops hallucinating repeats/junk on pauses — but if the VAD pass returns empty,
   it retries **without** VAD so quiet/short speech is never lost. This was a real
   regression once; don't remove the retry.
+- **Decoding uses beam search + the temperature ladder** (`transcriber.py`), which are
+  faster-whisper's own defaults. This ran greedy (`beam_size=1, best_of=1,
+  temperature=0.0`) — the fastest and least accurate setting, and pinning temperature
+  to `0.0` **disabled the fallback retry**, so a decode that tripped the
+  compression/logprob thresholds just shipped its bad text. Measured cost of the
+  upgrade: **+54 ms per dictation** on a 3070. Don't trade it back for latency.
 - **Post-process repeat collapse** (`collapse_repeated_phrases` in `text.py`): catches
   word/phrase/sentence repeats as a safety net. Prefer this over aggressive transcribe-time
   filters.
@@ -117,8 +185,24 @@ live (no regeneration). Falls back to `pyttsx3` SAPI if neural/VLC fails.
 - Avoid **Windows-key** hotkeys (OS intercepts them) and common browser combos (`Ctrl+T/W/R`).
 - **VLC must be installed** for neural TTS playback (`winget install VideoLAN.VLC`).
 - `settings.json`, `debug.log`, and `crash.log` are **gitignored** (local runtime state).
-  Internal tuning knobs (`min_record_seconds`, `min_record_peak`) live in both `DEFAULTS`
-  and `settings.json`. Debug logging is opt-in (`debug_logging`, default off).
+  Internal tuning knobs (`min_record_seconds`, `min_record_peak`, `preroll_ms`) live in
+  both `DEFAULTS` and `settings.json`. Debug logging is opt-in (`debug_logging`, default
+  off). `whisper_prompt` (default `""`) optionally biases Whisper toward your vocabulary
+  and casing — it is opt-in because a prompt can leak into the transcript.
+- **Whisper model choice:** `medium` is the shipped factory default; **`large-v3` is the
+  most accurate model that is SAFE here** (corpus gate 13/13; 3.2 GB VRAM, 449 ms/clip
+  vs medium's 308 ms on a 3070 — 8.7x realtime). Switching downloads the model once.
+  Put any model change through the gate first:
+  `RUN_CORPUS=1 CORPUS_MODEL=<name> pytest tests/test_corpus_gate.py`.
+- **NEVER ship a `distil-*` Whisper model here.** `distil-large-v3` looks ideal on paper
+  (near-`large-v3` accuracy, far faster) and **fails this app's hallucination gate**: on
+  pure room noise it emits "Thank you." with `no_speech_prob` **0.087–0.163** — it is
+  *confident* the noise is speech — where `medium` reports **0.875–0.960** and is
+  correctly dropped. The distilled decoder's no-speech head is unreliable, so no
+  threshold can separate it from genuine quiet speech, and the invented phrase is one
+  the denylist deliberately excludes (people really do dictate "Thank you"). Hallucinated
+  text pasted into the focused window is the worst failure this app has; it is not worth
+  any latency win. The Settings dropdown therefore does not offer distil models.
 - The Whisper model downloads on first run (one-time, cached outside the repo). The
   default OCR backend is Windows-native — no model download, no PyTorch. **PyTorch is
   no longer a dependency** (it only ever served EasyOCR); Whisper-GPU gets its CUDA
@@ -136,6 +220,12 @@ live (no regeneration). Falls back to `pyttsx3` SAPI if neural/VLC fails.
 3. First launch downloads models (~1 GB, one-time).
 
 ## Default hotkeys
+
+> **Recommended dictate key: `caps lock`** (what Josh runs). It is the only class of key
+> whose scan code never overlaps normal typing, it is the most comfortable key to hold
+> while speaking, and the app suppresses it so it no longer toggles caps. A modifier-only
+> combo like `ctrl+alt` works but is the weakest option — every `Ctrl+Alt+<key>` shortcut
+> also starts a recording.
 
 | Action | Default | Behavior |
 |---|---|---|
@@ -158,5 +248,15 @@ All are editable inline — click a hotkey pill and press your combo (single key
 - **Watchpoints:** the job-bound target HWND (never reintroduce a shared field), the
   monotonic job-id guard, the silent-drop thresholds, the VAD retry (its segment guards
   must stay on BOTH passes), and the threading law (`workers.SerialWorker` — no ad-hoc
-  threads). These interact; change them deliberately and finish with a live end-to-end
-  voice test (models can't hear a human in CI).
+  threads). **Capture-path watchpoints:** the always-open stream + pre-roll (never
+  reintroduce per-recording stream opens), the audio callback staying signal-free, the
+  three-way recorder teardown (weakref `atexit` — a strong ref defeats `__del__` and
+  reopens the segfault), hooking every combo key, and the PTT watchdog. These interact;
+  change them deliberately and finish with a live end-to-end voice test (models can't
+  hear a human in CI).
+- **Tests must never open a real capture device.** Every MainWindow harness stubs
+  `VoiceRecorder.open_stream`/`close_stream`; a live stream outliving a fixture is what
+  segfaulted the suite. Drive the recorder synchronously instead: `_audio_callback(...)`
+  to feed audio, `_on_tick()` for cap/health, `_finish_capture()` for the tail timer.
+- Local pytest runs may need `--basetemp` redirected (the default
+  `%TEMP%\pytest-of-*` dir can end up ACL-locked, which shows as ~29 unrelated errors).
