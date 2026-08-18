@@ -16,6 +16,21 @@ ENTRY_SCRIPT = os.path.join(CONFIG_DIR, "main.py")
 def main():
     # Self-diagnostic — fast, no GUI, no single-instance lock. Run this on a
     # new machine (or after a restart) to confirm every component is present.
+    if "--report" in sys.argv:
+        # Dictation reliability report from the local metrics file. No GUI,
+        # no model load, no network — just the numbers.
+        from . import metrics
+
+        limit = None
+        for arg in sys.argv:
+            if arg.startswith("--last="):
+                try:
+                    limit = max(1, int(arg.split("=", 1)[1]))
+                except ValueError:
+                    pass
+        print(metrics.format_report(metrics.load(limit=limit)))
+        sys.exit(0)
+
     if "--check" in sys.argv:
         from .selfcheck import run_selfcheck
 

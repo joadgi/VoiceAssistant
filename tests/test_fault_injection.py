@@ -297,3 +297,107 @@ class TestWorkerResilience:
         assert done.wait(3)
         assert order == [0, 1, 2, 3, 4]
         w.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Model loading: cache-first (no network on launch), and a LOUD device fallback
+# ---------------------------------------------------------------------------
+class _FakeWhisper:
+    """Records how WhisperModel was constructed; can fail on demand."""
+
+    def __init__(self, calls, fail_cuda=False, fail_local=False):
+        self.calls = calls
+        self.fail_cuda = fail_cuda
+        self.fail_local = fail_local
+
+    def __call__(self, size, device=None, compute_type=None, local_files_only=False,
+                 **kw):
+        self.calls.append(
+            {"size": size, "device": device, "compute": compute_type,
+             "local_only": bool(local_files_only)}
+        )
+        if self.fail_local and local_files_only:
+            from huggingface_hub.errors import LocalEntryNotFoundError
+
+            raise LocalEntryNotFoundError("simulated: nothing cached")
+        if self.fail_cuda and device == "cuda":
+            raise RuntimeError("simulated: cudnn missing")
+        return object()
+
+
+class TestModelLoad:
+    def _patch(self, monkeypatch, **kw):
+        import faster_whisper
+
+        calls = []
+        monkeypatch.setattr(faster_whisper, "WhisperModel",
+                            _FakeWhisper(calls, **kw))
+        return calls
+
+    def _transcriber(self):
+        from voiceassistant.transcriber import Transcriber
+
+        t = Transcriber(model_size="large-v3", device="cuda", compute_type="float16")
+        monkey = {"nvidia": False}
+        t._add_nvidia_dll_dirs = lambda: monkey.__setitem__("nvidia", True)
+        return t
+
+    def test_cached_model_loads_without_touching_the_network(self, monkeypatch):
+        """faster-whisper otherwise revalidates against huggingface.co on EVERY
+        launch: measured 176.3s vs 7.0s for an already-cached large-v3, i.e. ~3
+        minutes after each boot where the hotkey only says 'still loading'."""
+        calls = self._patch(monkeypatch)
+        t = self._transcriber()
+        ready = []
+        t.model_ready.connect(lambda: ready.append(True))
+        t._load_job()
+        assert ready == [True]
+        assert len(calls) == 1, f"expected ONE load attempt, got {calls}"
+        assert calls[0]["local_only"] is True, "did not prefer the local cache"
+
+    def test_cache_miss_falls_back_to_downloading_once(self, monkeypatch):
+        """A genuinely uncached model must still install on first run."""
+        calls = self._patch(monkeypatch, fail_local=True)
+        t = self._transcriber()
+        msgs, ready = [], []
+        t.model_loading.connect(msgs.append)
+        t.model_ready.connect(lambda: ready.append(True))
+        t._load_job()
+        assert ready == [True], "first-run download path did not complete"
+        assert [c["local_only"] for c in calls][:2] == [True, False], (
+            f"expected cache-first then download, got {calls}"
+        )
+        assert any("Download" in m for m in msgs), "user not told a download started"
+
+    def test_cuda_failure_is_not_mistaken_for_a_cache_miss(self, monkeypatch):
+        """A cuDNN/CUDA error must NOT trigger a pointless multi-GB download —
+        and must not leave us pinned to CPU after one."""
+        calls = self._patch(monkeypatch, fail_cuda=True)
+        t = self._transcriber()
+        t._load_job()
+        assert all(c["local_only"] for c in calls), (
+            f"a CUDA failure triggered a network download: {calls}"
+        )
+        assert [c["device"] for c in calls] == ["cuda", "cpu"], calls
+
+    def test_cpu_fallback_is_loud(self, monkeypatch):
+        """A silent CPU session is 10-20x slower and reads as 'dictation got
+        slow' with no explanation."""
+        self._patch(monkeypatch, fail_cuda=True)
+        t = self._transcriber()
+        degraded, ready = [], []
+        t.degraded.connect(degraded.append)
+        t.model_ready.connect(lambda: ready.append(True))
+        t._load_job()
+        assert ready == [True]
+        assert t.device == "cpu" and t.compute_type == "int8"
+        assert degraded, "CPU fallback was silent"
+        assert "CPU" in degraded[0]
+
+    def test_no_degraded_signal_when_the_gpu_works(self, monkeypatch):
+        self._patch(monkeypatch)
+        t = self._transcriber()
+        degraded = []
+        t.degraded.connect(degraded.append)
+        t._load_job()
+        assert degraded == [], "spurious degraded warning on a healthy GPU load"

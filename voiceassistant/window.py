@@ -7,6 +7,7 @@ renders state and dispatches jobs.
 """
 
 import time
+from collections import deque
 
 import keyboard as kb
 import numpy as np
@@ -19,7 +20,7 @@ from PySide6.QtWidgets import (
     QTextEdit, QVBoxLayout, QWidget,
 )
 
-from . import applog, winapi
+from . import applog, metrics, winapi
 from .config import (
     Config, DEFAULTS, MODIFIER_KEYS, normalize_hotkey, should_suppress_hotkey,
     validate_hotkey,
@@ -112,6 +113,12 @@ class MainWindow(QMainWindow):
         self._read_in_flight = False
         # Polls real key state while PTT is held, so a dropped keyup can't
         # wedge the recording open (see _on_ptt_watchdog).
+        # Metrics for the in-flight dictation. Keyed by transcription job id
+        # so overlapping dictations can't be attributed to each other; the
+        # paste leg is a FIFO because Paster jobs complete in order.
+        self._metrics_pending = {}
+        self._metrics_awaiting_paste = deque()
+        self._keyup_lost_pending = False
         self._ptt_watchdog = QTimer(self)
         self._ptt_watchdog.setInterval(100)
         self._ptt_watchdog.timeout.connect(self._on_ptt_watchdog)
@@ -388,11 +395,13 @@ class MainWindow(QMainWindow):
         self.transcriber.transcription_ready.connect(self._on_transcription_ready)
         self.transcriber.transcription_progress.connect(self._update_status)
         self.transcriber.error.connect(self._on_error)
+        self.transcriber.degraded.connect(self._on_degraded)
 
         self.ocr.model_loading.connect(self._on_model_loading)
         self.ocr.model_ready.connect(self._on_ocr_ready)
         self.ocr.text_ready.connect(self._on_ocr_text_ready)
         self.ocr.error.connect(self._on_error)
+        self.ocr.degraded.connect(self._on_degraded)
 
         self.tts.speaking_started.connect(self._on_tts_started)
         self.tts.speaking_finished.connect(self._on_tts_finished)
@@ -592,6 +601,7 @@ class MainWindow(QMainWindow):
             return
         if not still_held:
             applog.info("PTT watchdog: hotkey no longer held (keyup was lost) — stopping")
+            self._keyup_lost_pending = True
             self._ptt_active = False
             self._stop_ptt_watchdog()
             if self.recorder.is_recording:
@@ -742,6 +752,16 @@ class MainWindow(QMainWindow):
         pad = (self.recorder.preroll_ms / 1000.0) + 0.16
         hold_duration = max(0.0, duration - pad)
 
+        base = {
+            "hold_s": hold_duration, "audio_s": duration, "peak": max_amp,
+            "overflows": int(getattr(self.recorder, "_overflow_count", 0) or 0),
+            "model": self.transcriber.model_size,
+            "device": self.transcriber.device,
+        }
+        if self._keyup_lost_pending:
+            base["keyup_lost"] = True
+        self._keyup_lost_pending = False
+
         min_seconds = float(self.config.get("min_record_seconds", 0.2))
         min_peak = float(self.config.get("min_record_peak", 0.008))
         # Silent drops were invisible: the app normally lives in the tray, so a
@@ -751,6 +771,7 @@ class MainWindow(QMainWindow):
             applog.dbg(f"  ignored - hold too short ({hold_duration:.2f}s < {min_seconds}s)")
             self._update_status("Ignored — hotkey tapped, not held. Hold it while you speak.")
             self.indicator.show_error("Too short — hold to talk")
+            metrics.record(metrics.OUTCOME_DROPPED_SHORT, **base)
             return
         if max_amp < min_peak:
             applog.dbg(f"  ignored - too quiet (peak {max_amp:.4f} < {min_peak})")
@@ -759,12 +780,18 @@ class MainWindow(QMainWindow):
                 "Check the mic is unmuted and selected in Settings."
             )
             self.indicator.show_error("No sound — check mic")
+            metrics.record(metrics.OUTCOME_DROPPED_QUIET, **base)
             return
 
         if len(audio) > 0:
             self._update_status(f"Transcribing {duration:.1f}s (peak {max_amp:.3f})...")
             self.indicator.show_transcribing()
-            self.transcriber.transcribe(audio, context=target_hwnd)
+            job_id = self.transcriber.transcribe(audio, context=target_hwnd)
+            if job_id is not None:
+                self._metrics_pending[job_id] = base
+                # Bound the map: a job that never delivers must not leak.
+                while len(self._metrics_pending) > 16:
+                    self._metrics_pending.pop(min(self._metrics_pending), None)
         else:
             self._update_status("No audio captured")
             self.indicator.show_idle()
@@ -792,6 +819,29 @@ class MainWindow(QMainWindow):
         self.label_model_status.setStyleSheet("color: #a6e3a1; font-weight: bold;")
         self._update_status("Ready")
 
+    @Slot(str)
+    def _on_degraded(self, msg):
+        """A subsystem loaded but in a much worse mode than asked for.
+
+        The app lives in the tray, so the model label alone is invisible — a
+        CPU-instead-of-GPU session just feels like "dictation got slow" with no
+        explanation. Use the one channel that reaches the user in the tray: a
+        balloon, plus a label that STAYS marked degraded.
+        """
+        applog.error(f"DEGRADED: {msg}")
+        self._update_status(msg)
+        text = self.label_model_status.text()
+        if "DEGRADED" not in text:
+            self.label_model_status.setText(f"{text}  -  DEGRADED")
+        self.label_model_status.setStyleSheet("color: #fab387; font-weight: bold;")
+        try:
+            self.tray.showMessage(
+                "Voice Assistant - degraded", msg,
+                QSystemTrayIcon.MessageIcon.Warning, 10000,
+            )
+        except Exception:
+            pass
+
     @Slot()
     def _on_ocr_ready(self):
         self._update_status(f"Ready  |  OCR engine loaded ({self.ocr.describe()})")
@@ -813,9 +863,14 @@ class MainWindow(QMainWindow):
             return
         self._last_job_id = result.job_id
 
+        m = self._metrics_pending.pop(result.job_id, {})
+        m["transcribe_ms"] = float(getattr(result, "latency_ms", 0.0) or 0.0)
+        m["retried"] = bool(result.retried)
+
         if result.no_speech:
             self.indicator.show_idle()
             self._update_status("No speech detected")
+            metrics.record(metrics.OUTCOME_NO_SPEECH, **m)
             return
 
         text = clean_transcript(
@@ -828,6 +883,7 @@ class MainWindow(QMainWindow):
         if not text.strip():
             self.indicator.show_idle()
             self._update_status("No speech detected")
+            metrics.record(metrics.OUTCOME_NO_SPEECH, **m)
             return
 
         # Backstop for silence-hallucinations that slip past the segment
@@ -836,6 +892,7 @@ class MainWindow(QMainWindow):
             applog.dbg("  suppressed probable hallucination (retry artifact)")
             self.indicator.show_idle()
             self._update_status("Ignored noise (no clear speech)")
+            metrics.record(metrics.OUTCOME_HALLUCINATION, **m)
             return
 
         target_hwnd = result.context
@@ -847,14 +904,21 @@ class MainWindow(QMainWindow):
             # Paste runs on the paste worker — the GUI thread never blocks.
             self.indicator.show_pasting()
             self._update_status("Pasting...")
+            m["chars"] = len(text)
+            self._metrics_awaiting_paste.append(m)
             self.paster.submit(target_hwnd, text, self._sig_paste_done.emit)
         else:
             self.indicator.show_idle()
             self._update_status("Transcription complete")
             self._append_output(text, prefix="[Voice]")
+            metrics.record(metrics.OUTCOME_PANEL, chars=len(text), **m)
 
     @Slot(bool, str)
     def _on_paste_done(self, success, text):
+        m = (self._metrics_awaiting_paste.popleft()
+             if self._metrics_awaiting_paste else {})
+        metrics.record(metrics.OUTCOME_PASTED if success
+                       else metrics.OUTCOME_PASTE_FAILED, **m)
         if success:
             self.indicator.show_done()
             self._update_status("Transcribed and pasted")
@@ -1124,6 +1188,7 @@ class MainWindow(QMainWindow):
         self._pending_target_hwnd = None
         self._ptt_active = False
         self._stop_ptt_watchdog()
+        metrics.record(metrics.OUTCOME_MIC_ERROR)
         self._on_error(msg)
 
     @Slot(bool, str)

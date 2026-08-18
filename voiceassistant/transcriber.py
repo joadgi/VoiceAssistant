@@ -4,6 +4,7 @@ All model loads and transcription jobs serialize on a single SerialWorker
 (the threading law) — the old per-job daemon threads plus a lock are gone.
 """
 
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -15,6 +16,25 @@ from .workers import SerialWorker
 # Whisper's fixed input rate. Audio reaches this module already at 16 kHz mono
 # (the recorder is pinned to it); every sample-count → seconds calc uses this.
 SAMPLE_RATE = 16000
+
+
+def _is_cache_miss(exc):
+    """True when a local_files_only load failed only because nothing is cached.
+
+    Anything else (a CUDA/cuDNN failure, a corrupt file) must NOT be treated as
+    a cache miss, or we would fire off a pointless multi-GB download.
+    """
+    try:
+        from huggingface_hub.errors import LocalEntryNotFoundError
+
+        if isinstance(exc, LocalEntryNotFoundError):
+            return True
+    except Exception:
+        pass
+    if exc.__class__.__name__ in ("LocalEntryNotFoundError", "EntryNotFoundError"):
+        return True
+    text = str(exc).lower()
+    return "local_files_only" in text or "cannot find the requested files" in text
 
 
 @dataclass
@@ -31,6 +51,7 @@ class TranscriptionResult:
     context: Any = None      # opaque app payload (dictation: target HWND or None)
     duration_s: float = 0.0
     retried: bool = False    # True if the no-VAD retry produced this text
+    latency_ms: float = 0.0  # wall-clock decode time (fed to metrics)
     no_speech: bool = False  # True if both passes found nothing
 
 
@@ -39,6 +60,11 @@ class Transcriber(QObject):
 
     model_loading = Signal(str)  # status message
     model_ready = Signal()
+    # Loaded, but in a materially worse mode than requested (CPU instead of
+    # CUDA is 10-20x slower). A degraded session that only writes a log line
+    # is experienced as "dictation got slow" with no explanation, so this is
+    # surfaced LOUDLY (tray balloon + persistent label), not just logged.
+    degraded = Signal(str)
     transcription_ready = Signal(object)  # emits TranscriptionResult
     transcription_progress = Signal(str)  # partial results
     error = Signal(str)
@@ -90,39 +116,71 @@ class Transcriber(QObject):
                         except OSError:
                             pass
 
-    def _load_job(self):
+    def _open_model(self, device, compute_type):
+        """Open the model on `device`, preferring the local cache.
+
+        WHY local_files_only FIRST: faster-whisper otherwise revalidates the
+        model against huggingface.co on EVERY launch. Measured on this machine
+        with large-v3 already fully cached: **176.3s with the network check vs
+        7.0s from cache** — i.e. ~3 minutes after every boot during which
+        pressing the dictate hotkey only says "model still loading" and the
+        words are lost. It was also an undocumented external call in an app
+        whose whole premise is that dictation stays on your machine. The network
+        is now touched exactly once per model: the first time it is needed.
+        """
+        from faster_whisper import WhisperModel
+
         try:
-            self.model_loading.emit(f"Loading Whisper {self.model_size} model...")
-            if self.device == "cuda":
-                self._add_nvidia_dll_dirs()
-            from faster_whisper import WhisperModel
-
-            self._model = WhisperModel(
-                self.model_size,
-                device=self.device,
-                compute_type=self.compute_type,
+            return WhisperModel(
+                self.model_size, device=device, compute_type=compute_type,
+                local_files_only=True,
             )
-            self.model_ready.emit()
         except Exception as e:
-            # Try CPU fallback — and record WHY the GPU path failed so a
-            # silent slow-CPU session is diagnosable.
-            from . import applog
+            if not _is_cache_miss(e):
+                raise
 
-            applog.error(f"GPU model load failed ({e}); falling back to CPU int8")
-            try:
-                self.model_loading.emit("GPU failed, falling back to CPU...")
-                from faster_whisper import WhisperModel
+        from . import applog
 
-                self._model = WhisperModel(
-                    self.model_size,
-                    device="cpu",
-                    compute_type="int8",
+        applog.info(f"whisper model {self.model_size} not cached; downloading once")
+        self.model_loading.emit(
+            f"Downloading Whisper {self.model_size} (one-time)..."
+        )
+        return WhisperModel(
+            self.model_size, device=device, compute_type=compute_type
+        )
+
+    def _load_job(self):
+        from . import applog
+
+        self.model_loading.emit(f"Loading Whisper {self.model_size} model...")
+        if self.device == "cuda":
+            self._add_nvidia_dll_dirs()
+
+        want_device = self.device
+        try:
+            self._model = self._open_model(want_device, self.compute_type)
+            self.model_ready.emit()
+            return
+        except Exception as e:
+            # Record WHY the requested device failed so a silent slow-CPU
+            # session is diagnosable.
+            applog.error(f"model load on {want_device} failed ({e}); trying CPU int8")
+
+        # The device fallback is deliberately SEPARATE from the cache/download
+        # decision inside _open_model: a CUDA failure must never be mistaken for
+        # a cache miss, and a download must never silently pin us to CPU.
+        try:
+            self.model_loading.emit("GPU unavailable - falling back to CPU...")
+            self._model = self._open_model("cpu", "int8")
+            self.device, self.compute_type = "cpu", "int8"
+            self.model_ready.emit()
+            if want_device != "cpu":
+                self.degraded.emit(
+                    "Whisper is running on the CPU, not the GPU - dictation will be "
+                    "much slower than usual. See debug.log for the GPU error."
                 )
-                self.device = "cpu"
-                self.compute_type = "int8"
-                self.model_ready.emit()
-            except Exception as e2:
-                self.error.emit(f"Failed to load model: {e2}")
+        except Exception as e2:
+            self.error.emit(f"Failed to load model: {e2}")
 
     def transcribe(self, audio_data, context=None):
         """Transcribe audio on the worker.
@@ -140,6 +198,7 @@ class Transcriber(QObject):
 
         self._job_seq += 1
         self._worker.submit(self._transcribe_job, audio_data, context, self._job_seq)
+        return self._job_seq  # so callers can correlate metrics to the job
 
     def _run_transcribe(self, audio_data, use_vad):
         """Run one transcription pass.
@@ -193,6 +252,7 @@ class Transcriber(QObject):
 
     def _transcribe_job(self, audio_data, context, job_id):
         try:
+            t0 = time.perf_counter()
             duration = len(audio_data) / SAMPLE_RATE
             max_amp = float(np.max(np.abs(audio_data)))
             self.transcription_progress.emit(
@@ -216,6 +276,7 @@ class Transcriber(QObject):
                     duration_s=duration,
                     retried=retried,
                     no_speech=not full_text,
+                    latency_ms=(time.perf_counter() - t0) * 1000.0,
                 )
             )
         except Exception as e:

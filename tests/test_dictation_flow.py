@@ -475,3 +475,78 @@ def test_pending_hwnd_consumed_once_no_stale_reuse(flow, monkeypatch):
     mw.recorder.recording_stopped.emit(LOUD)
     assert ft.calls[-1] == (len(LOUD), None)
     assert len(ft.calls) == 2
+
+
+# --------------------------------------------------------------------------- #
+# Metrics wiring: every terminal state of a dictation must be recorded, or the
+# --report numbers silently under-count exactly the failures we care about.
+# --------------------------------------------------------------------------- #
+def test_every_dictation_outcome_is_recorded(flow, tmp_path, monkeypatch):
+    from voiceassistant import metrics
+
+    monkeypatch.setattr(metrics, "METRICS_PATH", str(tmp_path / "m.jsonl"))
+    mw, ft, fp = flow.mw, flow.transcribe, flow.paste
+    mw._dictation_active = True
+
+    def outcomes():
+        return [r["outcome"] for r in metrics.load()]
+
+    # 1. dropped: tapped, not held
+    mw.recorder.recording_stopped.emit(TOO_SHORT)
+    assert outcomes() == [metrics.OUTCOME_DROPPED_SHORT], outcomes()
+
+    # 2. dropped: nothing audible
+    mw.recorder.recording_stopped.emit(TOO_QUIET)
+    assert outcomes()[-1] == metrics.OUTCOME_DROPPED_QUIET
+
+    # 3. transcribed but empty -> no speech
+    mw.transcriber.transcription_ready.emit(
+        TranscriptionResult(text="", job_id=101, context=0xABCD,
+                            duration_s=2.0, retried=True, no_speech=True)
+    )
+    assert outcomes()[-1] == metrics.OUTCOME_NO_SPEECH
+
+    # 4. pasted (the happy path) — carries latency + char count.
+    # _FakePaste.submit already fires done_cb, so the paste leg completes on
+    # its own; emitting _sig_paste_done by hand would double-count.
+    fp.success = True
+    mw.transcriber.transcription_ready.emit(
+        TranscriptionResult(text="hello there", job_id=102, context=0xABCD,
+                            duration_s=2.0, latency_ms=321.0)
+    )
+    rows = metrics.load()
+    assert rows[-1]["outcome"] == metrics.OUTCOME_PASTED
+    assert rows[-1]["chars"] == len("Hello there.")
+    assert rows[-1]["transcribe_ms"] == 321.0, "decode latency not recorded"
+
+    # 5. paste refused -> recorded as a failure, not a success
+    fp.success = False
+    mw.transcriber.transcription_ready.emit(
+        TranscriptionResult(text="second one", job_id=103, context=0xABCD,
+                            duration_s=2.0, latency_ms=99.0)
+    )
+    assert metrics.load()[-1]["outcome"] == metrics.OUTCOME_PASTE_FAILED
+
+    # The report must be derivable from this and must flag the bad outcomes.
+    s = metrics.summarize(metrics.load())
+    assert s["total"] == 5, "one record per dictation outcome, no double-counting"
+    assert s["success_rate"] < 1.0, "failures did not count against the rate"
+
+
+def test_metrics_record_carries_capture_facts_not_text(flow, tmp_path, monkeypatch):
+    """The capture-side numbers (hold, audio, peak) are what diagnose the bugs
+    from this session — and no transcript text may ever be written."""
+    from voiceassistant import metrics
+
+    monkeypatch.setattr(metrics, "METRICS_PATH", str(tmp_path / "m2.jsonl"))
+    mw = flow.mw
+    mw._dictation_active = True
+    mw._keyup_lost_pending = True          # pretend the watchdog rescued a keyup
+    mw.recorder.recording_stopped.emit(TOO_QUIET)
+
+    row = metrics.load()[-1]
+    assert row["outcome"] == metrics.OUTCOME_DROPPED_QUIET
+    for key in ("hold_s", "audio_s", "peak", "overflows", "model", "device"):
+        assert key in row, f"{key} missing — cannot diagnose capture problems"
+    assert row["keyup_lost"] is True, "lost-keyup rescue not attributed"
+    assert mw._keyup_lost_pending is False, "flag not cleared (would taint the next)"

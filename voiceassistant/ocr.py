@@ -74,6 +74,9 @@ class OCREngine(QObject):
 
     model_loading = Signal(str)
     model_ready = Signal()
+    # Loaded, but slower/worse than requested (EasyOCR instead of the
+    # ~10ms native engine, or CPU instead of GPU). Surfaced, not just logged.
+    degraded = Signal(str)
     text_ready = Signal(str)
     error = Signal(str)
 
@@ -127,8 +130,16 @@ class OCREngine(QObject):
                     self.model_ready.emit()
                     return
                 applog.error("OCR: no Windows OCR language pack; falling back")
+                self.degraded.emit(
+                    "Screen reader fell back to EasyOCR: no Windows OCR language "
+                    "pack installed. OCR will be slower and needs the torch stack."
+                )
             except Exception as e:
                 applog.error(f"OCR: Windows engine unavailable ({e}); falling back")
+                self.degraded.emit(
+                    "Screen reader fell back to EasyOCR: the fast Windows OCR "
+                    "engine is unavailable. See debug.log."
+                )
             if self.backend == "windows":
                 self.error.emit("Windows OCR unavailable (install a language pack)")
                 return
@@ -153,6 +164,10 @@ class OCREngine(QObject):
                 self.gpu = False
                 self.active_backend = "easyocr"
                 self.model_ready.emit()
+                self.degraded.emit(
+                    "Screen reader OCR is running on the CPU, not the GPU - "
+                    "captures will be noticeably slower."
+                )
             except Exception as e2:
                 self.error.emit(f"OCR load failed: {e2}")
 

@@ -55,6 +55,7 @@ run.bat/shortcuts/startup-registry compatibility.
 | `voiceassistant/text.py` | Pure text logic: repeat collapse, cleanup chain, hallucination denylist, paste sanitizing. 100% unit-tested. |
 | `voiceassistant/config.py` | `Config` (ATOMIC saves, corrupt-file backup) + `DEFAULTS` + hotkey validation. |
 | `voiceassistant/workers.py` | `SerialWorker` — **the threading law**: every subsystem owns exactly one worker+queue; no ad-hoc `threading.Thread` anywhere. |
+| `voiceassistant/metrics.py` | Per-dictation metrics (JSONL, rolling, **never text**) + `--report` summary. |
 | `voiceassistant/applog.py` | Privacy-safe rotating log (never logs payloads), opt-in debug, excepthooks + faulthandler. |
 | `voiceassistant/selfcheck.py` | `python main.py --check` — no-GUI health probe (mic, hotkeys, CUDA, OCR, VLC, TTS). |
 | `tests/` | Characterization + fault-injection suites (fast) and the golden-audio corpus gate (local, `RUN_CORPUS=1`). |
@@ -136,6 +137,26 @@ live (no regeneration). Falls back to `pyttsx3` SAPI if neural/VLC fails.
   happened the release never fired and recording ran to the 120 s cap — `debug.log`
   shows it three times (08-08, 08-13, 08-17), once next to the overflow message,
   i.e. exactly the under-load hook-timeout case. A lost keyup now costs ~100 ms.
+- **The model loads from the CACHE first** (`Transcriber._open_model`). faster-whisper
+  otherwise revalidates against huggingface.co on EVERY launch: measured **176.3 s vs
+  7.0 s** for an already-cached `large-v3`, i.e. ~3 minutes after each boot where the
+  hotkey only says "model still loading" and the words are lost — plus an undocumented
+  external call in an app whose premise is local dictation. The network is touched
+  exactly once per model. **The cache/download decision is deliberately SEPARATE from
+  the CUDA→CPU device fallback**: a cuDNN failure must not be mistaken for a cache miss
+  (pointless multi-GB download) and a download must not silently pin the session to CPU.
+- **Degraded is not the same as broken, and must still be LOUD** (`degraded` signal on
+  `Transcriber` and `OCREngine` → `MainWindow._on_degraded`). A CUDA→CPU fallback is
+  10–20x slower; as a log line plus a label behind a tray icon it is experienced as
+  "dictation got slow" with no cause. It now raises a tray balloon and marks the model
+  label DEGRADED until restart.
+- **The app measures its own reliability** (`metrics.py`). Six capture bugs survived a
+  month because the USER was the monitoring system and "feels unreliable" is not
+  actionable. Every dictation now records hold/audio duration, peak, overflow count,
+  decode latency, retry, outcome and paste result; `python main.py --report` summarises
+  them (`--last=N` to window it). **Privacy: transcript text is NEVER written, only a
+  character count** — same rule as `applog`. `metrics.jsonl` is gitignored and rolls at
+  512 KB. If dictation ever feels off again, read the report before touching code.
 - **A dead mic must be loud, not silent.** The tick watchdog notices a stream that
   stopped delivering, reports it (`stream_state`), and reopens. Recording into a
   dead device looks identical to success until the empty transcript arrives.
@@ -245,6 +266,17 @@ All are editable inline — click a hotkey pill and press your combo (single key
 - **Before ANY behavior change:** run `pytest tests -q` (fast suites) and, for anything
   touching the dictation pipeline, `RUN_CORPUS=1 pytest tests/test_corpus_gate.py`
   (the golden-audio gate — the objective definition of "dictation still works").
+  Validate a NON-default model with `CORPUS_MODEL=<name>` (the gate used to only ever
+  test `DEFAULTS['whisper_model']`, so it could not vet what the user actually runs).
+- **The chain test:** `RUN_E2E=1 pytest tests/integration/test_end_to_end_live.py -s`
+  crosses every seam in one run (real handlers → real ring buffer → real Whisper →
+  real cleanup → real paste). Every bug in the 2026-08-17 audit lived in a seam that
+  no other test crossed. It has two tiers: run it from an INTERACTIVE terminal to get
+  the real-Ctrl+V tier; an agent/CI run cannot obtain foreground privilege and falls
+  back to asserting the exact (hwnd, text) handed to the paste worker.
+  **Never 'fix' that by patching `winapi.get_foreground_window`** — the real Paster
+  then believes focus is correct and fires a real Ctrl+V into whatever window is in
+  front. That was tried during development and pasted into an unrelated window.
 - **Watchpoints:** the job-bound target HWND (never reintroduce a shared field), the
   monotonic job-id guard, the silent-drop thresholds, the VAD retry (its segment guards
   must stay on BOTH passes), and the threading law (`workers.SerialWorker` — no ad-hoc
@@ -254,6 +286,10 @@ All are editable inline — click a hotkey pill and press your combo (single key
   reopens the segfault), hooking every combo key, and the PTT watchdog. These interact;
   change them deliberately and finish with a live end-to-end voice test (models can't
   hear a human in CI).
+- **Tests must never touch real runtime state** (`tests/conftest.py`). An autouse
+  fixture redirects `metrics.METRICS_PATH` to tmp, because MainWindow records a row
+  at every terminal state of a dictation — running the flow tests wrote dozens of
+  synthetic rows into the real `metrics.jsonl` and corrupted the `--report` baseline.
 - **Tests must never open a real capture device.** Every MainWindow harness stubs
   `VoiceRecorder.open_stream`/`close_stream`; a live stream outliving a fixture is what
   segfaulted the suite. Drive the recorder synchronously instead: `_audio_callback(...)`
