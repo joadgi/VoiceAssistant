@@ -28,7 +28,9 @@ from .config import (
 from .ocr import OCREngine, RegionSelector, ScreenCapture
 from .paste import Paster
 from .recorder import VoiceRecorder
-from .selection import SelectionReader
+from .selection import (
+    SRC_CONSOLE_BLOCKED, SRC_EMPTY, SRC_REFOCUS_FAILED, SelectionReader,
+)
 from .settings_dialog import SettingsDialog
 from .text import clean_transcript, is_probable_hallucination
 from .transcriber import Transcriber
@@ -43,7 +45,7 @@ class MainWindow(QMainWindow):
     _sig_hotkey_screen = Signal()
     _sig_hotkey_read = Signal()
     # Worker → GUI marshalling
-    _sig_read_text_ready = Signal(str)
+    _sig_read_text_ready = Signal(str, str)  # (text, source tier)
     _sig_paste_done = Signal(bool, str)
     _sig_crash_notice = Signal(str)
 
@@ -485,13 +487,19 @@ class MainWindow(QMainWindow):
         except Exception as e:
             errors.append(f"Screen hotkey ({hk_screen}): {e}")
 
-        needs_suppress_read = "windows" in hk_read
+        # SUPPRESS the read hotkey. It is a dedicated action key, and letting it
+        # through means it ALSO fires whatever the focused app binds to it —
+        # `ctrl+m` is Send/Receive in Outlook and indent in Word, so reading a
+        # selection was quietly acting on the user's documents.
         try:
             kb.add_hotkey(hk_read, lambda: self._sig_hotkey_read.emit(),
-                          suppress=needs_suppress_read)
+                          suppress=True)
         except Exception:
+            # Suppression refused — a working un-suppressed hotkey beats none.
             try:
                 kb.add_hotkey(hk_read, lambda: self._sig_hotkey_read.emit())
+                applog.error(f"read hotkey {hk_read}: suppression refused; "
+                             "it will also reach the focused app")
             except Exception as e2:
                 errors.append(f"Read aloud hotkey ({hk_read}): {e2}")
 
@@ -1038,16 +1046,62 @@ class MainWindow(QMainWindow):
             self._sig_read_text_ready.emit,
         )
 
-    @Slot(str)
-    def _on_read_text_ready(self, text):
-        """Called in main thread when selection has been captured."""
+    @Slot(str, str)
+    def _on_read_text_ready(self, text, source):
+        """Called in main thread when the selection capture finished.
+
+        `source` names which tier produced it, so a failure can say what
+        actually happened instead of the old blanket "No text selected" (which
+        pointed the user at the wrong problem whenever the real cause was a
+        refocus refusal or copy-blocked content).
+        """
         self._read_in_flight = False
         if text:
+            applog.dbg(f"read-aloud: {len(text)} chars via {source}")
+            metrics.record(f"read_{source}", chars=len(text))
             self._append_output(text, prefix="[Read]")
             self.tts.speak(text)
-            self._update_status(f"Reading {len(text)} chars aloud...")
-        else:
-            self._update_status("No text selected — highlight text first, then press the hotkey")
+            self._update_status(f"Reading {len(text)} chars aloud ({source})...")
+            return
+
+        # TIER 3: nothing readable as text. Fall back to OCR of the screen —
+        # this is what makes scanned PDFs, images and copy-protected content
+        # readable at all. Say so, so the behaviour isn't surprising.
+        if source in (SRC_CONSOLE_BLOCKED, SRC_EMPTY, SRC_REFOCUS_FAILED):
+            if self._read_ocr_fallback(source):
+                return
+        metrics.record(f"read_{source}", chars=0)
+        self._update_status(self._read_failure_message(source))
+
+    def _read_failure_message(self, source):
+        if source == SRC_CONSOLE_BLOCKED:
+            return ("That's a terminal — Ctrl+C there would interrupt your command, "
+                    "so it wasn't sent. Nothing readable found on screen either.")
+        if source == SRC_REFOCUS_FAILED:
+            return ("Couldn't switch back to that window (Windows blocked it), so the "
+                    "selection wasn't read — click the window, then press the hotkey.")
+        return "Nothing to read — highlight some text first, then press the hotkey."
+
+    def _read_ocr_fallback(self, source):
+        """OCR the area around the cursor and read that. Returns True if it
+        produced speech."""
+        if not self.ocr.is_loaded:
+            return False
+        try:
+            img = self.screen_capture.capture_around_cursor(
+                width=self.config["screen_capture_width"],
+                height=self.config["screen_capture_height"],
+            )
+        except Exception:
+            applog.exception("read-aloud OCR fallback capture failed")
+            return False
+        applog.dbg(f"read-aloud: escalating to OCR (source={source})")
+        self._update_status(
+            "No selectable text — reading the area around your cursor instead..."
+        )
+        metrics.record("read_ocr", chars=0)
+        self.ocr.read_image(img)
+        return True
 
     # -----------------------------------------------------------------------
     # Hotkey editing

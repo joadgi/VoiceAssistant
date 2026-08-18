@@ -23,3 +23,6 @@ nvidia-cudnn-cu12; sys_platform == "win32"
 # (zero extra deps). Only install easyocr if you need it — it pulls the
 # multi-GB PyTorch stack:
 #   pip install easyocr
+# UI Automation client for read-aloud's selection reader (voiceassistant/uia.py).
+# Ships with pyttsx3 today, but read-aloud now depends on it directly.
+comtypes>=1.2.0

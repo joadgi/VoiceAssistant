@@ -41,3 +41,7 @@ settings.json.corrupt.bak
 # local dictation metrics (privacy-safe, never uploaded)
 metrics.jsonl
 metrics.jsonl.1
+
+# archived diagnostic logs (local only)
+*.archive
+settings.json.corrupt.bak

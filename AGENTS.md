@@ -50,7 +50,8 @@ run.bat/shortcuts/startup-registry compatibility.
 | `voiceassistant/tts.py` | `TTSEngine` — edge-tts → VLC (live speed), per-utterance generations, pyttsx3 fallback, bounded network waits. |
 | `voiceassistant/ocr.py` | `ScreenCapture` (mss) + `OCREngine` (Windows-native OCR default, EasyOCR fallback) + `RegionSelector`. |
 | `voiceassistant/paste.py` | `Paster` — the paste worker: clipboard snapshot/restore + Win32 Ctrl+V, off the GUI thread. |
-| `voiceassistant/selection.py` | `SelectionReader` — read-aloud's selection grab (Ctrl+C sentinel + refocus), off the GUI thread (mirrors `Paster`). |
+| `voiceassistant/selection.py` | `SelectionReader` — read-aloud's 3-tier selection grab (UIA → Ctrl+C sentinel → tell caller to OCR), off the GUI thread (mirrors `Paster`). |
+| `voiceassistant/uia.py` | UI Automation selection reader — highlighted text with **no clipboard, no keystrokes, no focus switch**. |
 | `voiceassistant/winapi.py` | ALL Win32/ctypes calls (foreground window, keystrokes, single-instance, startup registry). |
 | `voiceassistant/text.py` | Pure text logic: repeat collapse, cleanup chain, hallucination denylist, paste sanitizing. 100% unit-tested. |
 | `voiceassistant/config.py` | `Config` (ATOMIC saves, corrupt-file backup) + `DEFAULTS` + hotkey validation. |
@@ -72,8 +73,14 @@ and sends Win32 `Ctrl+V` into the captured window (off the GUI thread; the prior
 is restored afterward). The floating pill mirrors each state (Ready → Recording →
 Transcribing → Pasted), **and names the reason when a clip is dropped**.
 
-**Read-aloud:** hotkey → refocus the prior window → Win32 `Ctrl+C` to grab the selection
-via a clipboard sentinel → `TTSEngine.speak()`.
+**Read-aloud:** hotkey → **3-tier selection grab** → `TTSEngine.speak()`.
+1. **UIA** (`uia.get_selection`) reads the highlight directly — no clipboard, no
+   keystrokes, no focus switch, and it works when the window ISN'T focused.
+2. **Ctrl+C sentinel** (refocus → sentinel → Ctrl+C → poll → restore) for apps UIA
+   doesn't expose. Skipped entirely for console windows.
+3. **OCR the area around the cursor** (`window._read_ocr_fallback`) for text that
+   isn't text — scanned PDFs, images, copy-protected content.
+The tier is reported back so failures name the real cause and `--report` counts them.
 
 **OCR:** hotkey (cursor region) or drag-selected region → `mss` grab → `OCREngine` →
 text shown and auto-spoken.
@@ -111,6 +118,29 @@ live (no regeneration). Falls back to `pyttsx3` SAPI if neural/VLC fails.
   land in arbitrary order, dictation silently failed to start about half the time.
   Releasing *any* combo key now ends the hold too. Locked down by
   `tests/integration/test_hotkey_register.py` (those tests fail against the old logic).
+- **Read-aloud reads the selection via UIA FIRST** (`uia.py`). The Ctrl+C sentinel was
+  the ONLY mechanism and it fails on copy-blocked content, on apps that remap Ctrl+C,
+  whenever Windows refuses the focus switch — and it was actively dangerous with a
+  terminal focused. Measured: UIA reads a full selection in **70–116 ms**, from the
+  SerialWorker, **without focus**. Coverage isn't universal (20 of 30 open windows
+  exposed UIA text; Acrobat and some Electron apps did not), which is why all three
+  tiers exist. Gotchas, all learned the hard way:
+  - **COM is apartment-threaded** — the client is cached PER THREAD and CoInitialize is
+    called there, because this runs on SelectionReader's worker, not the GUI thread.
+  - **Search order matters.** Do NOT "walk down from the window for the first
+    TextPattern": in Chrome that finds the ADDRESS BAR (measured: 31 characters). The
+    selection lives on the FOCUSED element; window descendants are only a fallback
+    (Notepad/Word keep TextPattern on a child, so the window element alone finds
+    nothing).
+  - Traversal is time-boxed (`_BUDGET_S`) — UIA calls cross a process boundary and can
+    block on a busy app.
+- **Never send Ctrl+C into a console** (`winapi.is_console_window`). There it means
+  INTERRUPT: read-aloud used to kill whatever command was running in the focused
+  terminal. Covers conhost, Windows Terminal, ConEmu, mintty, PuTTY.
+- **The read hotkey is SUPPRESSED.** It is a dedicated action key, and letting it
+  through means it ALSO fires whatever the focused app binds to it — `ctrl+m` is
+  Send/Receive in Outlook and indent in Word, so reading a selection was quietly
+  acting on the user's documents.
 - **A dedicated solo key is SUPPRESSED; a modifier never is** (`DEDICATED_SOLO_KEYS`,
   `should_suppress_hotkey`). Caps Lock is the best push-to-talk key available — home row,
   huge, and its scan code (58) is the only kind that does **not** overlap anything used in
@@ -286,10 +316,21 @@ All are editable inline — click a hotkey pill and press your combo (single key
   reopens the segfault), hooking every combo key, and the PTT watchdog. These interact;
   change them deliberately and finish with a live end-to-end voice test (models can't
   hear a human in CI).
-- **Tests must never touch real runtime state** (`tests/conftest.py`). An autouse
-  fixture redirects `metrics.METRICS_PATH` to tmp, because MainWindow records a row
-  at every terminal state of a dictation — running the flow tests wrote dozens of
-  synthetic rows into the real `metrics.jsonl` and corrupted the `--report` baseline.
+- **Tests must never touch real runtime state** (`tests/conftest.py`). One autouse
+  fixture redirects `metrics.METRICS_PATH`, `applog.LOG_PATH` and
+  `applog.CRASH_LOG_PATH` to tmp (and drops the cached `applog._logger`, which is
+  built once against LOG_PATH). Both leaks were real: the flow tests wrote dozens of
+  synthetic rows into the live `metrics.jsonl`, and the fault-injection tests wrote
+  **279 lines** of `simulated: no capture device` / `worker 'test' job failed` into
+  the live `debug.log` — the file the user is told to read when dictation misbehaves.
+  Test noise in a diagnostic log is worse than no log at all.
+- **`crash.log` may contain `Windows fatal exception: code 0x8001010d`**
+  (`RPC_E_CANTCALLOUT_ININPUTSYNCCALL`). These are FIRST-CHANCE COM exceptions that
+  faulthandler records and COM then handles internally — the app keeps running, and
+  faulthandler writes straight to the file WITHOUT calling the tray notifier, so they
+  are not user-visible. They come from input-synchronous UIA calls; the read path
+  only READS (verified: 8/8 captures, zero dumps) — it is `TextRange.Select()`, used
+  by `test_uia_selection_live.py` to create a selection, that provokes them.
 - **Tests must never open a real capture device.** Every MainWindow harness stubs
   `VoiceRecorder.open_stream`/`close_stream`; a live stream outliving a fixture is what
   segfaulted the suite. Drive the recorder synchronously instead: `_audio_callback(...)`

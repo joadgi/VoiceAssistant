@@ -61,6 +61,40 @@ def get_cursor_pos():
     return pt.x, pt.y
 
 
+# Window classes that treat Ctrl+C as INTERRUPT rather than copy. Sending our
+# synthetic Ctrl+C into one of these kills whatever command is running — a real
+# data-loss hazard, and read-aloud used to do it unconditionally.
+CONSOLE_WINDOW_CLASSES = {
+    "consolewindowclass",              # conhost (cmd, classic PowerShell)
+    "cascadia_hosting_window_class",   # Windows Terminal
+    "virtualconsoleclass",             # ConEmu / Cmder
+    "mintty",                          # Git Bash / MSYS2
+    "putty",
+    "vte",
+}
+
+
+def get_window_class(hwnd):
+    """Class name of a window, or "" if it cannot be read."""
+    if not hwnd:
+        return ""
+    try:
+        buf = ctypes.create_unicode_buffer(256)
+        if user32.GetClassNameW(int(hwnd), buf, 256):
+            return buf.value
+    except Exception:
+        pass
+    return ""
+
+
+def is_console_window(hwnd):
+    """True when sending Ctrl+C to this window would interrupt a program."""
+    cls = get_window_class(hwnd).lower()
+    if not cls:
+        return False
+    return cls in CONSOLE_WINDOW_CLASSES or "console" in cls or "terminal" in cls
+
+
 def is_window(hwnd):
     return bool(hwnd) and bool(user32.IsWindow(hwnd))
 
