@@ -61,6 +61,7 @@ run.bat/shortcuts/startup-registry compatibility.
 | `voiceassistant/selfcheck.py` | `python main.py --check` — no-GUI health probe (mic, hotkeys, CUDA, OCR, VLC, TTS). |
 | `tests/` | Characterization + fault-injection suites (fast) and the golden-audio corpus gate (local, `RUN_CORPUS=1`). |
 | `setup.bat` / `run.bat` / `create_shortcut.bat` | Env setup, silent launch (pythonw), desktop shortcut. |
+| `uninstall.bat` | Removes the HKCU startup value, desktop shortcut, venv + local runtime files, and (after confirming) the `models--Systran--faster-whisper-*` HF cache dirs. Scoped by glob so unrelated HF models survive. Cannot delete its own folder — tells the user. |
 
 ## How it works (data flow)
 
