@@ -14,7 +14,7 @@ SAPI locally.
 - **Floating desktop pill** — an always-visible indicator (drag it anywhere) that shows Ready / Recording / Transcribing / Pasted, and can be **clicked to start and stop** dictation without a hotkey.
 - **Read highlighted text aloud** — highlight text in any app and hear it through a local neural voice, with optional Microsoft online and Windows SAPI choices.
 - **OCR at cursor** — capture on-screen text from images, PDFs, error dialogs, or anything else you can't select, and have it read aloud.
-- **Fast local speed control** — local neural audio is generated at a calibrated 0.5x–2.6x, so the displayed rate tracks the rate actually played. One speed is fixed for each press of Speak; slider changes apply to the next read.
+- **Fast local speed control** — local neural audio is generated at a calibrated 0.5x–2.6x, so the displayed rate tracks the rate actually played. One speed is fixed for each press of Speak; the Voice and Speed controls lock during that read, then slider changes apply to the next read.
 - **Local and online neural voices** — Michael, Adam, Eric, Liam, Heart, and Sarah run locally; Microsoft voices remain available as clearly marked online choices.
 - **Fully customizable hotkeys** — every hotkey (Dictate, Read, OCR) is yours to change: click any hotkey pill on the main window, then press a **single key (like F9), a combo, or even a modifier-only combo (like Ctrl+Alt)** for push-to-talk. Nothing is hardcoded. (The `Fn` key can't be bound — it's handled in keyboard firmware and never reaches Windows.)
 - **Local Whisper transcription** — `faster-whisper` on NVIDIA GPU (CUDA) with CPU fallback.

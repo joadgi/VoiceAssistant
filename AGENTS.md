@@ -232,7 +232,8 @@ selection never changes into SAPI; `pyttsx3` runs only when explicitly selected.
   prepared voice segments**. Reading the slider during generation made it worse: one
   queued stream contained 2.60x, 2.50x, 2.20x, and 1.90x blocks. The full selection is
   now phonemized once, native batch pauses are preserved, and the requested speed is
-  snapshotted when Speak starts. A slider change deliberately applies to the next read.
+  snapshotted when Speak starts. A slider change deliberately applies to the next read;
+  the Playback controls make this visible and lock Voice/Speed during a local read.
 - **Never use VLC `set_rate()` for the local raw PCM stream.** VLC returned success for
   `set_rate(2.1)` but live wall time stayed at 1.0x. Kokoro receives the requested rate
   instead; the sample count itself becomes shorter. Because the model input becomes

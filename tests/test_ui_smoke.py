@@ -86,6 +86,28 @@ def test_speed_range_matches_selected_voice_backend(main_window):
     assert w.speed_slider.value() == 260
 
 
+def test_local_playback_controls_show_and_enforce_fixed_read_speed(main_window):
+    """The selected speed is real, visible, and cannot change mid-read."""
+    w = main_window
+    local_index = w.voice_combo.findData("kokoro:am_michael")
+    w.voice_combo.setCurrentIndex(local_index)
+    w.speed_slider.setValue(198)
+
+    assert w.tts._speed == pytest.approx(1.98)
+    assert w.speed_label.text() == "1.98x"
+    assert w.speed_apply_label.text() == "applies to next read"
+
+    w._on_tts_started()
+    assert not w.voice_combo.isEnabled()
+    assert not w.speed_slider.isEnabled()
+    assert w.speed_apply_label.text() == "locked at 1.98x for this read"
+
+    w._on_tts_finished()
+    assert w.voice_combo.isEnabled()
+    assert w.speed_slider.isEnabled()
+    assert w.speed_apply_label.text() == "applies to next read"
+
+
 def test_pill_states_do_not_crash(main_window):
     ind = main_window.indicator
     for method in ("show_recording", "show_transcribing", "show_pasting",

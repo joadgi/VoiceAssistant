@@ -335,12 +335,21 @@ class MainWindow(QMainWindow):
         self.speed_slider.setFixedWidth(200)
         self.speed_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
         self.speed_slider.setTickInterval(25)
+        self.speed_slider.setToolTip(
+            "Choose the speed before pressing Speak; one speed is kept for the whole read."
+            if saved_voice.startswith("kokoro:") else
+            "Playback speed"
+        )
         playback_lay.addWidget(self.speed_slider)
 
         self.speed_label = QLabel(f"{initial_speed:.2f}x")
         self.speed_label.setFixedWidth(60)
         self.speed_label.setStyleSheet("color: #89b4fa; font-weight: bold;")
         playback_lay.addWidget(self.speed_label)
+
+        self.speed_apply_label = QLabel("applies to next read")
+        self.speed_apply_label.setStyleSheet("color: #6c7086; font-size: 10px;")
+        playback_lay.addWidget(self.speed_apply_label)
 
         playback_lay.addStretch()
         root_layout.addWidget(playback_group)
@@ -386,7 +395,7 @@ class MainWindow(QMainWindow):
 
         self.voice_combo.currentIndexChanged.connect(self._on_voice_change)
         self.speed_slider.valueChanged.connect(self._on_speed_change)
-        self.speed_slider.sliderReleased.connect(self.config.flush)
+        self.speed_slider.sliderReleased.connect(self._on_speed_released)
 
         self.btn_dictation.toggled.connect(self._on_dictation_toggle)
 
@@ -1024,12 +1033,24 @@ class MainWindow(QMainWindow):
             "QPushButton { background-color: #d32f2f; color: #fff; border: none; "
             "border-radius: 6px; padding: 10px 20px; font-size: 13px; font-weight: 600; }"
         )
+        # A local neural read is generated at one fixed rate and voice. Lock
+        # those controls while it is active so the UI cannot imply that a
+        # mid-read change altered audio which was already generated.
+        self.voice_combo.setEnabled(False)
+        if str(self.voice_combo.currentData() or "").startswith("kokoro:"):
+            self.speed_slider.setEnabled(False)
+            self.speed_apply_label.setText(
+                f"locked at {self.speed_slider.value() / 100.0:.2f}x for this read"
+            )
 
     @Slot()
     def _on_tts_finished(self):
         self.btn_speak_toggle.setText("  Speak")
         self.btn_speak_toggle.setChecked(False)
         self.btn_speak_toggle.setStyleSheet("")
+        self.voice_combo.setEnabled(True)
+        self.speed_slider.setEnabled(True)
+        self.speed_apply_label.setText("applies to next read")
 
     # -----------------------------------------------------------------------
     # Read-aloud (selection) flow
@@ -1195,7 +1216,7 @@ class MainWindow(QMainWindow):
                 int((LOCAL_MAX_SPEED if local_voice else 3.0) * 100)
             )
             self.speed_slider.setToolTip(
-                "Local neural speed is generated into the audio; changes apply to the next block."
+                "Choose the speed before pressing Speak; one speed is kept for the whole read."
                 if local_voice else
                 "Playback speed"
             )
@@ -1210,6 +1231,14 @@ class MainWindow(QMainWindow):
         # defer_save: the slider fires per tick — one disk write per pixel of
         # drag was a real I/O storm. Flushed on sliderReleased + closeEvent.
         self.config.set("tts_speed", speed, defer_save=True)
+
+    @Slot()
+    def _on_speed_released(self):
+        self.config.flush()
+        self._update_status(
+            f"Speed set to {self.speed_slider.value() / 100.0:.2f}x — "
+            "press Speak to use it"
+        )
 
     @Slot()
     def _on_settings(self):

@@ -459,7 +459,7 @@ class TTSEngine(QObject):
         Local neural audio is synthesized at this calibrated rate. VLC's rate control is
         intentionally not used for its raw PCM callback stream: live testing
         proved that VLC accepted ``set_rate(2.1)`` but still played that stream
-        at 1.0x. A local change therefore affects the next synthesized block.
+        at 1.0x. A local change therefore affects the next read.
         Online MP3 and explicit SAPI voices retain their live backend control.
         """
         max_speed = LOCAL_MAX_SPEED if self._use_local else 3.0
