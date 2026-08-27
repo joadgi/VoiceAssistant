@@ -15,7 +15,7 @@ import pyperclip
 from PySide6.QtCore import Qt, QTimer, Signal, Slot
 from PySide6.QtGui import QAction, QColor, QFont, QTextCharFormat
 from PySide6.QtWidgets import (
-    QComboBox, QDialog, QGroupBox, QHBoxLayout, QLabel, QMainWindow, QMenu,
+    QApplication, QComboBox, QDialog, QGroupBox, QHBoxLayout, QLabel, QMainWindow, QMenu,
     QProgressBar, QPushButton, QSlider, QStatusBar, QStyle, QSystemTrayIcon,
     QTextEdit, QVBoxLayout, QWidget,
 )
@@ -45,7 +45,7 @@ class MainWindow(QMainWindow):
     _sig_hotkey_screen = Signal()
     _sig_hotkey_read = Signal()
     # Worker → GUI marshalling
-    _sig_read_text_ready = Signal(str, str)  # (text, source tier)
+    _sig_read_text_ready = Signal(int, str, str)  # (request generation, text, source tier)
     _sig_paste_done = Signal(bool, str)
     _sig_crash_notice = Signal(str)
 
@@ -113,6 +113,10 @@ class MainWindow(QMainWindow):
         self._force_quit = False
         # Debounce flag for read-aloud hotkey
         self._read_in_flight = False
+        # A stopped selection capture may still finish on its worker. Bind the
+        # callback to a generation so that stale text can never start speaking
+        # after the user pressed Stop or began a newer read.
+        self._read_gen = 0
         # Polls real key state while PTT is held, so a dropped keyup can't
         # wedge the recording open (see _on_ptt_watchdog).
         # Metrics for the in-flight dictation. Keyed by transcription job id
@@ -996,7 +1000,12 @@ class MainWindow(QMainWindow):
     def _on_speak_toggle(self):
         if self.tts.is_speaking:
             self.tts.stop()
-            self.btn_speak_toggle.setChecked(False)
+            # Reset the button HERE rather than waiting for speaking_finished:
+            # the worker still has to unwind, and the button sat there red and
+            # labelled "Stop" in the meantime, which reads as "the click did
+            # nothing". _on_tts_finished is idempotent, so the later signal is
+            # harmless.
+            self._on_tts_finished()
             self._update_status("Speech stopped")
         else:
             text = self.text_output.toPlainText()
@@ -1028,14 +1037,18 @@ class MainWindow(QMainWindow):
     def _on_read_aloud_toggle(self):
         """Toggle read aloud: if speaking or in-flight, stop. Otherwise start read."""
         if self.tts.is_speaking or self._read_in_flight:
+            self._read_gen += 1  # invalidate a capture callback already in flight
             self.tts.stop()
             self._read_in_flight = False
+            self._on_tts_finished()  # reset the button now, not on unwind
             self._update_status("Read aloud stopped")
             return
 
         # Capture target window NOW before Windows key can steal focus
         self._read_target_hwnd = winapi.get_foreground_window()
 
+        self._read_gen += 1
+        request_gen = self._read_gen
         self._read_in_flight = True
         self._update_status("Capturing selection...")
         # Capture runs on the SelectionReader's own worker; it calls back with
@@ -1043,11 +1056,13 @@ class MainWindow(QMainWindow):
         self._selection_reader.capture(
             self.config["hotkey_read_aloud"],
             self._read_target_hwnd,
-            self._sig_read_text_ready.emit,
+            lambda text, source, gen=request_gen: self._sig_read_text_ready.emit(
+                gen, text, source
+            ),
         )
 
-    @Slot(str, str)
-    def _on_read_text_ready(self, text, source):
+    @Slot(int, str, str)
+    def _on_read_text_ready(self, request_gen, text, source):
         """Called in main thread when the selection capture finished.
 
         `source` names which tier produced it, so a failure can say what
@@ -1055,6 +1070,11 @@ class MainWindow(QMainWindow):
         pointed the user at the wrong problem whenever the real cause was a
         refocus refusal or copy-blocked content).
         """
+        if request_gen != self._read_gen:
+            applog.dbg(
+                f"read-aloud: discarded stale capture generation {request_gen}"
+            )
+            return
         self._read_in_flight = False
         if text:
             applog.dbg(f"read-aloud: {len(text)} chars via {source}")
@@ -1115,12 +1135,15 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         self._ptt_active = False
+        self._read_gen += 1
         self._read_in_flight = False
         self._setup_hotkeys()
         self._update_dictation_hint()
         self._update_status(f"{label} hotkey set to {self.config[config_key]}")
 
     def _reset_hotkeys_to_defaults(self):
+        self._read_gen += 1
+        self._read_in_flight = False
         self.config.set("hotkey_record", DEFAULTS["hotkey_record"])
         self.config.set("hotkey_read_aloud", DEFAULTS["hotkey_read_aloud"])
         self.config.set("hotkey_screen_read", DEFAULTS["hotkey_screen_read"])
@@ -1321,6 +1344,13 @@ class MainWindow(QMainWindow):
     def quit_app(self):
         self._force_quit = True
         self.close()
+        # app.py deliberately keeps the event loop alive when the last window
+        # closes because this is a tray-first app. The explicit Quit action must
+        # therefore stop QApplication after closeEvent finishes full teardown;
+        # otherwise a windowless pythonw process and stale tray objects survive.
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
 
     def _apply_window_flags(self):
         was_visible = self.isVisible()

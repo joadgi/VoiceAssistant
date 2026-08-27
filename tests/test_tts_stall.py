@@ -1,9 +1,9 @@
 """TTS regression tests: a network stall must NEVER wedge the engine.
 
 The failure this guards: edge-tts connects but the stream never yields and
-never raises. The consumer must time out into the offline fallback, stop()
-must unwedge a stalled utterance, and the engine's single worker must remain
-alive and drainable afterwards (threading law).
+never raises. The consumer must time out without changing the selected neural
+voice into SAPI, stop() must retire the request, and the engine's single worker
+must remain alive and drainable afterwards (threading law).
 
 Runnable standalone (python tests/test_tts_stall.py) or via pytest.
 """
@@ -42,10 +42,6 @@ def _make_engine():
     from voiceassistant.tts import TTSEngine
 
     eng = TTSEngine()
-    # Ensure the fallback path is reachable even if SAPI init failed on this box;
-    # _speak_offline is patched in every test so it is never actually invoked.
-    if not eng._pyttsx_engine:
-        eng._pyttsx_engine = object()
     return eng
 
 
@@ -57,22 +53,26 @@ def _assert_worker_drains(eng, timeout, context):
     assert probe.wait(timeout), f"tts worker is wedged ({context})"
 
 
-def test_stall_falls_back_to_offline():
-    """No first audio within FIRST_AUDIO_TIMEOUT -> TimeoutError -> offline fallback."""
+def test_stall_fails_without_changing_voice():
+    """No playable lead within FIRST_AUDIO_TIMEOUT -> honest error, never SAPI."""
     _install_fake_edge_tts("stall")
     eng = _make_engine()
 
     fallback_called = threading.Event()
+    error_called = threading.Event()
     eng._speak_offline = lambda text, stop_event=None: fallback_called.set()
+    from PySide6.QtCore import Qt
+    eng.error.connect(
+        lambda _message: error_called.set(), Qt.ConnectionType.DirectConnection
+    )
 
     eng.speak("This request will stall on the network.")
     # 6s first-audio timeout + margin
-    assert fallback_called.wait(timeout=12), (
-        "offline fallback did not fire after a network stall — worker is wedged"
-    )
-    _assert_worker_drains(eng, 5, "after stall fallback")
+    assert error_called.wait(timeout=10), "network stall did not surface or worker wedged"
+    assert not fallback_called.is_set(), "stall changed neural voice into robotic SAPI"
+    _assert_worker_drains(eng, 5, "after stalled neural request")
     assert eng._speaking is False
-    print("PASS: stall -> offline fallback fired, worker drains cleanly")
+    print("PASS: stall -> honest error, chosen voice preserved, worker drains")
 
 
 def test_stop_unwedges_stalled_worker():
@@ -95,18 +95,24 @@ def test_stop_unwedges_stalled_worker():
     print("PASS: stop() unwedged a stalled utterance, no spurious fallback")
 
 
-def test_fast_failure_still_falls_back():
-    """Fast failures (offline/DNS) must keep the pre-existing fallback path."""
+def test_fast_failure_retries_then_preserves_voice():
+    """A fast DNS failure gets one neural retry, then an error—not SAPI."""
     _install_fake_edge_tts("fail_fast")
     eng = _make_engine()
 
     fallback_called = threading.Event()
+    error_called = threading.Event()
     eng._speak_offline = lambda text, stop_event=None: fallback_called.set()
+    from PySide6.QtCore import Qt
+    eng.error.connect(
+        lambda _message: error_called.set(), Qt.ConnectionType.DirectConnection
+    )
 
     eng.speak("This request fails immediately.")
-    assert fallback_called.wait(timeout=8), "fast-failure fallback regressed"
+    assert error_called.wait(timeout=8), "fast neural failure did not surface"
+    assert not fallback_called.is_set(), "fast failure changed voice into SAPI"
     _assert_worker_drains(eng, 5, "after fast failure")
-    print("PASS: fast failure -> offline fallback (no regression)")
+    print("PASS: fast failure retries once, then preserves the chosen voice")
 
 
 def test_speak_interrupts_previous_utterance():
@@ -130,8 +136,8 @@ def test_speak_interrupts_previous_utterance():
 
 
 if __name__ == "__main__":
-    test_stall_falls_back_to_offline()
+    test_stall_fails_without_changing_voice()
     test_stop_unwedges_stalled_worker()
-    test_fast_failure_still_falls_back()
+    test_fast_failure_retries_then_preserves_voice()
     test_speak_interrupts_previous_utterance()
     print("\nALL TTS TESTS PASSED")

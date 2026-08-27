@@ -99,6 +99,65 @@ def test_pill_menu_has_expected_actions(main_window):
     assert any("Quit" in x for x in labels)
 
 
+def test_quit_action_closes_window_and_stops_qt(monkeypatch):
+    """Tray mode disables quit-on-last-window-closed, so the explicit Quit
+    action must do both halves: close for teardown, then stop QApplication."""
+    import voiceassistant.window as window_module
+
+    calls = []
+
+    class FakeApp:
+        def quit(self):
+            calls.append("app.quit")
+
+    class FakeApplication:
+        @staticmethod
+        def instance():
+            return FakeApp()
+
+    class FakeWindow:
+        _force_quit = False
+
+        def close(self):
+            calls.append("window.close")
+
+    monkeypatch.setattr(window_module, "QApplication", FakeApplication)
+    fake_window = FakeWindow()
+    window_module.MainWindow.quit_app(fake_window)
+
+    assert fake_window._force_quit is True
+    assert calls == ["window.close", "app.quit"]
+
+
+def test_stopped_selection_capture_cannot_start_speaking_later(
+        main_window, monkeypatch):
+    """A selection grab finishes asynchronously. If Stop lands first, its late
+    callback must not resurrect the canceled read or cross into a newer one."""
+    from voiceassistant import winapi
+
+    callbacks = []
+    spoken = []
+    monkeypatch.setattr(winapi, "get_foreground_window", lambda: 1234)
+    monkeypatch.setattr(
+        main_window._selection_reader,
+        "capture",
+        lambda combo, hwnd, done_cb: callbacks.append(done_cb),
+    )
+    monkeypatch.setattr(main_window.tts, "speak", spoken.append)
+
+    main_window._on_read_aloud_toggle()
+    assert main_window._read_in_flight is True
+    assert len(callbacks) == 1
+
+    main_window._on_read_aloud_toggle()  # Stop while selection capture is pending.
+    callbacks[0]("stale selection", "uia")
+    assert spoken == [], "stopped capture started speaking after Stop"
+
+    main_window._on_read_aloud_toggle()
+    callbacks[1]("current selection", "uia")
+    assert spoken == ["current selection"]
+
+
 # ---------------------------------------------------------------------------
 # The pill key-CAPTURE flow: pressing keys on a HotkeyCaptureWidget must
 # translate Qt key events into the right combo string (the literal

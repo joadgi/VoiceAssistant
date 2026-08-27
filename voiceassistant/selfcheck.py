@@ -7,8 +7,10 @@ never aborts the report. Exit code: 0 if nothing REQUIRED failed, else 1.
 Categories:
   REQUIRED — dictation (the primary feature) can't work without it.
   OPTIONAL — a secondary feature degrades but the app still runs.
-Use `--check --deep` to also load the Whisper model (slow; first run downloads
-~1GB) and prove the GPU/CPU transcription path end-to-end.
+Use `--check --deep` to also synthesize a real phrase with the neural voice
+   (proves edge-tts is reachable, not just importable — an unreachable service now
+   produces an honest error without changing voices) and to load the Whisper model (slow; first
+run downloads ~1GB), proving the GPU/CPU transcription path end-to-end.
 """
 
 import importlib
@@ -94,6 +96,60 @@ def _check_offline_tts():
         return False, f"pyttsx3 unavailable ({e.__class__.__name__})"
 
 
+def _check_neural_tts():
+    """Actually reach the edge-tts service, don't just import the package.
+
+    An importable edge_tts says nothing about whether synthesis works — and
+    when it doesn't, read-aloud cannot use the selected neural voice. This is
+    the check that names that cause instead of leaving the user to guess.
+
+    DEEP-ONLY: it makes a real network call, so it must stay out of CHECKS
+    (tests/test_selfcheck.py runs every entry there, and the fast suites must
+    not depend on the network).
+    """
+    try:
+        import asyncio
+        import os
+        import tempfile
+        import edge_tts
+        from .config import Config
+        from .tts import NEURAL_META
+
+        voice = Config().get("tts_voice", "en-US-AndrewNeural")
+        if voice not in NEURAL_META:
+            voice = "en-US-AndrewNeural"
+
+        async def probe(path):
+            # Consume the utterance fully through edge-tts's public save path.
+            # Breaking after the first stream packet leaves its aiohttp response
+            # closing asynchronously, so closing our loop immediately afterward
+            # emits "Task was destroyed" / "Unclosed client session" noise.
+            await edge_tts.Communicate("Test.", voice).save(path)
+            return os.path.getsize(path)
+
+        handle = tempfile.NamedTemporaryFile(
+            prefix="voiceassist_check_", suffix=".mp3", delete=False
+        )
+        path = handle.name
+        handle.close()
+
+        loop = asyncio.new_event_loop()
+        try:
+            got = loop.run_until_complete(asyncio.wait_for(probe(path), timeout=10))
+        finally:
+            loop.close()
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        if not got:
+            return False, "connected but returned no audio - neural read-aloud unavailable"
+        return True, f"neural synthesis OK ({voice}, {got} bytes)"
+    except Exception as e:
+        return False, (f"unreachable ({e.__class__.__name__}: {e}) - "
+                       "selected neural voice will report an error")
+
+
 def _check_microphone():
     try:
         import sounddevice as sd
@@ -127,7 +183,7 @@ CHECKS = [
     ("CUDA runtime",          False, _check_cuda_runtime),
     ("OCR (screen reader)",   False, _check_native_ocr),
     ("VLC (neural TTS)",      False, _check_vlc),
-    ("offline TTS fallback",  False, _check_offline_tts),
+    ("offline TTS option",    False, _check_offline_tts),
     ("edge-tts (neural TTS)", False, _check_import("edge_tts")),
 ]
 
@@ -178,6 +234,10 @@ def run_selfcheck(deep=False):
         print(f"  [{mark}] {label}{tag}: {detail}")
 
     if deep:
+        print("  ...synthesizing a test phrase with the neural voice...")
+        ok, detail = _check_neural_tts()
+        print(f"  [{'PASS' if ok else 'WARN'}] neural TTS synthesis (optional): {detail}")
+
         print("  ...loading Whisper model (may download ~1GB on first run)...")
         ok, detail = _check_whisper_load()
         print(f"  [{'PASS' if ok else 'FAIL'}] Whisper model load: {detail}")

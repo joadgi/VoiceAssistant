@@ -429,17 +429,24 @@ def test_read_result_wired_to_tts_on_success(qapp, mw, monkeypatch):
     from PySide6.QtCore import Qt
 
     got = []
-    mw._sig_read_text_ready.connect(got.append, Qt.ConnectionType.DirectConnection)
+    mw._sig_read_text_ready.connect(
+        lambda gen, text, source: got.append((gen, text, source)),
+        Qt.ConnectionType.DirectConnection,
+    )
     spoken = []
     monkeypatch.setattr(mw.tts, "speak", lambda t: spoken.append(t))
     monkeypatch.setattr(mw._selection_reader, "_capture",
-                        lambda combo, hwnd: "hello from selection")
+                        lambda combo, hwnd: ("hello from selection", "uia"))
 
+    mw._read_gen = 7
     mw._read_in_flight = True
     mw._selection_reader._job(mw.config["hotkey_read_aloud"],
-                              mw._read_target_hwnd, mw._sig_read_text_ready.emit)
+                              mw._read_target_hwnd,
+                              lambda text, source: mw._sig_read_text_ready.emit(
+                                  7, text, source
+                              ))
 
-    assert got == ["hello from selection"], got
+    assert got == [(7, "hello from selection", "uia")], got
     assert spoken == ["hello from selection"], "captured text not wired through to TTS"
     assert mw._read_in_flight is False, "read-in-flight flag left wedged"
 
@@ -448,16 +455,23 @@ def test_read_result_empty_on_capture_exception(qapp, mw, monkeypatch):
     from PySide6.QtCore import Qt
 
     got = []
-    mw._sig_read_text_ready.connect(got.append, Qt.ConnectionType.DirectConnection)
+    mw._sig_read_text_ready.connect(
+        lambda gen, text, source: got.append((gen, text, source)),
+        Qt.ConnectionType.DirectConnection,
+    )
 
     def boom(combo, hwnd):
         raise RuntimeError("capture blew up")
 
     monkeypatch.setattr(mw._selection_reader, "_capture", boom)
 
+    mw._read_gen = 8
     mw._read_in_flight = True
     mw._selection_reader._job(mw.config["hotkey_read_aloud"],
-                              mw._read_target_hwnd, mw._sig_read_text_ready.emit)
+                              mw._read_target_hwnd,
+                              lambda text, source: mw._sig_read_text_ready.emit(
+                                  8, text, source
+                              ))
 
-    assert got == [""], got
+    assert got == [(8, "", "empty")], got
     assert mw._read_in_flight is False, "read-in-flight flag left wedged after an error"

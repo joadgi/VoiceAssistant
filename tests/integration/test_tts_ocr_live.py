@@ -4,11 +4,10 @@ These are REAL end-to-end tests — no network/audio mocking. They prove the
 features actually produce audio / read real pixels, and they do it
 OBJECTIVELY (you cannot judge audio by ear in automation):
 
-  * TTS  — non-empty, on-disk MP3 chunk files appear in the engine's temp dir;
+  * TTS  — LibVLC reaches its playing state from one in-memory neural stream;
            `speaking_started` fires before `speaking_finished`; no `error`
-           signal; measured time-to-first-audio and total wall time; chunk
-           count scales with sentence count; offline SAPI path produces NO
-           neural MP3s and touches no network; shutdown removes the temp dir.
+           signal; measured time-to-first-audio and total wall time; offline
+           SAPI remains an explicit option; shutdown removes the temp dir.
   * OCR  — word recall on images rendered in several fonts/sizes, a multi-line
            code block, and a mock dialog; per-read latency well under 200ms
            (native engine is ~10ms); and ONE real screen capture proving the
@@ -38,8 +37,8 @@ Run (PowerShell):
 The engines are QObjects, but we do NOT run a Qt event loop: signals are
 connected with DirectConnection so they fire synchronously in the worker
 thread at emit time, and the main thread drives everything by polling
-threading primitives / the on-disk temp dir (a tiny watcher thread) with
-bounded waits — the same synchronous style as the existing test suites.
+threading primitives with bounded waits — the same synchronous style as the
+existing test suites.
 """
 
 import os
@@ -117,52 +116,23 @@ class _SignalLog:
 
     def first_playing_offset(self, t0):
         """Wall-time (s) from t0 to the first neural 'Playing ...' status, or None.
-        The engine only emits 'Playing' AFTER a non-empty MP3 was handed to VLC,
-        so this doubles as proof that real audio was produced."""
+        The engine only emits 'Playing' AFTER LibVLC reports the in-memory neural
+        stream is playing, so this doubles as proof that real audio was produced."""
         for ts, s in self.status:
             if s.startswith("Playing"):
                 return ts - t0
         return None
 
 
-def _watch_mp3s(engine, stop_evt, seen):
-    """Poll the engine's temp dir and record every non-empty *.mp3 seen (name ->
-    max size). Chunks are deleted right after playback, so we must observe them
-    live; `seen` retains the evidence after deletion."""
-    d = engine._temp_dir
-    while not stop_evt.is_set():
-        try:
-            names = os.listdir(d)
-        except OSError:
-            names = []
-        for name in names:
-            if name.endswith(".mp3"):
-                try:
-                    sz = os.path.getsize(os.path.join(d, name))
-                except OSError:
-                    continue
-                if sz > 0:
-                    seen[name] = max(seen.get(name, 0), sz)
-        time.sleep(0.01)
-
-
 def _drive_speak(engine, text, timeout):
     """Speak `text` and block (polling) until speaking_finished fires or timeout.
-    Returns (log, seen_mp3s, time_to_first_audio, total_seconds, finished_ok)."""
+    Returns (log, time_to_first_audio, total_seconds, finished_ok)."""
     log = _SignalLog(engine)
-    seen = {}
-    stop_evt = threading.Event()
-    watcher = threading.Thread(
-        target=_watch_mp3s, args=(engine, stop_evt, seen), daemon=True
-    )
-    watcher.start()
     t0 = time.monotonic()
     engine.speak(text)
     ok = _wait(lambda: len(log.finished) >= 1, timeout)
     total = time.monotonic() - t0
-    stop_evt.set()
-    watcher.join(timeout=2)
-    return log, seen, log.first_playing_offset(t0), total, ok
+    return log, log.first_playing_offset(t0), total, ok
 
 
 @pytest.mark.skipif(
@@ -193,11 +163,11 @@ class TestTTSLive:
 
     # 1) Neural speak of a SHORT phrase -----------------------------------
     def test_neural_short_phrase(self, eng):
-        log, seen, t_first, total, ok = _drive_speak(
+        log, t_first, total, ok = _drive_speak(
             eng, "Integration test, phrase one.", timeout=30
         )
         assert ok, f"neural speech never finished; status={log.status} errors={log.errors}"
-        if t_first is None and not seen:
+        if t_first is None:
             pytest.skip(
                 "neural edge-tts produced no audio (network down?); "
                 f"status={log.status} errors={log.errors}"
@@ -205,16 +175,57 @@ class TestTTSLive:
         assert len(log.started) >= 1 and len(log.finished) >= 1
         assert log.started[0] <= log.finished[0], "finished fired before started"
         assert not log.errors, f"unexpected error(s): {log.errors}"
-        assert seen, "no non-empty MP3 appeared in the temp dir"
-        assert all(sz > 0 for sz in seen.values()), f"empty MP3(s): {seen}"
-        # time-to-first-audio quality proxy (typ. 1-3s); lenient bound vs network jitter.
-        assert t_first is not None and t_first < 15.0, f"time-to-first-audio too high: {t_first}"
+        # The engine's own startup deadline is six seconds; allow scheduling margin.
+        assert t_first is not None and t_first < 8.0, f"time-to-first-audio too high: {t_first}"
         print(
-            f"\n[TTS-1] time_to_first_audio={t_first:.2f}s total={total:.2f}s "
-            f"mp3s={ {k: v for k, v in seen.items()} }"
+            f"\n[TTS-1] one_stream time_to_first_audio={t_first:.2f}s "
+            f"total={total:.2f}s"
         )
 
-    # 2) Multi-sentence -> multiple chunk files, playback completes -------
+    def test_neural_long_read_is_one_request_and_stops(self, eng, monkeypatch):
+        """The user's failure case: a 5,553-character read at 2.1x must start
+        through one cloud request, then Stop must close it without an error."""
+        import edge_tts
+
+        original = edge_tts.Communicate
+        calls = []
+
+        class CountingCommunicate:
+            def __init__(self, text, voice, **kwargs):
+                calls.append((text, voice, kwargs))
+                self._inner = original(text, voice, **kwargs)
+
+            def stream(self):
+                return self._inner.stream()
+
+        monkeypatch.setattr(edge_tts, "Communicate", CountingCommunicate)
+        eng.set_speed(2.1)
+        text = ("One continuous neural passage with no sentence request seams. " * 100)[:5553]
+        assert len(text) == 5_553
+
+        log = _SignalLog(eng)
+        t0 = time.monotonic()
+        eng.speak(text)
+        started = _wait(lambda: log.first_playing_offset(t0) is not None, timeout=10)
+        if not started and log.errors:
+            pytest.skip(f"neural service unavailable: {log.errors}")
+        assert started, f"long neural read did not start; status={log.status}"
+        t_first = log.first_playing_offset(t0)
+        eng.stop()
+        assert _wait(lambda: len(log.finished) >= 1, timeout=3), (
+            "Stop did not retire the active long neural request"
+        )
+
+        assert len(calls) == 1, f"long selection opened {len(calls)} requests"
+        assert calls[0][0] == text.strip()
+        assert not log.errors, f"long read/Stop emitted errors: {log.errors}"
+        assert not eng.is_speaking
+        print(
+            f"\n[TTS-1b] 5553 chars at 2.1x started in {t_first:.2f}s; "
+            "one request; Stop retired it cleanly"
+        )
+
+    # 2) Multi-sentence -> one continuous stream, playback completes -------
     def test_neural_multi_sentence(self, eng):
         text = (
             "This is the first sentence of the integration test. "
@@ -222,18 +233,14 @@ class TestTTSLive:
             "And finally a third sentence to finish the passage cleanly."
         )
         words = len(text.split())
-        log, seen, t_first, total, ok = _drive_speak(eng, text, timeout=60)
+        log, t_first, total, ok = _drive_speak(eng, text, timeout=60)
         assert ok, f"multi-sentence speech never finished; status={log.status}"
-        if t_first is None and not seen:
+        if t_first is None:
             pytest.skip(f"neural edge-tts produced no audio (network?); status={log.status}")
         assert not log.errors, f"unexpected error(s): {log.errors}"
-        # Objective proxy for "duration proportional to content": the streamer
-        # emits one MP3 per sentence-ish chunk, so >1 sentence => multiple files.
-        assert len(seen) >= 2, f"expected multiple chunk MP3s, saw {sorted(seen)}"
-        assert all(sz > 0 for sz in seen.values())
         assert total > 0.5, "multi-sentence playback finished implausibly fast"
         print(
-            f"\n[TTS-2] words={words} chunks={len(seen)} "
+            f"\n[TTS-2] words={words} one_stream "
             f"first_audio={t_first:.2f}s total={total:.2f}s "
             f"(~{words / max(total, 0.01):.1f} words/s incl. synthesis)"
         )
@@ -250,12 +257,6 @@ class TestTTSLive:
 
         # Now exercise the LIVE set_rate path during real playback.
         log = _SignalLog(eng)
-        seen = {}
-        stop_evt = threading.Event()
-        watcher = threading.Thread(
-            target=_watch_mp3s, args=(eng, stop_evt, seen), daemon=True
-        )
-        watcher.start()
         t0 = time.monotonic()
         eng.speak("Changing the playback speed live while this sentence is spoken aloud.")
         # Wait until audio is actually playing, then poke the speed (hits VLC set_rate).
@@ -263,14 +264,12 @@ class TestTTSLive:
         eng.set_speed(1.5)
         eng.set_speed(0.75)
         ok = _wait(lambda: len(log.finished) >= 1, timeout=40)
-        stop_evt.set()
-        watcher.join(timeout=2)
 
         assert ok, f"speech did not complete after live speed changes; status={log.status}"
-        if log.first_playing_offset(t0) is None and not seen:
+        if log.first_playing_offset(t0) is None:
             pytest.skip("neural audio unavailable (network?); live-speed path not reached")
         assert not log.errors, f"live speed changes caused error(s): {log.errors}"
-        print(f"\n[TTS-3] live speed changes OK; completed; chunks={len(seen)}")
+        print("\n[TTS-3] live speed changes OK; one stream completed")
 
     # 4) Offline path (pyttsx3 SAPI) — completes, no network, no MP3s -----
     def test_offline_sapi_no_network(self, eng):
@@ -280,20 +279,19 @@ class TestTTSLive:
         eng.set_voice(sapi[0])
         assert eng._use_offline is True, "set_voice(sapi:...) did not select offline path"
 
-        log, seen, t_first, total, ok = _drive_speak(
+        log, t_first, total, ok = _drive_speak(
             eng, "This sentence is spoken by the offline system voice.", timeout=30
         )
         assert ok, f"offline speech never finished; status={log.status} errors={log.errors}"
         assert not log.errors, f"offline path error(s): {log.errors}"
-        # Offline uses pyttsx3 — it must NOT create neural MP3s and must NOT emit 'Playing'.
-        assert not seen, f"offline path unexpectedly produced neural MP3s: {seen}"
+        # Offline uses pyttsx3 and must not emit the neural VLC 'Playing' status.
         assert t_first is None, "offline path unexpectedly used the neural VLC 'Playing' path"
         assert any("offline" in s.lower() for _t, s in log.status), (
             f"offline status not observed: {log.status}"
         )
         print(
             f"\n[TTS-4] offline SAPI completed in {total:.2f}s "
-            f"(no network, zero MP3s); voice={sapi[0]}"
+            f"(no network); voice={sapi[0]}"
         )
 
     # 5) shutdown() removes the temp dir and is idempotent ----------------

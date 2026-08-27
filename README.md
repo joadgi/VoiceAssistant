@@ -2,13 +2,13 @@
 
 A local Windows desktop app for voice dictation, screen text reading, and OCR.
 
-**Privacy:** dictation (Whisper) and OCR (Windows' built-in engine) run **entirely on your own machine** — your voice and screen contents never leave it. Read-aloud's *neural* voices use Microsoft's online `edge-tts` service (the selected text is sent to Microsoft to synthesize audio); a fully offline Windows SAPI voice is available as a fallback if you prefer read-aloud to stay local too.
+**Privacy:** dictation (Whisper) and OCR (Windows' built-in engine) run **entirely on your own machine** — your voice and screen contents never leave it. Read-aloud's *neural* voices use Microsoft's online `edge-tts` service (the selected text is sent to Microsoft to synthesize audio); fully offline Windows SAPI voices are available as explicit choices if you prefer read-aloud to stay local too.
 
 ## Features
 
 - **Push-to-talk dictation** — hold a hotkey, speak, release, and the transcription is pasted directly into whichever window had your cursor (Outlook, Word, Chrome, Slack, anything).
 - **Floating desktop pill** — an always-visible indicator (drag it anywhere) that shows Ready / Recording / Transcribing / Pasted, and can be **clicked to start and stop** dictation without a hotkey.
-- **Read highlighted text aloud** — highlight any text in any app, press a hotkey, and hear it read by a natural neural voice (online Microsoft voices; offline SAPI fallback available).
+- **Read highlighted text aloud** — highlight any text in any app, press a hotkey, and hear it read by a natural neural voice (online Microsoft voices; offline SAPI choices available).
 - **OCR at cursor** — capture on-screen text from images, PDFs, error dialogs, or anything else you can't select, and have it read aloud.
 - **Real-time speed control** — drag the speed slider from 0.5x to 3.0x *while audio is playing* — no restart.
 - **Modern Microsoft neural voices** — Andrew, Brian, Christopher, Eric, Guy, Emma, Ava, Jenny, and more.
@@ -21,7 +21,7 @@ A local Windows desktop app for voice dictation, screen text reading, and OCR.
 |---|---|
 | UI | PySide6 (Qt) with dark theme |
 | Voice-to-text | `faster-whisper` (CTranslate2-optimized Whisper) |
-| Text-to-speech | `edge-tts` (streaming neural voices — **online** Microsoft service); `pyttsx3` SAPI offline fallback |
+| Text-to-speech | `edge-tts` (one buffered neural stream — **online** Microsoft service); explicit `pyttsx3` SAPI offline option |
 | Audio playback | VLC (via `python-vlc`) — for real-time speed control |
 | Screen capture | `mss` |
 | OCR | **Windows-native OCR** (the same engine PowerToys Text Extractor uses — instant, no downloads); EasyOCR available as an optional fallback |
@@ -194,7 +194,10 @@ your transcribed text.**
 | Short words ("yes", "no") get dropped | They fell below the minimum-length or minimum-volume gate. The pill names the reason. Tune `min_record_seconds` / `min_record_peak` in `settings.json`. |
 | Hotkey does nothing in *one* specific app | That app is probably running as administrator. Windows blocks keyboard hooks from a normal-privilege app into an elevated one — run this app as admin too, or use a different app. |
 | Caps Lock toggles caps while dictating | Shouldn't happen — the app swallows the key when Caps Lock is bound. If it does, report it; it means the key suppression broke. |
-| Read-aloud is silent | No neural voice usually means VLC is missing: `winget install VideoLAN.VLC`. If it speaks with the robotic Windows voice instead, the neural service is unreachable and it fell back to offline SAPI. |
+| Read-aloud is silent | No neural voice usually means VLC is missing: `winget install VideoLAN.VLC`. |
+| It reads in the robotic Windows voice, not the one I picked | Current builds never switch a selected neural voice into SAPI automatically. A neural failure stops and reports **chosen neural voice unavailable**. A Windows voice speaks only when you explicitly choose an **[Offline]** voice. Run `main.py --check --deep` to test the neural service directly. |
+| Stop doesn't stop the reading | Current builds cancel the active edge-tts request, stop VLC, and purge explicitly selected SAPI speech. A selection result that arrives after Stop is also discarded, so it cannot restart speech. |
+| Read-aloud pauses for several seconds, catches up, or reports `playback buffer ran dry` | Current builds send the complete selection through exactly one edge-tts request and one VLC stream—no sentence-sized MP3 seams. VLC read-ahead waits for that bounded request instead of treating a temporarily empty buffer as a failure. Live checks on this machine started a short phrase in 4.05 seconds and a 5,553-character passage at 2.1x in 4.62 seconds; the long read used one request and Stop retired it cleanly. |
 | Read-aloud reads the wrong text (e.g. a browser address bar) | That app doesn't expose its selection properly. Re-select the text and try again; it will fall back to copy or OCR. |
 | The `Fn` key won't bind | It can't. `Fn` is handled inside your keyboard's firmware and never reaches Windows, so no software can see it. Use `F9` or similar. |
 | A hotkey fires in the browser too | Some defaults collide (`Ctrl+Shift+T` reopens a closed tab). Click the hotkey pill and rebind it. |

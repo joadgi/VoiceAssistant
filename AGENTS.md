@@ -10,7 +10,7 @@ A **local, private, Windows desktop dictation app** — and the dictation engine
 point. Dictation (Whisper) and OCR (EasyOCR) run entirely on the user's own machine
 (GPU with CPU fallback) — voice and screen contents never leave it. **Exception:**
 read-aloud's *neural* voices use Microsoft's online `edge-tts` service (selected text
-is sent to Microsoft for synthesis); the `pyttsx3` SAPI fallback is fully offline.
+ is sent to Microsoft for synthesis); explicitly selected `pyttsx3` SAPI voices are fully offline.
 Never describe the whole app as "nothing sent to the cloud" — scope the claim.
 The goal is to be a faster, cleaner alternative to Wispr Flow.
 
@@ -27,7 +27,7 @@ Three features, in priority order:
 |---|---|
 | UI | PySide6 (Qt), dark theme |
 | Voice-to-text | `faster-whisper` (CTranslate2 Whisper) on CUDA, CPU fallback |
-| Text-to-speech | `edge-tts` streaming neural voices → VLC playback (live speed); `pyttsx3` SAPI offline fallback |
+| Text-to-speech | `edge-tts` neural synthesis → one gapless buffered VLC stream (live speed); explicit `pyttsx3` SAPI offline option |
 | Screen capture | `mss` |
 | OCR | **Windows-native `Windows.Media.Ocr`** via `winsdk` (default — ~10ms, zero heavy deps; DPI-correct physical-pixel capture); EasyOCR optional fallback (`pip install easyocr`, pulls the multi-GB torch stack) |
 | Global hotkeys | `keyboard` |
@@ -47,7 +47,7 @@ run.bat/shortcuts/startup-registry compatibility.
 | `voiceassistant/settings_dialog.py` / `theme.py` | Settings UI, dark stylesheet. |
 | `voiceassistant/recorder.py` | `VoiceRecorder` — **always-open** mic stream + pre-roll ring buffer; GUI-thread tick owns metering/duration-cap/mic-health. |
 | `voiceassistant/transcriber.py` | `Transcriber` + `TranscriptionResult` (faster-whisper, both-pass guards, job-bound context). |
-| `voiceassistant/tts.py` | `TTSEngine` — edge-tts → VLC (live speed), per-utterance generations, pyttsx3 fallback, bounded network waits. |
+| `voiceassistant/tts.py` | `TTSEngine` — one edge-tts request → one VLC stream (live speed), per-utterance generations, explicit pyttsx3 option, bounded network waits. Carries the STOP CONTRACT and VOICE CONTRACT (in-file). |
 | `voiceassistant/ocr.py` | `ScreenCapture` (mss) + `OCREngine` (Windows-native OCR default, EasyOCR fallback) + `RegionSelector`. |
 | `voiceassistant/paste.py` | `Paster` — the paste worker: clipboard snapshot/restore + Win32 Ctrl+V, off the GUI thread. |
 | `voiceassistant/selection.py` | `SelectionReader` — read-aloud's 3-tier selection grab (UIA → Ctrl+C sentinel → tell caller to OCR), off the GUI thread (mirrors `Paster`). |
@@ -59,7 +59,7 @@ run.bat/shortcuts/startup-registry compatibility.
 | `voiceassistant/metrics.py` | Per-dictation metrics (JSONL, rolling, **never text**) + `--report` summary. |
 | `voiceassistant/applog.py` | Privacy-safe rotating log (never logs payloads), opt-in debug, excepthooks + faulthandler. |
 | `voiceassistant/selfcheck.py` | `python main.py --check` — no-GUI health probe (mic, hotkeys, CUDA, OCR, VLC, TTS). |
-| `tests/` | Characterization + fault-injection suites (fast) and the golden-audio corpus gate (local, `RUN_CORPUS=1`). |
+| `tests/` | Characterization + fault-injection suites (fast), the TTS stop/voice regression suite, and the golden-audio corpus gate (local, `RUN_CORPUS=1`). |
 | `setup.bat` / `run.bat` / `create_shortcut.bat` | Env setup, silent launch (pythonw), desktop shortcut. |
 | `uninstall.bat` | Removes the HKCU startup value, desktop shortcut, venv + local runtime files, and (after confirming) the `models--Systran--faster-whisper-*` HF cache dirs. Scoped by glob so unrelated HF models survive. Cannot delete its own folder — tells the user. |
 
@@ -86,8 +86,13 @@ The tier is reported back so failures name the real cause and `--report` counts 
 **OCR:** hotkey (cursor region) or drag-selected region → `mss` grab → `OCREngine` →
 text shown and auto-spoken.
 
-**TTS:** `edge-tts` streams MP3 to a temp file; VLC plays it and `set_rate()` changes speed
-live (no regeneration). Falls back to `pyttsx3` SAPI if neural/VLC fails.
+**TTS:** exactly one `edge-tts.Communicate` request fills one in-memory byte stream.
+After a protected lead (one second for selections up to 600 characters, three seconds
+for longer reads, scaled by live speed), VLC consumes it through custom media callbacks
+while synthesis continues. The TTS `SerialWorker` owns the asyncio request; LibVLC's
+native callback consumes it, so there is no extra Python producer thread. `set_rate()`
+changes speed live (no regeneration). A neural selection never changes into SAPI;
+`pyttsx3` runs only when the user explicitly selects an offline voice.
 
 ## Key design decisions (the "why", for future reviews)
 
@@ -194,6 +199,61 @@ live (no regeneration). Falls back to `pyttsx3` SAPI if neural/VLC fails.
 - **Silent drops are surfaced on the pill.** The app lives in the tray, so a
   status-bar-only "Recording ignored" was invisible and read as "it just didn't
   work". The gate also measures the user's **hold** time, not the padded slice.
+- **Stop must interrupt EVERY TTS backend, and `runAndWait()` is not one**
+  (`tts.py` STOP CONTRACT). `pyttsx3.runAndWait()` blocks inside the SAPI
+  driver loop until the whole text has been spoken, so on the offline path
+  `stop()` was a **complete no-op**: measured, the old code did not unwind
+  within a 5 s cap on a ~20 s passage — audio ran to the end while `stop()`
+  had already set `_speaking = False`, so `is_speaking` said idle and the next
+  hotkey press queued a SECOND utterance behind the still-playing first. The
+  offline path now runs through pyttsx3's **external** loop (`startLoop(False)` +
+  `iterate()`), checking the job's stop event every ~10 ms, and is chunked so
+  even a driver without external-loop support over-runs by one sentence rather
+  than the whole document. Measured after: neural **172 ms**, offline
+  **234 ms** to full unwind, with `stop()` itself costing 0.1–20 ms on the
+  calling thread. **Never reintroduce a blocking speak-until-finished call.**
+- **VLC's `play()` is asynchronous, so the warm-up poll must honour stop too.**
+  The 40×25 ms wait for `is_playing()` had no stop check — a Stop pressed there
+  kept playing for up to a further second and then called `set_rate` on it. A
+  `_vlc_lock` also closes the inversion where `stop()` (GUI thread) landed
+  between `set_media()` and `play()` (worker thread) and the next chunk started
+  anyway.
+- **A neural voice is a hard choice; never switch it to SAPI automatically.**
+  The old fallback converted a transient neural startup delay into an unexpected
+  robotic Windows voice. Stopping that voice and pressing Read again could then
+  overlap the still-draining neural request. A neural failure now stops the job
+  and reports `chosen neural voice unavailable`; SAPI speaks only when the user
+  explicitly selects an `[Offline]` voice in the dropdown.
+- **A failure mid-utterance TRUNCATES; it never re-reads.** The old handler
+  fell back to `_speak_offline(text)` for the WHOLE text no matter how much had
+  already played, so a VLC hiccup three sentences in made you hear the opening
+  twice, the second time robotic. `_speak_job` tracks whether audio actually
+  reached the speakers; any failure after that truncates and never re-reads.
+- **Retry the neural path on FAST failures only** (`_speak_neural`). edge-tts
+  throws transient websocket/403/DNS errors that one cheap retry recovers; a
+  **stall** (our own `TimeoutError` after `FIRST_AUDIO_TIMEOUT`) is never
+  retried, because that would buy a second full timeout of dead air before the
+  error is finally reported.
+- **Neural read-aloud is ONE PROTECTED STREAM, not sentence requests.** The old
+  producer opened a fresh edge-tts websocket every `<=240` characters and
+  played the first file immediately. At the user's `2.1x` speed that tiny lead
+  repeatedly ran dry: a long silent pause at a sentence boundary, then
+  catch-up when the next request completed. Waiting for the complete MP3 fixed
+  that but made long selections take too long to start. Concurrent mini-MP3s
+  improved startup but preserved independent encoder/prosody seams. The current
+  path uses one `Communicate` generator for the whole selection and starts one
+  VLC callback stream after its protected lead, while the same TTS worker keeps
+  filling it. Short selections use a one-second lead; reads over 600 characters
+  use three seconds to absorb service jitter at 2x+ speed. **Do not treat an
+  empty buffer as an audible underrun:** VLC aggressively reads ahead into its
+  own decoder/cache, so the callback waits for the bounded edge-tts request to
+  write, finish, fail, or be stopped. A `0.75s` callback cutoff was tried and
+  caused false `playback buffer ran dry` failures about three seconds into
+  otherwise healthy reads. Stop cancels and closes the active async request and
+  wakes the callback within ~50 ms; real network stalls remain bounded.
+  The normal SAPI external-loop path likewise queues the complete selection
+  once; sentence chunks exist only for a driver without interruptible loop
+  support.
 - **VAD with a no-VAD retry** (`transcriber.py` `_run_transcribe`): VAD trims silence so
   Whisper stops hallucinating repeats/junk on pauses — but if the VAD pass returns empty,
   it retries **without** VAD so quiet/short speech is never lost. This was a real
@@ -229,6 +289,11 @@ live (no regeneration). Falls back to `pyttsx3` SAPI if neural/VLC fails.
 - **Single instance** via a named Win32 mutex. Note: `venv\Scripts\pythonw.exe` is a
   launcher stub that spawns the real interpreter as a child — so "two pythonw processes"
   (stub + child) is **one** logical instance, not a duplicate.
+- **Tray Quit must stop `QApplication` explicitly.** `app.py` sets
+  `setQuitOnLastWindowClosed(False)` so hiding/closing the main window does not
+  end a tray-first app. After `closeEvent` performs the full recorder/worker/VLC
+  teardown, `quit_app()` must call `QApplication.quit()` or a windowless
+  pythonw process and stale tray objects survive.
 
 ## Constraints & gotchas
 
@@ -262,7 +327,7 @@ live (no regeneration). Falls back to `pyttsx3` SAPI if neural/VLC fails.
   `Transcriber._add_nvidia_dll_dirs`).
 - **TTS dependency decision (2026-07-17):** Piper (fully local neural TTS) was evaluated
   as an edge-tts replacement and DEFERRED — edge-tts voice quality is materially better,
-  the offline-private option already exists (SAPI fallback), and live speed control
+  the offline-private option already exists (explicit SAPI selection), and live speed control
   depends on VLC either way. Revisit if/when packaging for distribution.
 
 ## Setup & run
@@ -293,7 +358,10 @@ All are editable inline — click a hotkey pill and press your combo (single key
 - **Dictation accuracy/latency** → `voiceassistant/transcriber.py` (VAD params, both-pass
   segment guards, model size) and `voiceassistant/text.py` (cleanup chain, denylist).
 - **Paste reliability / focus / the beep** → `voiceassistant/paste.py` + `winapi.py`.
-- **Playback / voices / speed** → `voiceassistant/tts.py`.
+- **Playback / voices / speed / Stop** → `voiceassistant/tts.py`. Read the
+  STOP CONTRACT and VOICE CONTRACT comments there BEFORE changing that file;
+  `tests/test_tts_stop_and_voice.py` pins both (12 of its 15 cases fail against
+  the pre-2026-08-26 engine).
 - **Before ANY behavior change:** run `pytest tests -q` (fast suites) and, for anything
   touching the dictation pipeline, `RUN_CORPUS=1 pytest tests/test_corpus_gate.py`
   (the golden-audio gate — the objective definition of "dictation still works").
@@ -311,7 +379,10 @@ All are editable inline — click a hotkey pill and press your combo (single key
 - **Watchpoints:** the job-bound target HWND (never reintroduce a shared field), the
   monotonic job-id guard, the silent-drop thresholds, the VAD retry (its segment guards
   must stay on BOTH passes), and the threading law (`workers.SerialWorker` — no ad-hoc
-  threads). **Capture-path watchpoints:** the always-open stream + pre-roll (never
+  threads). **Read-aloud watchpoints:** no blocking speak-until-finished call on
+  ANY TTS backend, the VLC warm-up's stop check, the neural voice id never
+  reaching SAPI, and truncate-don't-re-read on a mid-utterance failure.
+  **Capture-path watchpoints:** the always-open stream + pre-roll (never
   reintroduce per-recording stream opens), the audio callback staying signal-free, the
   three-way recorder teardown (weakref `atexit` — a strong ref defeats `__del__` and
   reopens the segfault), hooking every combo key, and the PTT watchdog. These interact;
