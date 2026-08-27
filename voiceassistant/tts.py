@@ -1,4 +1,4 @@
-"""TTSEngine — edge-tts neural voices via VLC, explicit pyttsx3 SAPI option.
+"""TTSEngine — local/online neural voices via VLC, explicit SAPI option.
 
 Phase 3 rework:
   * ONE owned SerialWorker — utterances serialize; two workers can never
@@ -23,7 +23,8 @@ evidence that the speakers have run dry.
 Stop/voice rework (2026-08-26) — the two user-visible bugs turned out to
 share one root cause. See the STOP CONTRACT and VOICE CONTRACT below.
 
-The TTS SerialWorker also owns edge-tts's asyncio loop. LibVLC's native media
+The TTS SerialWorker owns both local Kokoro inference and edge-tts's asyncio
+loop. LibVLC's native media
 callback consumes the in-memory stream while that same worker continues the
 single async request; there is no second Python producer thread to outlive or
 overlap the next utterance.
@@ -66,6 +67,43 @@ NEURAL_VOICES = [
     ("William (Male, AU)", "en-AU-WilliamNeural"),
     ("Natasha (Female, AU)", "en-AU-NatashaNeural"),
 ]
+
+# Fast local neural voices. Unlike edge-tts these synthesize on this machine,
+# so playback cannot hiccup when Microsoft's service runs slower than audio.
+LOCAL_NEURAL_VOICES = [
+    ("Michael (Male, US) - Warm", "am_michael"),
+    ("Adam (Male, US) - Clear", "am_adam"),
+    ("Eric (Male, US) - Calm", "am_eric"),
+    ("Liam (Male, US) - Natural", "am_liam"),
+    ("Heart (Female, US) - Warm", "af_heart"),
+    ("Sarah (Female, US) - Clear", "af_sarah"),
+]
+
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+KOKORO_MODEL_PATH = os.path.join(
+    _PROJECT_ROOT, "models", "kokoro", "kokoro-v1.0.fp16.onnx"
+)
+KOKORO_VOICES_PATH = os.path.join(
+    _PROJECT_ROOT, "models", "kokoro", "voices-v1.0.bin"
+)
+LOCAL_PCM_SAMPLE_RATE = 24_000
+LOCAL_MAX_SPEED = 2.6
+
+# The Kokoro v1.0 model's rate input becomes nonlinear above ~2.1. These
+# points were calibrated from produced sample counts on a punctuation-bearing
+# 444-character passage. Interpolation keeps the UI multiplier tied to actual
+# duration rather than displaying the raw model input. The model plateaus near
+# 2.6x even when its input is raised further, which is why LOCAL_MAX_SPEED is
+# an honest 2.6 instead of the old fake 3.0.
+_LOCAL_SPEED_CALIBRATION = (
+    (0.5, 0.5),
+    (2.1, 2.1),
+    (2.2, 2.42),
+    (2.3, 2.76),
+    (2.4, 3.18),
+    (2.5, 4.0),
+    (2.6, 6.0),
+)
 
 
 def _neural_meta():
@@ -226,8 +264,79 @@ class _StreamingAudioBuffer:
         return self._stop_event.is_set() or self._cancel_event.is_set()
 
 
+class _PacedAudioStream:
+    """Expose raw PCM to VLC at the rate represented by its sample clock.
+
+    LibVLC's raw-audio demux aggressively read the callback to EOF. On the
+    user's 941-character passage it consumed 44.959 seconds of generated PCM
+    in 20.250 seconds, marked the media Ended, and let the next Speak stop the
+    still-queued output. That sounded like whole sections were being skipped.
+
+    A small lead keeps VLC fed, then reads are clocked at the PCM byte rate.
+    This makes Ended line up with what has actually reached the speakers. The
+    waiter is stop-aware; test clocks/waiters are injectable so the duration
+    contract can be pinned without making the suite sleep in real time.
+    """
+
+    def __init__(
+        self,
+        source,
+        stop_event,
+        sample_rate=LOCAL_PCM_SAMPLE_RATE,
+        channels=1,
+        bytes_per_sample=2,
+        lead_seconds=0.25,
+        frame_seconds=0.05,
+        clock=None,
+        waiter=None,
+    ):
+        self._source = source
+        self._stop_event = stop_event
+        self._bytes_per_frame = int(channels) * int(bytes_per_sample)
+        self._bytes_per_second = int(sample_rate) * self._bytes_per_frame
+        self._lead_seconds = float(lead_seconds)
+        self._frame_bytes = max(
+            self._bytes_per_frame,
+            int(self._bytes_per_second * float(frame_seconds)),
+        )
+        self._clock = clock or time.monotonic
+        self._waiter = waiter or stop_event.wait
+        self._started_at = None
+        self._sent = 0
+
+    @property
+    def error(self):
+        return self._source.error
+
+    def read(self, size):
+        requested = max(self._bytes_per_frame, int(size))
+        threshold = min(requested, self._frame_bytes)
+        if self._started_at is None:
+            self._started_at = self._clock()
+
+        while not self._stop_event.is_set():
+            elapsed = max(0.0, self._clock() - self._started_at)
+            permitted = int(
+                (elapsed + self._lead_seconds) * self._bytes_per_second
+            )
+            allowed = permitted - self._sent
+            if allowed >= threshold:
+                take = min(requested, allowed)
+                take -= take % self._bytes_per_frame
+                data = self._source.read(take)
+                if data:
+                    self._sent += len(data)
+                return data
+
+            missing = threshold - allowed
+            delay = min(0.02, max(0.002, missing / self._bytes_per_second))
+            self._waiter(delay)
+
+        return None
+
+
 class TTSEngine(QObject):
-    """Neural TTS with real-time speed control via VLC."""
+    """Local/online neural TTS plus an explicit Windows SAPI option."""
 
     speaking_started = Signal()
     speaking_finished = Signal()
@@ -250,6 +359,10 @@ class TTSEngine(QObject):
         self._active_stop = None          # stop Event of the CURRENT utterance
         self._voice_id = "en-US-AndrewNeural"
         self._sapi_voice_id = None        # set ONLY when the user picks a SAPI voice
+        self._local_voice_id = "am_michael"
+        self._use_local = False
+        self._kokoro = None
+        self._kokoro_load_queued = False
         self._temp_dir = tempfile.mkdtemp(prefix="voiceassist_")
         self._worker = SerialWorker("tts")
 
@@ -298,8 +411,14 @@ class TTSEngine(QObject):
         return self._speaking
 
     def get_voices(self):
-        """Return list of (id, name) — neural voices, then explicit offline options."""
-        voices = [(vid, f"[Neural] {name}") for name, vid in NEURAL_VOICES]
+        """Return local neural, online neural, then explicit offline voices."""
+        voices = [
+            (f"kokoro:{vid}", f"[Local Neural] {name}")
+            for name, vid in LOCAL_NEURAL_VOICES
+        ]
+        voices.extend(
+            (vid, f"[Online Neural] {name}") for name, vid in NEURAL_VOICES
+        )
         if self._pyttsx_engine:
             try:
                 for v in self._pyttsx_engine.getProperty("voices"):
@@ -310,21 +429,42 @@ class TTSEngine(QObject):
         return voices
 
     def set_voice(self, voice_id):
-        if voice_id.startswith("sapi:"):
+        if voice_id.startswith("kokoro:"):
+            self._use_local = True
+            self._use_offline = False
+            self._sapi_voice_id = None
+            self._local_voice_id = voice_id[7:]
+            self._voice_id = voice_id
+            # Do not retain a number the local backend cannot honor.
+            self._speed = min(self._speed, LOCAL_MAX_SPEED)
+            if self._kokoro is None and not self._kokoro_load_queued:
+                self._kokoro_load_queued = True
+                self._worker.submit(self._load_kokoro)
+        elif voice_id.startswith("sapi:"):
+            self._use_local = False
             self._use_offline = True
             self._sapi_voice_id = voice_id[5:]
             self._voice_id = self._sapi_voice_id
             if self._pyttsx_engine:
                 self._pyttsx_engine.setProperty("voice", self._voice_id)
         else:
+            self._use_local = False
             self._use_offline = False
             self._sapi_voice_id = None
             self._voice_id = voice_id
 
     def set_speed(self, speed):
-        """Set playback speed (0.5 to 3.0). Takes effect immediately during playback."""
-        self._speed = max(0.5, min(3.0, float(speed)))
-        if self._vlc_player and self._speaking:
+        """Set the requested speech-rate multiplier.
+
+        Local neural audio is synthesized at this calibrated rate. VLC's rate control is
+        intentionally not used for its raw PCM callback stream: live testing
+        proved that VLC accepted ``set_rate(2.1)`` but still played that stream
+        at 1.0x. A local change therefore affects the next synthesized block.
+        Online MP3 and explicit SAPI voices retain their live backend control.
+        """
+        max_speed = LOCAL_MAX_SPEED if self._use_local else 3.0
+        self._speed = max(0.5, min(max_speed, float(speed)))
+        if self._vlc_player and self._speaking and not self._use_local:
             try:
                 self._vlc_player.set_rate(self._speed)
             except Exception:
@@ -437,7 +577,10 @@ class TTSEngine(QObject):
         # robotic. Anything already played means truncate, never re-read.
         progress = []
         try:
-            if self._use_offline:
+            if self._use_local:
+                self.status.emit("Generating local neural speech...")
+                self._speak_local(text, stop_event, progress)
+            elif self._use_offline:
                 self.status.emit("Using offline TTS...")
                 self._speak_offline(text, stop_event)
             else:
@@ -452,7 +595,7 @@ class TTSEngine(QObject):
                 applog.exception("TTS failed mid-utterance")
                 self.status.emit("Speech cut short (playback error)")
                 self.error.emit(f"TTS error: {e}")
-            elif not self._use_offline:
+            elif not self._use_offline and not self._use_local:
                 # A selected neural voice is a hard voice choice. Silently
                 # changing Andrew/Emma/etc. into Windows SAPI is experienced as
                 # the app choosing the wrong voice. Keep the job in the chosen
@@ -477,6 +620,259 @@ class TTSEngine(QObject):
     # retry; stalls and repeated failures surface an honest error. SAPI speaks
     # only when the user explicitly selects an offline voice in the dropdown.
     # ------------------------------------------------------------------ #
+
+    def _load_kokoro(self):
+        """Load the local neural model on the TTS worker, once.
+
+        CPU is deliberate on this installation: the measured real-time factor
+        is ~0.3 (more than 3x faster than playback), while the available ONNX
+        GPU wheel expects a newer CUDA runtime than Whisper uses. Forcing CPU
+        avoids a noisy failed-GPU probe without sacrificing the speed contract.
+        """
+        if self._kokoro is not None:
+            self._kokoro_load_queued = False
+            return self._kokoro
+        try:
+            if not os.path.isfile(KOKORO_MODEL_PATH):
+                raise RuntimeError(
+                    f"local neural model is missing ({KOKORO_MODEL_PATH})"
+                )
+            if not os.path.isfile(KOKORO_VOICES_PATH):
+                raise RuntimeError(
+                    f"local neural voices are missing ({KOKORO_VOICES_PATH})"
+                )
+
+            import onnxruntime as ort
+            from kokoro_onnx import Kokoro
+
+            options = ort.SessionOptions()
+            options.log_severity_level = 3
+            session = ort.InferenceSession(
+                KOKORO_MODEL_PATH,
+                providers=["CPUExecutionProvider"],
+                sess_options=options,
+            )
+            self._kokoro = Kokoro.from_session(session, KOKORO_VOICES_PATH)
+            applog.info("local neural TTS ready (Kokoro, CPU)")
+            return self._kokoro
+        finally:
+            self._kokoro_load_queued = False
+
+    @staticmethod
+    def _create_local_audio(engine, text, voice, speed):
+        """Create Kokoro audio with the supplied raw model-speed input.
+
+        kokoro-onnx 0.6.1's public wrapper rejects values above 2.0 even
+        though the v1.0 ONNX model accepts the calibrated high-rate inputs. Preparation is
+        independent of speed, so it is performed through the package helper
+        at its documented ceiling and the prepared batches are inferred at
+        the calibrated high-rate range. requirements.txt pins the package version
+        because these two helpers are intentionally private.
+        """
+        preparation_speed = min(float(speed), 2.0)
+        voice_style, _phonemes, batches = engine._prepare(
+            text,
+            voice,
+            preparation_speed,
+            "en-us",
+            False,
+            0.25,
+            0.1,
+        )
+        audio, _timings = engine._create_batches(
+            batches,
+            voice_style,
+            float(speed),
+            True,
+        )
+        return audio, LOCAL_PCM_SAMPLE_RATE
+
+    @staticmethod
+    def _local_model_speed(requested_speed):
+        """Map the user-facing duration multiplier to Kokoro's nonlinear input."""
+        requested = max(0.5, min(LOCAL_MAX_SPEED, float(requested_speed)))
+        points = _LOCAL_SPEED_CALIBRATION
+        for (left_rate, left_input), (right_rate, right_input) in zip(
+            points, points[1:]
+        ):
+            if requested <= right_rate:
+                span = right_rate - left_rate
+                fraction = (requested - left_rate) / span
+                return left_input + fraction * (right_input - left_input)
+        return points[-1][1]
+
+    def _speak_local(self, text, stop_event, progress):
+        """Synthesize local neural PCM ahead of one continuous VLC stream.
+
+        The complete selection is phonemized and divided exactly once by
+        Kokoro's native punctuation-aware batcher. Streaming those prepared
+        batches preserves Kokoro's sentence/clause pauses; the old extra
+        180-character splitter erased the pause at every artificial boundary
+        and made a 5,553-character read jump across 39 separate voice segments.
+
+        Speed is snapshotted once for the utterance. Reading ``self._speed``
+        per generated block created a mixed-rate queue when the slider moved:
+        one live trace contained 2.60x, 2.50x, 2.20x, and 1.90x blocks in the
+        same playback stream.
+        No network, MP3 decoder boundary, or second Python thread is involved.
+        """
+        import numpy as np
+
+        engine = self._load_kokoro()
+        started_at = time.monotonic()
+        requested_speed = min(self._speed, LOCAL_MAX_SPEED)
+        model_speed = self._local_model_speed(requested_speed)
+        preparation_speed = min(model_speed, 2.0)
+        voice_style, _phonemes, batches = engine._prepare(
+            text,
+            self._local_voice_id,
+            preparation_speed,
+            "en-us",
+            False,
+            0.25,
+            0.1,
+        )
+        if not batches or stop_event.is_set():
+            return
+
+        cancel_event = threading.Event()
+        stream = _StreamingAudioBuffer(stop_event, cancel_event)
+        started = False
+        playback_started_at = None
+        total_pcm_bytes = 0
+        error = None
+        try:
+            for index, (phonemes, pause_after) in enumerate(batches):
+                if stop_event.is_set():
+                    break
+                synth_started = time.monotonic()
+                samples, _edges = engine._create_batch(
+                    phonemes,
+                    voice_style,
+                    model_speed,
+                    True,
+                    pause_after,
+                )
+                pcm = (
+                    np.clip(np.asarray(samples).reshape(-1), -1.0, 1.0)
+                    * 32767.0
+                ).astype("<i2", copy=False).tobytes()
+                applog.dbg(
+                    "local neural block ready "
+                    f"(block={index + 1}/{len(batches)}, phonemes={len(phonemes)}, "
+                    f"requested={requested_speed:.2f}x, model_input={model_speed:.2f}, "
+                    f"pause={pause_after:.2f}s, "
+                    f"audio={len(pcm) / 2 / LOCAL_PCM_SAMPLE_RATE:.2f}s, "
+                    f"synth={time.monotonic() - synth_started:.2f}s)"
+                )
+                stream.write(pcm)
+                total_pcm_bytes += len(pcm)
+                if not started and pcm and not stop_event.is_set():
+                    applog.dbg(
+                        "local neural playback ready "
+                        f"(chars={len(text)}, batches={len(batches)}, "
+                        f"wait={time.monotonic() - started_at:.2f}s)"
+                    )
+                    self.status.emit(f"Playing locally at {requested_speed:.2f}x...")
+                    self._start_vlc_pcm_stream(stream, stop_event, progress)
+                    started = not stop_event.is_set()
+                    if started:
+                        playback_started_at = time.monotonic()
+        except Exception as exc:
+            error = exc
+        finally:
+            stream.finish(error)
+
+        if stop_event.is_set():
+            stream.cancel()
+            return
+        if error is not None and not started:
+            raise error
+        if not started:
+            raise RuntimeError("Local neural TTS returned no playable audio")
+        self._wait_vlc_stream(stream, stop_event)
+        expected_audio_s = total_pcm_bytes / (
+            LOCAL_PCM_SAMPLE_RATE * 2
+        )
+        playback_wall_s = (
+            time.monotonic() - playback_started_at
+            if playback_started_at is not None else 0.0
+        )
+        starvation_count, max_starvation_s = stream.starvation_stats
+        applog.dbg(
+            "local neural playback complete "
+            f"(blocks={len(batches)}, callback_waits={starvation_count}, "
+            f"max_callback_wait={max_starvation_s:.3f}s, "
+            f"audio={expected_audio_s:.3f}s, wall={playback_wall_s:.3f}s)"
+        )
+        if error is not None:
+            raise error
+
+    def _start_vlc_pcm_stream(self, stream, stop_event, progress):
+        """Start one raw 24 kHz mono PCM stream already synthesized at speed."""
+        import ctypes
+        import vlc
+
+        paced_stream = _PacedAudioStream(stream, stop_event)
+
+        @vlc.cb.MediaReadCb
+        def read_cb(_opaque, buf, length):
+            data = paced_stream.read(int(length))
+            if data is None:
+                return -1
+            if not data:
+                return 0
+            ctypes.memmove(buf, data, len(data))
+            return len(data)
+
+        with self._vlc_lock:
+            if not self._vlc_player:
+                self._init_vlc()
+            if not self._vlc_player:
+                raise RuntimeError("VLC player not available")
+            if stop_event.is_set():
+                return
+            media = self._vlc_instance.media_new_callbacks(
+                None, read_cb, None, None, None
+            )
+            if media is None:
+                raise RuntimeError("VLC could not open the local neural stream")
+            media.add_option(":demux=rawaud")
+            media.add_option(":rawaud-channels=1")
+            media.add_option(f":rawaud-samplerate={LOCAL_PCM_SAMPLE_RATE}")
+            media.add_option(":rawaud-fourcc=s16l")
+            self._vlc_callbacks = (read_cb, paced_stream)
+            self._vlc_player.set_media(media)
+            media.release()
+            self._vlc_player.audio_set_volume(int(self._volume * 100))
+            self._vlc_player.play()
+
+        for _ in range(40):
+            if stop_event.is_set():
+                self._vlc_stop()
+                return
+            if self._vlc_player.is_playing():
+                if not progress:
+                    progress.append("local-neural-stream-started")
+                break
+            if self._vlc_player.get_state() == vlc.State.Error:
+                raise stream.error or RuntimeError("VLC local neural playback error")
+            time.sleep(0.025)
+        else:
+            self._vlc_stop()
+            raise stream.error or RuntimeError("VLC local neural stream did not start")
+
+        if stop_event.is_set():
+            self._vlc_stop()
+            return
+        # The PCM already contains the requested speed. Live testing proved
+        # that VLC silently ignored non-1.0 rates on this callback-backed raw
+        # stream, so applying _speed here both lies to the UI and risks a future
+        # double-speed regression if VLC changes its behavior.
+        try:
+            self._vlc_player.set_rate(1.0)
+        except Exception:
+            pass
 
     def _speak_neural(self, text, gen, stop_event, progress):
         """Neural path with a bounded retry.

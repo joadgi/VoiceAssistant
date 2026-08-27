@@ -10,7 +10,14 @@ pyperclip>=1.8.2
 Pillow>=10.0.0
 winsdk>=1.0.0
 
-# Neural read-aloud (online) + playback
+# Neural read-aloud: local Kokoro is the reliable default; edge-tts remains an
+# optional online voice family. Models are downloaded by setup.bat.
+# Exact pin: voiceassistant/tts.py uses the 0.6.1 prepared-batch helpers so the
+# shipped model can use calibrated high-rate inputs for the user's 2.6x setting.
+kokoro-onnx==0.6.1
+# Keep Kokoro on CPU. The GPU wheel available during validation required CUDA
+# 13, while Whisper intentionally uses the CUDA 12 runtime on this machine.
+onnxruntime==1.24.4
 edge-tts>=7.0.0
 python-vlc>=3.0.0
 

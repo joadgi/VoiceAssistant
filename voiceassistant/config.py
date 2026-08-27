@@ -33,7 +33,7 @@ DEFAULTS = {
     "whisper_prompt": "",
 
     "tts_speed": 1.0,
-    "tts_voice": "en-US-AndrewNeural",
+    "tts_voice": "kokoro:am_michael",
     "tts_volume": 1.0,
 
     "ocr_languages": ["en"],

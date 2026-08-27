@@ -11,10 +11,29 @@ dozens of synthetic rows into the real `metrics.jsonl` and corrupted the
 
 import os
 import sys
+import logging
 
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def _drop_applog_handlers(applog):
+    """Close every cached handler before changing LOG_PATH.
+
+    Setting ``applog._logger = None`` is not enough: logging.getLogger returns
+    the same named Logger object, whose old RotatingFileHandler keeps writing
+    to the real debug.log. Collection-time imports can initialize that handler
+    before the per-test fixture begins, so remove it explicitly at both ends.
+    """
+    logger = logging.getLogger("voiceassistant")
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
+        try:
+            handler.close()
+        except Exception:
+            pass
+    applog._logger = None
 
 
 @pytest.fixture(autouse=True)
@@ -32,12 +51,14 @@ def _isolate_runtime_state(tmp_path, monkeypatch):
     """
     from voiceassistant import applog, metrics
 
+    _drop_applog_handlers(applog)
     monkeypatch.setattr(metrics, "METRICS_PATH", str(tmp_path / "metrics.jsonl"))
     monkeypatch.setattr(applog, "LOG_PATH", str(tmp_path / "debug.log"))
     monkeypatch.setattr(applog, "CRASH_LOG_PATH", str(tmp_path / "crash.log"))
     # The logger is built once and cached against LOG_PATH, so it has to be
     # dropped for the redirect to take effect (and again afterwards, so the
     # next test rebuilds against ITS tmp dir).
-    monkeypatch.setattr(applog, "_logger", None)
-    yield
-    applog._logger = None
+    try:
+        yield
+    finally:
+        _drop_applog_handlers(applog)

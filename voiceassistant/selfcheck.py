@@ -7,10 +7,10 @@ never aborts the report. Exit code: 0 if nothing REQUIRED failed, else 1.
 Categories:
   REQUIRED — dictation (the primary feature) can't work without it.
   OPTIONAL — a secondary feature degrades but the app still runs.
-Use `--check --deep` to also synthesize a real phrase with the neural voice
-   (proves edge-tts is reachable, not just importable — an unreachable service now
-   produces an honest error without changing voices) and to load the Whisper model (slow; first
-run downloads ~1GB), proving the GPU/CPU transcription path end-to-end.
+Use `--check --deep` to also synthesize a real phrase with the selected neural
+backend (local Kokoro by default, or edge-tts when an online voice is selected)
+and to load the Whisper model (slow; first run downloads ~1GB), proving both
+pipelines end-to-end.
 """
 
 import importlib
@@ -96,6 +96,24 @@ def _check_offline_tts():
         return False, f"pyttsx3 unavailable ({e.__class__.__name__})"
 
 
+def _check_local_neural_files():
+    """Fast presence/import probe; deep mode performs real model inference."""
+    try:
+        import os
+        import kokoro_onnx  # noqa: F401
+        from .tts import KOKORO_MODEL_PATH, KOKORO_VOICES_PATH
+
+        missing = [
+            path for path in (KOKORO_MODEL_PATH, KOKORO_VOICES_PATH)
+            if not os.path.isfile(path) or os.path.getsize(path) == 0
+        ]
+        if missing:
+            return False, "model assets missing - run setup.bat"
+        return True, "Kokoro package and local model assets ready"
+    except Exception as e:
+        return False, f"unavailable ({e.__class__.__name__}: {e}) - run setup.bat"
+
+
 def _check_neural_tts():
     """Actually reach the edge-tts service, don't just import the package.
 
@@ -150,6 +168,42 @@ def _check_neural_tts():
                        "selected neural voice will report an error")
 
 
+def _check_selected_neural_tts():
+    """Deep synthesis probe for the backend currently selected in settings."""
+    from .config import Config
+
+    voice = Config().get("tts_voice", "kokoro:am_michael")
+    if not voice.startswith("kokoro:"):
+        return _check_neural_tts()
+
+    try:
+        import onnxruntime as ort
+        from kokoro_onnx import Kokoro
+        from .tts import (
+            KOKORO_MODEL_PATH, KOKORO_VOICES_PATH, TTSEngine,
+        )
+
+        options = ort.SessionOptions()
+        options.log_severity_level = 3
+        session = ort.InferenceSession(
+            KOKORO_MODEL_PATH,
+            providers=["CPUExecutionProvider"],
+            sess_options=options,
+        )
+        engine = Kokoro.from_session(session, KOKORO_VOICES_PATH)
+        audio, sample_rate = TTSEngine._create_local_audio(
+            engine, "Test.", voice[7:], 2.1
+        )
+        if len(audio) == 0:
+            return False, "local model returned no audio"
+        return True, (
+            f"local neural synthesis OK ({voice}, {len(audio)} samples at "
+            f"{sample_rate} Hz)"
+        )
+    except Exception as e:
+        return False, f"local synthesis failed ({e.__class__.__name__}: {e})"
+
+
 def _check_microphone():
     try:
         import sounddevice as sd
@@ -183,8 +237,9 @@ CHECKS = [
     ("CUDA runtime",          False, _check_cuda_runtime),
     ("OCR (screen reader)",   False, _check_native_ocr),
     ("VLC (neural TTS)",      False, _check_vlc),
+    ("local neural TTS",      False, _check_local_neural_files),
     ("offline TTS option",    False, _check_offline_tts),
-    ("edge-tts (neural TTS)", False, _check_import("edge_tts")),
+    ("online neural option",  False, _check_import("edge_tts")),
 ]
 
 
@@ -234,8 +289,8 @@ def run_selfcheck(deep=False):
         print(f"  [{mark}] {label}{tag}: {detail}")
 
     if deep:
-        print("  ...synthesizing a test phrase with the neural voice...")
-        ok, detail = _check_neural_tts()
+        print("  ...synthesizing a test phrase with the selected neural voice...")
+        ok, detail = _check_selected_neural_tts()
         print(f"  [{'PASS' if ok else 'WARN'}] neural TTS synthesis (optional): {detail}")
 
         print("  ...loading Whisper model (may download ~1GB on first run)...")

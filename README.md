@@ -2,16 +2,20 @@
 
 A local Windows desktop app for voice dictation, screen text reading, and OCR.
 
-**Privacy:** dictation (Whisper) and OCR (Windows' built-in engine) run **entirely on your own machine** — your voice and screen contents never leave it. Read-aloud's *neural* voices use Microsoft's online `edge-tts` service (the selected text is sent to Microsoft to synthesize audio); fully offline Windows SAPI voices are available as explicit choices if you prefer read-aloud to stay local too.
+**Privacy:** dictation (Whisper), OCR (Windows' built-in engine), and the default
+Kokoro neural read-aloud voices run **entirely on your own machine**. Optional
+voices marked **[Online Neural]** use Microsoft's `edge-tts` service and send the
+selected text to Microsoft for synthesis. Voices marked **[Offline]** use Windows
+SAPI locally.
 
 ## Features
 
 - **Push-to-talk dictation** — hold a hotkey, speak, release, and the transcription is pasted directly into whichever window had your cursor (Outlook, Word, Chrome, Slack, anything).
 - **Floating desktop pill** — an always-visible indicator (drag it anywhere) that shows Ready / Recording / Transcribing / Pasted, and can be **clicked to start and stop** dictation without a hotkey.
-- **Read highlighted text aloud** — highlight any text in any app, press a hotkey, and hear it read by a natural neural voice (online Microsoft voices; offline SAPI choices available).
+- **Read highlighted text aloud** — highlight text in any app and hear it through a local neural voice, with optional Microsoft online and Windows SAPI choices.
 - **OCR at cursor** — capture on-screen text from images, PDFs, error dialogs, or anything else you can't select, and have it read aloud.
-- **Real-time speed control** — drag the speed slider from 0.5x to 3.0x *while audio is playing* — no restart.
-- **Modern Microsoft neural voices** — Andrew, Brian, Christopher, Eric, Guy, Emma, Ava, Jenny, and more.
+- **Fast local speed control** — local neural audio is generated at a calibrated 0.5x–2.6x, so the displayed rate tracks the rate actually played. One speed is fixed for each press of Speak; slider changes apply to the next read.
+- **Local and online neural voices** — Michael, Adam, Eric, Liam, Heart, and Sarah run locally; Microsoft voices remain available as clearly marked online choices.
 - **Fully customizable hotkeys** — every hotkey (Dictate, Read, OCR) is yours to change: click any hotkey pill on the main window, then press a **single key (like F9), a combo, or even a modifier-only combo (like Ctrl+Alt)** for push-to-talk. Nothing is hardcoded. (The `Fn` key can't be bound — it's handled in keyboard firmware and never reaches Windows.)
 - **Local Whisper transcription** — `faster-whisper` on NVIDIA GPU (CUDA) with CPU fallback.
 
@@ -21,8 +25,8 @@ A local Windows desktop app for voice dictation, screen text reading, and OCR.
 |---|---|
 | UI | PySide6 (Qt) with dark theme |
 | Voice-to-text | `faster-whisper` (CTranslate2-optimized Whisper) |
-| Text-to-speech | `edge-tts` (one buffered neural stream — **online** Microsoft service); explicit `pyttsx3` SAPI offline option |
-| Audio playback | VLC (via `python-vlc`) — for real-time speed control |
+| Text-to-speech | Local Kokoro ONNX neural synthesis (default); optional online `edge-tts`; explicit Windows SAPI option |
+| Audio playback | One callback-backed VLC stream per selection |
 | Screen capture | `mss` |
 | OCR | **Windows-native OCR** (the same engine PowerToys Text Extractor uses — instant, no downloads); EasyOCR available as an optional fallback |
 | Global hotkeys | `keyboard` |
@@ -125,7 +129,7 @@ VoiceAssistant/
 │   ├── theme.py             Dark stylesheet
 │   ├── recorder.py          Mic capture (always-open stream + pre-roll buffer)
 │   ├── transcriber.py       Whisper transcription
-│   ├── tts.py               edge-tts neural voices + VLC playback
+│   ├── tts.py               local/online neural voices + VLC playback
 │   ├── ocr.py               Screen capture + OCR (Windows-native, EasyOCR fallback)
 │   ├── selection.py         Read-aloud's 3-tier selection grab
 │   ├── uia.py               UI Automation selection reader (no clipboard needed)
@@ -194,10 +198,10 @@ your transcribed text.**
 | Short words ("yes", "no") get dropped | They fell below the minimum-length or minimum-volume gate. The pill names the reason. Tune `min_record_seconds` / `min_record_peak` in `settings.json`. |
 | Hotkey does nothing in *one* specific app | That app is probably running as administrator. Windows blocks keyboard hooks from a normal-privilege app into an elevated one — run this app as admin too, or use a different app. |
 | Caps Lock toggles caps while dictating | Shouldn't happen — the app swallows the key when Caps Lock is bound. If it does, report it; it means the key suppression broke. |
-| Read-aloud is silent | No neural voice usually means VLC is missing: `winget install VideoLAN.VLC`. |
-| It reads in the robotic Windows voice, not the one I picked | Current builds never switch a selected neural voice into SAPI automatically. A neural failure stops and reports **chosen neural voice unavailable**. A Windows voice speaks only when you explicitly choose an **[Offline]** voice. Run `main.py --check --deep` to test the neural service directly. |
-| Stop doesn't stop the reading | Current builds cancel the active edge-tts request, stop VLC, and purge explicitly selected SAPI speech. A selection result that arrives after Stop is also discarded, so it cannot restart speech. |
-| Read-aloud pauses for several seconds, catches up, or reports `playback buffer ran dry` | Current builds send the complete selection through exactly one edge-tts request and one VLC stream—no sentence-sized MP3 seams. VLC read-ahead waits for that bounded request instead of treating a temporarily empty buffer as a failure. Live checks on this machine started a short phrase in 4.05 seconds and a 5,553-character passage at 2.1x in 4.62 seconds; the long read used one request and Stop retired it cleanly. |
+| Read-aloud is silent | VLC or the local Kokoro model may be missing. Run `setup.bat`, install VLC with `winget install VideoLAN.VLC`, then run `main.py --check`. |
+| It reads in the robotic Windows voice, not the one I picked | A neural voice is never switched into SAPI automatically. Windows SAPI speaks only when you explicitly choose an **[Offline]** voice. |
+| Stop doesn't stop the reading | Current builds wake the local stream callback, cancel an active online request, stop VLC, and purge explicitly selected SAPI speech. A stale selection result cannot restart speech. |
+| Read-aloud pauses, catches up, skips sections, or reports `playback buffer ran dry` | Select a **[Local Neural]** voice. The full selection is phonemized once, Kokoro's native punctuation-aware batches retain their sentence pauses, and one fixed speed feeds one continuous VLC stream. The raw PCM callback is clock-paced so VLC cannot read ahead to EOF and mark a still-audible passage complete. |
 | Read-aloud reads the wrong text (e.g. a browser address bar) | That app doesn't expose its selection properly. Re-select the text and try again; it will fall back to copy or OCR. |
 | The `Fn` key won't bind | It can't. `Fn` is handled inside your keyboard's firmware and never reaches Windows, so no software can see it. Use `F9` or similar. |
 | A hotkey fires in the browser too | Some defaults collide (`Ctrl+Shift+T` reopens a closed tab). Click the hotkey pill and rebind it. |

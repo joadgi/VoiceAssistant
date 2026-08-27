@@ -125,12 +125,22 @@ class FakeSapiEngine:
 
 
 class FakeMedia:
+    def __init__(self):
+        self.options = []
+
+    def add_option(self, option):
+        self.options.append(option)
+
     def release(self):
         pass
 
 
 class FakeVlcInstance:
     def media_new(self, path):
+        return FakeMedia()
+
+    def media_new_callbacks(self, *args):
+        self.callback_args = args
         return FakeMedia()
 
 
@@ -177,6 +187,7 @@ def _install_fake_vlc():
         Stopped = "stopped"
 
     fake.State = State
+    fake.cb = types.SimpleNamespace(MediaReadCb=lambda fn: fn)
     sys.modules["vlc"] = fake
 
 
@@ -314,6 +325,183 @@ def test_vlc_never_starts_after_stop():
     eng._play_vlc("chunk.mp3", stop_event)
     assert player.plays == 0, "a stopped utterance still started playback"
     print("PASS: no playback starts after stop")
+
+
+# --------------------------------------------------------------------------- #
+# Local neural path — speed must be real and the stream must stay gapless
+# --------------------------------------------------------------------------- #
+def test_local_model_receives_exact_2_1_speed():
+    """The local model, not VLC, must create the requested 2.1x audio."""
+    import numpy as np
+    from voiceassistant.tts import LOCAL_PCM_SAMPLE_RATE, TTSEngine
+
+    calls = []
+
+    class FakeKokoro:
+        def _prepare(self, text, voice, speed, lang, is_phonemes,
+                     sentence_pause, clause_pause):
+            calls.append(("prepare", text, voice, speed, lang))
+            return "voice-style", "phonemes", [("phonemes", 0.0)]
+
+        def _create_batches(self, batches, voice_style, speed, trim):
+            calls.append(("infer", batches, voice_style, speed, trim))
+            return np.zeros(2400, dtype=np.float32), []
+
+    audio, sample_rate = TTSEngine._create_local_audio(
+        FakeKokoro(), "Read this quickly.", "am_michael", 2.1
+    )
+
+    assert calls[0][3] == 2.0, "package preparation ceiling changed"
+    assert calls[1][3] == 2.1, "model inference did not receive the requested speed"
+    assert sample_rate == LOCAL_PCM_SAMPLE_RATE
+    assert len(audio) == 2400
+
+
+def test_local_speech_prepares_full_text_once_and_freezes_speed():
+    """Native pauses and one rate must survive across every streamed batch."""
+    import numpy as np
+
+    eng = _engine()
+    eng._use_local = True
+    eng.set_speed(2.6)
+    prepared = []
+    generated = []
+
+    class FakeKokoro:
+        def _prepare(self, text, voice, speed, lang, is_phonemes,
+                     sentence_pause, clause_pause):
+            prepared.append((text, voice, speed, sentence_pause, clause_pause))
+            return "voice-style", "all-phonemes", [
+                ("first native phrase.", 0.25),
+                ("second native phrase.", 0.0),
+            ]
+
+        def _create_batch(self, phonemes, voice_style, speed, trim, pause):
+            generated.append((phonemes, voice_style, speed, trim, pause))
+            # A slider move during inference must not alter later queued audio.
+            if len(generated) == 1:
+                eng.set_speed(1.0)
+            return np.zeros(2400, dtype=np.float32), None
+
+    eng._kokoro = FakeKokoro()
+
+    starts = []
+    eng._start_vlc_pcm_stream = (
+        lambda stream, stop_event, progress: (starts.append(stream), progress.append("started"))
+    )
+    eng._wait_vlc_stream = lambda stream, stop_event: None
+    progress = []
+    full_text = "First native phrase. Second native phrase."
+    eng._speak_local(full_text, threading.Event(), progress)
+
+    assert prepared == [(full_text, "am_michael", 2.0, 0.25, 0.1)]
+    assert [item[2] for item in generated] == [6.0, 6.0]
+    assert [item[4] for item in generated] == [0.25, 0.0]
+    assert len(starts) == 1, "local blocks opened more than one VLC stream"
+    assert progress == ["started"]
+
+
+def test_local_pcm_stream_never_delegates_speed_to_vlc():
+    """Regression: callback-backed raw PCM ignored VLC set_rate(2.1)."""
+    _install_fake_vlc()
+    eng = _engine()
+    eng._use_local = True
+    eng.set_speed(2.1)
+    player = FakeVlcPlayer(becomes_playing_after=1)
+    eng._vlc_player = player
+    eng._vlc_instance = FakeVlcInstance()
+
+    class FakeStream:
+        error = None
+
+        def read(self, size):
+            return b""
+
+    progress = []
+    eng._start_vlc_pcm_stream(FakeStream(), threading.Event(), progress)
+
+    assert player.rate == 1.0, (
+        "local PCM was handed a fake VLC speed instead of being generated at speed"
+    )
+    assert progress == ["local-neural-stream-started"]
+
+
+def test_local_pcm_is_exposed_on_its_real_sample_clock():
+    """VLC must not read 45 seconds of PCM in ~20 seconds again."""
+    from voiceassistant.tts import _PacedAudioStream
+
+    class Source:
+        error = None
+
+        def __init__(self, data):
+            self.data = bytearray(data)
+
+        def read(self, size):
+            if not self.data:
+                return b""
+            part = bytes(self.data[:size])
+            del self.data[:size]
+            return part
+
+    # 0.2 seconds of mono s16 PCM at 1 kHz = 400 bytes.
+    source = Source(b"x" * 400)
+    now = [0.0]
+
+    def wait_without_sleep(delay):
+        now[0] += delay
+        return False
+
+    paced = _PacedAudioStream(
+        source,
+        threading.Event(),
+        sample_rate=1000,
+        lead_seconds=0.02,
+        frame_seconds=0.05,
+        clock=lambda: now[0],
+        waiter=wait_without_sleep,
+    )
+    received = bytearray()
+    while True:
+        data = paced.read(256)
+        if not data:
+            break
+        received.extend(data)
+
+    assert received == b"x" * 400
+    assert 0.17 <= now[0] <= 0.25, (
+        f"0.2 seconds of PCM was exposed over {now[0]:.3f}s"
+    )
+
+
+def test_stop_interrupts_pcm_pacing_immediately():
+    from voiceassistant.tts import _PacedAudioStream
+
+    class Source:
+        error = None
+
+        def read(self, size):
+            raise AssertionError("stopped pacer reached the source")
+
+    stop_event = threading.Event()
+    stop_event.set()
+    paced = _PacedAudioStream(Source(), stop_event)
+    assert paced.read(4096) is None
+
+
+def test_local_speed_is_honestly_clamped_to_measured_ceiling():
+    from voiceassistant.tts import LOCAL_MAX_SPEED
+
+    eng = _engine()
+    eng._use_local = True
+    eng.set_speed(3.0)
+    assert eng._speed == LOCAL_MAX_SPEED == 2.6
+
+
+def test_local_high_speed_calibration_preserves_saved_2_6x():
+    from voiceassistant.tts import TTSEngine
+
+    assert TTSEngine._local_model_speed(2.1) == 2.1
+    assert TTSEngine._local_model_speed(2.6) == 6.0
 
 
 def test_neural_uses_one_protected_stream(monkeypatch):

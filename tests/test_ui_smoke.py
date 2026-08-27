@@ -35,6 +35,7 @@ def main_window(qapp, monkeypatch):
     import voiceassistant.config as cfg
     import voiceassistant.transcriber as tr
     import voiceassistant.ocr as ocr
+    import voiceassistant.tts as tts
     import voiceassistant.winapi as winapi
     from voiceassistant.window import MainWindow
 
@@ -42,6 +43,7 @@ def main_window(qapp, monkeypatch):
                         os.path.join(tempfile.mkdtemp(), "settings.json"))
     monkeypatch.setattr(tr.Transcriber, "load_model", lambda self: None)
     monkeypatch.setattr(ocr.OCREngine, "load_model", lambda self: None)
+    monkeypatch.setattr(tts.TTSEngine, "_load_kokoro", lambda self: None)
     monkeypatch.setattr(winapi, "set_start_with_windows", lambda *a, **k: True)
     monkeypatch.setattr(MainWindow, "_setup_hotkeys", lambda self: None)
     monkeypatch.setattr(MainWindow, "_setup_tray", lambda self: None)
@@ -64,6 +66,24 @@ def test_mainwindow_constructs(main_window):
     for attr in ("indicator", "text_output", "btn_record", "btn_settings",
                  "level_bar", "label_model_status", "voice_combo", "speed_slider"):
         assert hasattr(w, attr), f"missing widget: {attr}"
+
+
+def test_speed_range_matches_selected_voice_backend(main_window):
+    """Local neural exposes only rates it actually produces; online keeps 3x."""
+    w = main_window
+    assert w.voice_combo.currentData().startswith("kokoro:")
+    assert w.speed_slider.maximum() == 260
+
+    online_index = w.voice_combo.findData("en-US-AndrewNeural")
+    assert online_index >= 0
+    w.voice_combo.setCurrentIndex(online_index)
+    assert w.speed_slider.maximum() == 300
+
+    local_index = w.voice_combo.findData("kokoro:am_michael")
+    w.speed_slider.setValue(300)
+    w.voice_combo.setCurrentIndex(local_index)
+    assert w.speed_slider.maximum() == 260
+    assert w.speed_slider.value() == 260
 
 
 def test_pill_states_do_not_crash(main_window):

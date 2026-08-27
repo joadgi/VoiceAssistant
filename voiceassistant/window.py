@@ -34,7 +34,7 @@ from .selection import (
 from .settings_dialog import SettingsDialog
 from .text import clean_transcript, is_probable_hallucination
 from .transcriber import Transcriber
-from .tts import TTSEngine
+from .tts import LOCAL_MAX_SPEED, TTSEngine
 from .widgets import HotkeyCaptureWidget, RecordingIndicator
 
 
@@ -80,8 +80,8 @@ class MainWindow(QMainWindow):
             backend=self.config.get("ocr_backend", "auto"),
         )
         self.tts = TTSEngine(volume=self.config["tts_volume"])
+        self.tts.set_voice(self.config.get("tts_voice", "kokoro:am_michael"))
         self.tts.set_speed(self.config.get("tts_speed", 1.0))
-        self.tts.set_voice(self.config.get("tts_voice", "en-US-AndrewNeural"))
         self.region_selector = RegionSelector()
         self.indicator = RecordingIndicator()
         self.paster = Paster()
@@ -318,7 +318,7 @@ class MainWindow(QMainWindow):
         voices = self.tts.get_voices()
         for vid, vname in voices:
             self.voice_combo.addItem(vname, vid)
-        saved_voice = self.config.get("tts_voice", "en-US-AndrewNeural")
+        saved_voice = self.config.get("tts_voice", "kokoro:am_michael")
         idx = self.voice_combo.findData(saved_voice)
         if idx >= 0:
             self.voice_combo.setCurrentIndex(idx)
@@ -327,9 +327,10 @@ class MainWindow(QMainWindow):
         playback_lay.addSpacing(16)
         playback_lay.addWidget(QLabel("Speed:"))
 
-        initial_speed = self.config.get("tts_speed", 1.0)
+        speed_max = LOCAL_MAX_SPEED if saved_voice.startswith("kokoro:") else 3.0
+        initial_speed = min(self.config.get("tts_speed", 1.0), speed_max)
         self.speed_slider = QSlider(Qt.Orientation.Horizontal)
-        self.speed_slider.setRange(50, 300)
+        self.speed_slider.setRange(50, int(speed_max * 100))
         self.speed_slider.setValue(int(initial_speed * 100))
         self.speed_slider.setFixedWidth(200)
         self.speed_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
@@ -1189,6 +1190,15 @@ class MainWindow(QMainWindow):
         voice_id = self.voice_combo.currentData()
         if voice_id:
             self.tts.set_voice(voice_id)
+            local_voice = voice_id.startswith("kokoro:")
+            self.speed_slider.setMaximum(
+                int((LOCAL_MAX_SPEED if local_voice else 3.0) * 100)
+            )
+            self.speed_slider.setToolTip(
+                "Local neural speed is generated into the audio; changes apply to the next block."
+                if local_voice else
+                "Playback speed"
+            )
             self.config.set("tts_voice", voice_id)
             self._update_status(f"Voice: {self.voice_combo.currentText()}")
 
@@ -1196,7 +1206,7 @@ class MainWindow(QMainWindow):
     def _on_speed_change(self, value):
         speed = value / 100.0
         self.speed_label.setText(f"{speed:.2f}x")
-        self.tts.set_speed(speed)  # live change via VLC!
+        self.tts.set_speed(speed)
         # defer_save: the slider fires per tick — one disk write per pixel of
         # drag was a real I/O storm. Flushed on sliderReleased + closeEvent.
         self.config.set("tts_speed", speed, defer_save=True)
