@@ -14,7 +14,7 @@ SAPI locally.
 - **Floating desktop pill** — an always-visible indicator (drag it anywhere) that shows Ready / Recording / Transcribing / Pasted, and can be **clicked to start and stop** dictation without a hotkey.
 - **Read highlighted text aloud** — highlight text in any app and hear it through a local neural voice, with optional Microsoft online and Windows SAPI choices.
 - **OCR at cursor** — capture on-screen text from images, PDFs, error dialogs, or anything else you can't select, and have it read aloud.
-- **Fast local speed control** — local neural audio is generated at a calibrated 0.5x–2.6x, so the displayed rate tracks the rate actually played. One speed is fixed for each press of Speak; the Voice and Speed controls lock during that read, then slider changes apply to the next read.
+- **Fast local speed control** — Michael and the other local voices generate at an intelligible rate, then pitch-preserving tempo compression supplies playback from 0.5x–2.6x. One speed is fixed for each press of Speak; the Voice and Speed controls lock during that read, then slider changes apply to the next read.
 - **Local and online neural voices** — Michael, Adam, Eric, Liam, Heart, and Sarah run locally; Microsoft voices remain available as clearly marked online choices.
 - **Fully customizable hotkeys** — every hotkey (Dictate, Read, OCR) is yours to change: click any hotkey pill on the main window, then press a **single key (like F9), a combo, or even a modifier-only combo (like Ctrl+Alt)** for push-to-talk. Nothing is hardcoded. (The `Fn` key can't be bound — it's handled in keyboard firmware and never reaches Windows.)
 - **Local Whisper transcription** — `faster-whisper` on NVIDIA GPU (CUDA) with CPU fallback.
@@ -202,6 +202,7 @@ your transcribed text.**
 | It reads in the robotic Windows voice, not the one I picked | A neural voice is never switched into SAPI automatically. Windows SAPI speaks only when you explicitly choose an **[Offline]** voice. |
 | Stop doesn't stop the reading | Current builds wake the local stream callback, cancel an active online request, stop VLC, and purge explicitly selected SAPI speech. A stale selection result cannot restart speech. |
 | Read-aloud pauses, catches up, skips sections, or reports `playback buffer ran dry` | Select a **[Local Neural]** voice. The full selection is phonemized once, Kokoro's native punctuation-aware batches retain their sentence pauses, and one fixed speed feeds one continuous VLC stream. The raw PCM callback is clock-paced so VLC cannot read ahead to EOF and mark a still-audible passage complete. |
+| Read-aloud says "backslash," reads a file path, or produces nonsense from a source link | Current builds convert Markdown source to its visible words before synthesis: escaped list markers are removed and `[label](path)` speaks only `label`. |
 | Read-aloud reads the wrong text (e.g. a browser address bar) | That app doesn't expose its selection properly. Re-select the text and try again; it will fall back to copy or OCR. |
 | The `Fn` key won't bind | It can't. `Fn` is handled inside your keyboard's firmware and never reaches Windows, so no software can see it. Use `F9` or similar. |
 | A hotkey fires in the browser too | Some defaults collide (`Ctrl+Shift+T` reopens a closed tab). Click the hotkey pill and rebind it. |

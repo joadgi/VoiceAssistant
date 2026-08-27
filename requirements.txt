@@ -18,6 +18,9 @@ kokoro-onnx==0.6.1
 # Keep Kokoro on CPU. The GPU wheel available during validation required CUDA
 # 13, while Whisper intentionally uses the CUDA 12 runtime on this machine.
 onnxruntime==1.24.4
+# Used directly for FFmpeg's pitch-preserving `atempo` filter. faster-whisper
+# also depends on PyAV, but list it explicitly because local TTS now imports it.
+av>=14.0.0
 edge-tts>=7.0.0
 python-vlc>=3.0.0
 

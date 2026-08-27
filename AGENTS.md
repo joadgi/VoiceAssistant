@@ -90,8 +90,9 @@ text shown and auto-spoken.
 Kokoro's native punctuation-aware batches through the TTS `SerialWorker`. The first
 batch starts one raw 24 kHz PCM VLC callback stream; later batches fill the same stream
 faster than playback consumes them while retaining Kokoro's sentence/clause pauses.
-Speed is snapshotted once per Speak and mapped to a calibrated Kokoro model input
-(0.5x–2.6x), not VLC `set_rate`; slider changes apply to the next read. Optional online voices use
+Speed is snapshotted once per Speak. Kokoro generates at no more than a quality-safe
+1.2x; PyAV/FFmpeg `atempo` supplies higher speeds up to 2.6x without changing pitch.
+VLC `set_rate` is not used; slider changes apply to the next read. Optional online voices use
 one `edge-tts.Communicate` generator and one buffered VLC stream. LibVLC's native
 callback consumes either stream, so there is no extra Python producer thread. A neural
 selection never changes into SAPI; `pyttsx3` runs only when explicitly selected.
@@ -234,13 +235,21 @@ selection never changes into SAPI; `pyttsx3` runs only when explicitly selected.
   now phonemized once, native batch pauses are preserved, and the requested speed is
   snapshotted when Speak starts. A slider change deliberately applies to the next read;
   the Playback controls make this visible and lock Voice/Speed during a local read.
-- **Never use VLC `set_rate()` for the local raw PCM stream.** VLC returned success for
-  `set_rate(2.1)` but live wall time stayed at 1.0x. Kokoro receives the requested rate
-  instead; the sample count itself becomes shorter. Because the model input becomes
-  nonlinear above 2.1, the app uses measured interpolation points; a long calibration
-  passage at the saved **2.6x** setting produced an effective **2.599x** duration ratio.
-  The model plateaus beyond that point, so local voices honestly cap the UI at **2.6x**. The callback player stays
-  at 1.0x to prevent both a fake-speed regression and future double speed.
+- **Strip source markup before phonemization.** Read-aloud can receive Markdown source,
+  not rendered prose. On the user's exact report excerpt, eSpeak literally phonemized
+  `1\.` and every `\-` bullet as "backslash," then pronounced the hidden local path in
+  `[label](<C:/...>)` as invented words. `prepare_text_for_speech` keeps visible labels
+  and prose, removes Markdown escapes/link targets, and punctuates list items. Logs may
+  record input/spoken character counts, never either payload.
+- **High playback speed comes from pitch-preserving tempo compression, not high-rate
+  Kokoro generation.** On the same 919-character excerpt, local Whisper recovered
+  **99.1%** of words from Michael at model input 1.0 but only **84.0%** at 1.98; the
+  generated audio contained mutations such as "combo-owner" and "fitter consequence."
+  Generating at model input **1.2** and applying PyAV/FFmpeg `atempo` to the requested
+  **1.98x** restored **99.1%** recovery. Higher requested rates use that same quality-safe
+  model input. Tempo filtering runs synchronously on the TTS worker per native batch;
+  no subprocess or Python thread is added. Never use VLC `set_rate()` here: VLC returned
+  success for `2.1` on the raw callback stream but live wall time stayed at 1.0x.
 - **Pace raw PCM reads to the sample clock.** VLC's raw-audio demux reads callback
   streams aggressively. On the user's exact 941-character passage, Kokoro produced
   **44.959 s** of ordered PCM but VLC reached `Ended` after **20.250 s**. That made the

@@ -32,7 +32,9 @@ overlap the next utterance.
 
 import asyncio
 import collections
+import html
 import os
+import re
 import shutil
 import tempfile
 import threading
@@ -88,22 +90,14 @@ KOKORO_VOICES_PATH = os.path.join(
 )
 LOCAL_PCM_SAMPLE_RATE = 24_000
 LOCAL_MAX_SPEED = 2.6
-
-# The Kokoro v1.0 model's rate input becomes nonlinear above ~2.1. These
-# points were calibrated from produced sample counts on a punctuation-bearing
-# 444-character passage. Interpolation keeps the UI multiplier tied to actual
-# duration rather than displaying the raw model input. The model plateaus near
-# 2.6x even when its input is raised further, which is why LOCAL_MAX_SPEED is
-# an honest 2.6 instead of the old fake 3.0.
-_LOCAL_SPEED_CALIBRATION = (
-    (0.5, 0.5),
-    (2.1, 2.1),
-    (2.2, 2.42),
-    (2.3, 2.76),
-    (2.4, 3.18),
-    (2.5, 4.0),
-    (2.6, 6.0),
-)
+# Kokoro starts mutating or swallowing words when it is asked to *generate*
+# close to 2x. On the user's exact 919-character report excerpt, a local
+# Whisper audit recovered 99.1% of words at model input 1.0, but only 84.0% at
+# 1.98. Model input 1.2 followed by FFmpeg's pitch-preserving atempo filter at
+# an effective 1.98x recovered 99.1%. The model's measured duration multiplier
+# at input 1.2 is about 1.15 once punctuation pauses are included.
+LOCAL_QUALITY_MODEL_SPEED = 1.2
+LOCAL_QUALITY_EFFECTIVE_SPEED = 1.15
 
 
 def _neural_meta():
@@ -123,6 +117,74 @@ def _neural_meta():
 NEURAL_META = _neural_meta()
 
 BASE_RATE_WPM = 175  # SAPI/offline base words-per-minute; scaled by _speed
+
+
+_MARKDOWN_LINK_RE = re.compile(
+    r"!?\[([^\]]*)\]\(\s*(?:<[^>]*>|[^)\r\n]*)\s*\)"
+)
+_MARKDOWN_ESCAPE_RE = re.compile(r"\\([\\`*_{}\[\]()#+\-.!>])")
+_MARKDOWN_NUMBERED_ITEM_RE = re.compile(r"^(\d+)[.)]\s+(.*)$")
+_MARKDOWN_BULLET_RE = re.compile(r"^[-*+]\s+(.*)$")
+
+
+def prepare_text_for_speech(text):
+    """Return the words a rendered Markdown selection visibly represents.
+
+    Read-aloud receives selections from browsers, editors, and generated reports.
+    Those selections can contain Markdown source such as ``1\\.``, ``\\-`` and
+    ``[label](<C:/private/path>)``. Passing that source straight to eSpeak made
+    Kokoro literally say "backslash" before list items and pronounce the hidden
+    link destination as invented syllables. This boundary keeps the visible label
+    and prose while removing formatting that is not part of the spoken content.
+
+    It deliberately does not rewrite ordinary punctuation, acronyms, numbers, or
+    hyphenated words; those remain the selected voice's pronunciation decision.
+    """
+    if not text:
+        return ""
+
+    normalized = html.unescape(str(text)).replace("\r\n", "\n").replace("\r", "\n")
+    normalized = _MARKDOWN_LINK_RE.sub(lambda match: match.group(1), normalized)
+    normalized = _MARKDOWN_ESCAPE_RE.sub(r"\1", normalized)
+
+    spoken_lines = []
+    for raw_line in normalized.split("\n"):
+        line = raw_line.strip()
+        if line.startswith("```"):
+            continue
+        if not line:
+            if spoken_lines and spoken_lines[-1] != "":
+                spoken_lines.append("")
+            continue
+
+        line = re.sub(r"^#{1,6}\s+", "", line)
+        line = re.sub(r"^>\s?", "", line)
+        if re.fullmatch(r"[-*_]{3,}", line):
+            continue
+
+        numbered = _MARKDOWN_NUMBERED_ITEM_RE.match(line)
+        bullet = _MARKDOWN_BULLET_RE.match(line)
+        if numbered:
+            content = numbered.group(2).strip()
+            if content and content[-1] not in ".!?;:":
+                content += "."
+            line = f"{numbered.group(1)}. {content}"
+        elif bullet:
+            line = bullet.group(1).strip()
+            if line and line[-1] not in ".!?;:":
+                line += "."
+
+        # Formatting delimiters are visual, not words. The boundary-aware
+        # patterns preserve underscores/asterisks inside identifiers.
+        line = line.replace("`", "")
+        line = re.sub(r"(\*\*|__)(.+?)\1", r"\2", line)
+        line = re.sub(r"(?<!\w)[*_](?=\S)|(?<=\S)[*_](?!\w)", "", line)
+        if line:
+            spoken_lines.append(line)
+
+    while spoken_lines and spoken_lines[-1] == "":
+        spoken_lines.pop()
+    return "\n".join(spoken_lines).strip()
 EDGE_MP3_BYTES_PER_SECOND = 6000  # edge-tts output is 48 kbps CBR MP3
 
 
@@ -456,10 +518,12 @@ class TTSEngine(QObject):
     def set_speed(self, speed):
         """Set the requested speech-rate multiplier.
 
-        Local neural audio is synthesized at this calibrated rate. VLC's rate control is
-        intentionally not used for its raw PCM callback stream: live testing
-        proved that VLC accepted ``set_rate(2.1)`` but still played that stream
-        at 1.0x. A local change therefore affects the next read.
+        Local neural audio is synthesized at a quality-safe model rate, then
+        pitch-preserving tempo compression supplies higher requested speeds.
+        VLC's rate control is intentionally not used for its raw PCM callback
+        stream: live testing proved that VLC accepted ``set_rate(2.1)`` but
+        still played that stream at 1.0x. A local change therefore affects the
+        next read.
         Online MP3 and explicit SAPI voices retain their live backend control.
         """
         max_speed = LOCAL_MAX_SPEED if self._use_local else 3.0
@@ -497,14 +561,20 @@ class TTSEngine(QObject):
         new utterance plays — callers wanting toggle behavior check
         is_speaking themselves (the old embedded toggle silently DROPPED a
         new OCR capture while busy)."""
-        if not text.strip():
+        spoken_text = prepare_text_for_speech(text)
+        if not spoken_text:
             return
+        if spoken_text != text:
+            applog.dbg(
+                "TTS display markup normalized "
+                f"(input_chars={len(text)}, spoken_chars={len(spoken_text)})"
+            )
         self.stop()  # no-op when idle
         self._gen += 1
         stop_event = threading.Event()
         self._active_stop = stop_event
         self._speaking = True
-        self._worker.submit(self._speak_job, text, self._gen, stop_event)
+        self._worker.submit(self._speak_job, spoken_text, self._gen, stop_event)
 
     def stop(self):
         """Stop the current utterance immediately.
@@ -660,20 +730,12 @@ class TTSEngine(QObject):
 
     @staticmethod
     def _create_local_audio(engine, text, voice, speed):
-        """Create Kokoro audio with the supplied raw model-speed input.
-
-        kokoro-onnx 0.6.1's public wrapper rejects values above 2.0 even
-        though the v1.0 ONNX model accepts the calibrated high-rate inputs. Preparation is
-        independent of speed, so it is performed through the package helper
-        at its documented ceiling and the prepared batches are inferred at
-        the calibrated high-rate range. requirements.txt pins the package version
-        because these two helpers are intentionally private.
-        """
-        preparation_speed = min(float(speed), 2.0)
+        """Create intelligible Kokoro audio at the requested playback speed."""
+        model_speed, tempo_factor = TTSEngine._local_speed_plan(speed)
         voice_style, _phonemes, batches = engine._prepare(
             text,
             voice,
-            preparation_speed,
+            model_speed,
             "en-us",
             False,
             0.25,
@@ -682,24 +744,69 @@ class TTSEngine(QObject):
         audio, _timings = engine._create_batches(
             batches,
             voice_style,
-            float(speed),
+            model_speed,
             True,
         )
+        audio = TTSEngine._time_stretch_local_audio(audio, tempo_factor)
         return audio, LOCAL_PCM_SAMPLE_RATE
 
     @staticmethod
-    def _local_model_speed(requested_speed):
-        """Map the user-facing duration multiplier to Kokoro's nonlinear input."""
+    def _local_speed_plan(requested_speed):
+        """Return ``(safe Kokoro input, pitch-preserving tempo factor)``."""
         requested = max(0.5, min(LOCAL_MAX_SPEED, float(requested_speed)))
-        points = _LOCAL_SPEED_CALIBRATION
-        for (left_rate, left_input), (right_rate, right_input) in zip(
-            points, points[1:]
-        ):
-            if requested <= right_rate:
-                span = right_rate - left_rate
-                fraction = (requested - left_rate) / span
-                return left_input + fraction * (right_input - left_input)
-        return points[-1][1]
+        if requested <= LOCAL_QUALITY_MODEL_SPEED:
+            return requested, 1.0
+        return (
+            LOCAL_QUALITY_MODEL_SPEED,
+            requested / LOCAL_QUALITY_EFFECTIVE_SPEED,
+        )
+
+    @staticmethod
+    def _time_stretch_local_audio(samples, tempo_factor):
+        """Tempo-compress mono float PCM with FFmpeg while preserving pitch.
+
+        PyAV is already a faster-whisper dependency. This runs synchronously on
+        the one TTS SerialWorker and creates no process or Python thread.
+        """
+        import av
+        import numpy as np
+        from fractions import Fraction
+
+        audio = np.asarray(samples, dtype=np.float32).reshape(-1)
+        if audio.size == 0 or tempo_factor <= 1.001:
+            return audio
+
+        frame = av.AudioFrame.from_ndarray(
+            audio.reshape(1, -1), format="flt", layout="mono"
+        )
+        frame.sample_rate = LOCAL_PCM_SAMPLE_RATE
+        frame.time_base = Fraction(1, LOCAL_PCM_SAMPLE_RATE)
+
+        graph = av.filter.Graph()
+        source = graph.add_abuffer(
+            sample_rate=LOCAL_PCM_SAMPLE_RATE,
+            format="flt",
+            layout="mono",
+            channels=1,
+            time_base=Fraction(1, LOCAL_PCM_SAMPLE_RATE),
+        )
+        tempo = graph.add("atempo", f"{tempo_factor:.6f}")
+        sink = graph.add("abuffersink")
+        source.link_to(tempo)
+        tempo.link_to(sink)
+        graph.configure()
+        source.push(frame)
+        source.push(None)
+
+        output = []
+        while True:
+            try:
+                output.append(sink.pull().to_ndarray().reshape(-1))
+            except (BlockingIOError, EOFError):
+                break
+        if not output:
+            raise RuntimeError("Local speech tempo filter returned no audio")
+        return np.concatenate(output).astype(np.float32, copy=False)
 
     def _speak_local(self, text, stop_event, progress):
         """Synthesize local neural PCM ahead of one continuous VLC stream.
@@ -721,12 +828,11 @@ class TTSEngine(QObject):
         engine = self._load_kokoro()
         started_at = time.monotonic()
         requested_speed = min(self._speed, LOCAL_MAX_SPEED)
-        model_speed = self._local_model_speed(requested_speed)
-        preparation_speed = min(model_speed, 2.0)
+        model_speed, tempo_factor = self._local_speed_plan(requested_speed)
         voice_style, _phonemes, batches = engine._prepare(
             text,
             self._local_voice_id,
-            preparation_speed,
+            model_speed,
             "en-us",
             False,
             0.25,
@@ -753,6 +859,7 @@ class TTSEngine(QObject):
                     True,
                     pause_after,
                 )
+                samples = self._time_stretch_local_audio(samples, tempo_factor)
                 pcm = (
                     np.clip(np.asarray(samples).reshape(-1), -1.0, 1.0)
                     * 32767.0
@@ -761,6 +868,7 @@ class TTSEngine(QObject):
                     "local neural block ready "
                     f"(block={index + 1}/{len(batches)}, phonemes={len(phonemes)}, "
                     f"requested={requested_speed:.2f}x, model_input={model_speed:.2f}, "
+                    f"tempo={tempo_factor:.2f}x, "
                     f"pause={pause_after:.2f}s, "
                     f"audio={len(pcm) / 2 / LOCAL_PCM_SAMPLE_RATE:.2f}s, "
                     f"synth={time.monotonic() - synth_started:.2f}s)"
