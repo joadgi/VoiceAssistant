@@ -358,6 +358,16 @@ def test_spoken_text_preserves_normal_hyphens_acronyms_and_identifiers():
     assert prepare_text_for_speech(source) == source
 
 
+def test_spoken_text_makes_amazon_identifiers_and_prices_unambiguous():
+    from voiceassistant.tts import prepare_text_for_speech
+
+    source = "Parent ASINs include ASIN B0CPMP4CVQ and SKU SHOE_55 at $69.99."
+    assert prepare_text_for_speech(source) == (
+        "Parent A-sin identifiers include A-sin B 0 C P M P 4 C V Q and skew SHOE_55 "
+        "at 69 dollars and 99 cents."
+    )
+
+
 def test_speak_submits_normalized_text_without_logging_payload():
     eng = _engine()
     submitted = []

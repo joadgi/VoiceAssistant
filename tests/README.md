@@ -6,6 +6,8 @@
 |---|---|---|
 | `test_characterization.py` | Pure logic: repeat-collapse, paste sanitizing, light cleanup, hotkey normalize/validate (the **dynamic-hotkey contract**), config persistence | <1s |
 | `test_tts_stall.py` | TTS network-stall regression: stall → offline fallback, `stop()` unwedges, fast-fail path intact | ~20s |
+| `test_tts_eval.py` + `tts_eval_runner.py` | **Local read-aloud corpus gate**: real Kokoro PCM → local Whisper word audit, speed/duration checks, repeatability, all local voices | model-loading, opt-in |
+| `integration/test_tts_stress_live.py` | Muted real-VLC completion, repeated Stop, and replace-active stress | ~1–2 min, opt-in |
 | `corpus_runner.py` | **Golden-audio corpus**: drives the real Whisper pipeline (gate → VAD pass → no-VAD retry → cleanup) over `fixtures/audio/*.wav` | ~1 min (GPU) |
 | `generate_fixtures.py` | Regenerates the corpus WAVs (offline SAPI speech + programmatic silence/noise at controlled levels) | ~30s |
 
@@ -17,6 +19,25 @@ venv\Scripts\python.exe tests\generate_fixtures.py   # (re)create WAV fixtures
 venv\Scripts\python.exe tests\corpus_runner.py       # run corpus, print results
 venv\Scripts\python.exe tests\corpus_runner.py baseline  # rewrite baseline.json
 ```
+
+## Read-aloud release gate
+
+Run this before calling a TTS change fixed. It is local and private: it uses the
+installed Kokoro model, a cached local Whisper model, and muted VLC playback.
+It does not call Microsoft or play audible speech.
+
+```powershell
+$env:RUN_TTS_EVAL="1"
+venv\Scripts\python.exe -m pytest tests/test_tts_eval.py tests/integration/test_tts_stress_live.py -v -s
+Remove-Item Env:RUN_TTS_EVAL
+```
+
+The gate repeats the original Markdown/path regression passage three times at
+1.98x, audits ordered word fidelity, checks the duration and word recovery at
+1.0x/1.5x/1.98x/2.6x, renders a long native multi-batch selection, smoke-tests
+all bundled local voices, then drives the real PCM callback through VLC at zero
+volume. A failure is a release blocker; do not replace it with a claim that the
+audio merely “sounds fine.” Set `TTS_EVAL_REPEATS` higher for an overnight run.
 
 ## Corpus design
 

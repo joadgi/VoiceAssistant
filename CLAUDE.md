@@ -235,6 +235,11 @@ selection never changes into SAPI; `pyttsx3` runs only when explicitly selected.
   now phonemized once, native batch pauses are preserved, and the requested speed is
   snapshotted when Speak starts. A slider change deliberately applies to the next read;
   the Playback controls make this visible and lock Voice/Speed during a local read.
+- **Normalize ambiguous domain syntax before phonemization.** Amazon terms need
+  deterministic spoken forms — `ASIN`/`SKU`, mixed
+  letter-number identifiers, and dollar prices are expanded before synthesis because
+  the raw phonemizer otherwise drops plurals, invents identifier syllables, and reads
+  `$69.99` without clear dollar/cents units. Ordinary prose and years stay unchanged.
 - **Strip source markup before phonemization.** Read-aloud can receive Markdown source,
   not rendered prose. On the user's exact report excerpt, eSpeak literally phonemized
   `1\.` and every `\-` bullet as "backslash," then pronounced the hidden local path in
@@ -406,6 +411,9 @@ All are editable inline — click a hotkey pill and press your combo (single key
 - **Before ANY behavior change:** run `pytest tests -q` (fast suites) and, for anything
   touching the dictation pipeline, `RUN_CORPUS=1 pytest tests/test_corpus_gate.py`
   (the golden-audio gate — the objective definition of "dictation still works").
+  For anything touching read-aloud, also run
+  `RUN_TTS_EVAL=1 pytest tests/test_tts_eval.py tests/integration/test_tts_stress_live.py -v -s`;
+  it is the objective word-fidelity, speed, voice, VLC, Stop, and replacement gate.
   Validate a NON-default model with `CORPUS_MODEL=<name>` (the gate used to only ever
   test `DEFAULTS['whisper_model']`, so it could not vet what the user actually runs).
 - **The chain test:** `RUN_E2E=1 pytest tests/integration/test_end_to_end_live.py -s`

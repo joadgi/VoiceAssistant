@@ -125,6 +125,28 @@ _MARKDOWN_LINK_RE = re.compile(
 _MARKDOWN_ESCAPE_RE = re.compile(r"\\([\\`*_{}\[\]()#+\-.!>])")
 _MARKDOWN_NUMBERED_ITEM_RE = re.compile(r"^(\d+)[.)]\s+(.*)$")
 _MARKDOWN_BULLET_RE = re.compile(r"^[-*+]\s+(.*)$")
+_CURRENCY_RE = re.compile(r"\$\s*(\d[\d,]*)(?:\.(\d{2}))?")
+_ALPHANUMERIC_ID_RE = re.compile(
+    r"\b(?=[A-Z0-9]*[A-Z])(?=[A-Z0-9]*\d)[A-Z0-9]{4,}\b"
+)
+
+
+def _speak_currency(match):
+    """Turn a display price into words with unambiguous units."""
+    dollars = int(match.group(1).replace(",", ""))
+    cents_text = match.group(2)
+    cents = int(cents_text) if cents_text is not None else None
+    parts = []
+    if dollars or cents in (None, 0):
+        parts.append(f"{dollars} {'dollar' if dollars == 1 else 'dollars'}")
+    if cents:
+        parts.append(f"{cents} {'cent' if cents == 1 else 'cents'}")
+    return " and ".join(parts)
+
+
+def _spell_identifier(match):
+    """Keep an ASIN-like identifier intelligible instead of inventing a word."""
+    return " ".join(match.group(0))
 
 
 def prepare_text_for_speech(text):
@@ -137,8 +159,10 @@ def prepare_text_for_speech(text):
     link destination as invented syllables. This boundary keeps the visible label
     and prose while removing formatting that is not part of the spoken content.
 
-    It deliberately does not rewrite ordinary punctuation, acronyms, numbers, or
-    hyphenated words; those remain the selected voice's pronunciation decision.
+    It also expands the few machine-readable forms that eSpeak/Kokoro is known
+    to mispronounce: Amazon ASIN/SKU terms, mixed letter-number identifiers, and
+    dollar prices. Ordinary prose, punctuation, years, and hyphenated words are
+    otherwise left to the selected voice.
     """
     if not text:
         return ""
@@ -146,6 +170,14 @@ def prepare_text_for_speech(text):
     normalized = html.unescape(str(text)).replace("\r\n", "\n").replace("\r", "\n")
     normalized = _MARKDOWN_LINK_RE.sub(lambda match: match.group(1), normalized)
     normalized = _MARKDOWN_ESCAPE_RE.sub(r"\1", normalized)
+    normalized = _CURRENCY_RE.sub(_speak_currency, normalized)
+    normalized = _ALPHANUMERIC_ID_RE.sub(_spell_identifier, normalized)
+    # These are standard spoken forms in the Amazon workflow. Raw eSpeak turns
+    # ASINs into singular "assin" and a bare SKU into letter fragments.
+    normalized = re.sub(r"\bASINs\b", "A-sin identifiers", normalized)
+    normalized = re.sub(r"\bASIN\b", "A-sin", normalized)
+    normalized = re.sub(r"\bSKUs\b", "skews", normalized)
+    normalized = re.sub(r"\bSKU\b", "skew", normalized)
 
     spoken_lines = []
     for raw_line in normalized.split("\n"):
