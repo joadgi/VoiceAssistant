@@ -60,7 +60,7 @@ run.bat/shortcuts/startup-registry compatibility.
 | `voiceassistant/metrics.py` | Per-dictation metrics (JSONL, rolling, **never text**) + `--report` summary. |
 | `voiceassistant/applog.py` | Privacy-safe rotating log (never logs payloads), opt-in debug, excepthooks + faulthandler. |
 | `voiceassistant/selfcheck.py` | `python main.py --check` — no-GUI health probe (mic, hotkeys, CUDA, OCR, VLC, TTS). |
-| `tests/` | Characterization + fault-injection suites (fast), the TTS stop/voice regression suite, and the golden-audio corpus gate (local, `RUN_CORPUS=1`). |
+| `tests/` | Characterization + fault-injection suites (fast), the keyboard-safety suite (`test_keyboard_safety.py` — modifier passthrough, checked input batches, stale-key reconciliation), the source-encoding gate (`test_source_encoding.py`), the TTS stop/voice regression suite, and the golden-audio corpus gate (local, `RUN_CORPUS=1`). |
 | `setup.bat` / `run.bat` / `create_shortcut.bat` | Env setup, silent launch (pythonw), desktop shortcut. |
 | `uninstall.bat` | Removes the HKCU startup value, desktop shortcut, venv + local runtime files, and (after confirming) the `models--Systran--faster-whisper-*` HF cache dirs. Scoped by glob so unrelated HF models survive. Cannot delete its own folder — tells the user. |
 
@@ -186,6 +186,50 @@ selection never changes into SAPI; `pyttsx3` runs only when explicitly selected.
   state would incorrectly end recording. Those bindings retain hook-event
   state and the recording-duration cap. They are not independently protected
   against a completely lost raw key-up; do not claim otherwise.
+- **A hook's own cached key state is NOT evidence that a key is held**
+  (`read_hotkey.py` `_reconcile`). This is the half of the 2026-09-09 Ctrl fix
+  that was missed: that commit stopped the app *sending* keystrokes while a
+  modifier is held, but `ReadHotkey` still *believed* a stale cached one, because
+  a hook only knows the events it is delivered. One dropped key-up latched a
+  modifier forever with no recovery short of a restart. Measured with the shipped
+  `ctrl+alt` chord: after a lost Ctrl key-up **every later Alt press fired
+  read-aloud**, so Alt+Tab read the selection; with a normal trigger the same
+  stale modifier **also swallowed the keystroke** (a plain `M` fired read-aloud
+  and never reached the document); and if every combo key latches, `active` never
+  goes false, so `_latched` never resets and read-aloud goes **silently dead**.
+  The held set is now reconciled against Windows' accepted state on every event.
+  Two exclusions carry the correctness, do not remove either:
+  - **The current event's own key is never checked.** A low-level hook runs
+    BEFORE the event reaches the rest of the system, so that state can still read
+    "up" for the key being delivered. Checking it drops the key just received and
+    breaks every chord.
+  - **Modifiers only.** A key this matcher CONSUMED never reaches Windows'
+    accepted state, so that state cannot judge it — the same boundary as the PTT
+    watchdog above. `MapVirtualKeyW` is also untrustworthy for some codes
+    `keyboard` enumerates (measured: ctrl's `57629` → VK_PAUSE, the Windows key's
+    `91`/`92` → `0xF1`/`0xEA`, scroll lock's `57414` → VK_CANCEL), so the probe
+    maps first and then requires a known modifier VK.
+  `_blocked` is deliberately untouched — that is what keeps a consumed down/up
+  pair matched when a modifier is reconciled away between the two edges. The
+  probe is INJECTED, not imported, so the module still makes no Windows calls of
+  its own and stays hermetically testable, and it fails **open**: a probe error
+  falls back to cached state rather than cutting a genuine hold short. Cost over
+  20,000 events: **0.9 µs** median with nothing held (the probe is skipped
+  outright), **32 µs** median / **1.07 ms** worst case with three modifiers
+  cached, against a `LowLevelHooksTimeout` budget of ~300 ms.
+- **A dropped hook is a KNOWN, UNMITIGATED failure mode — do not claim
+  otherwise.** `keyboard`'s listener is a bare `GetMessage` pump
+  (`_winkeyboard.listen`) with no hook-health check and no re-registration, so if
+  Windows unhooks it (LowLevelHooksTimeout, UAC, secure desktop) **every** hotkey
+  dies silently until restart. An auto-recovering watchdog was designed and
+  deliberately NOT built: the only hook-independent liveness signal is
+  `GetLastInputInfo`, which counts mouse input too, so "system input recent but
+  our hook silent" cannot be distinguished from a user who moused for minutes
+  without typing — acting on it would re-register hooks in the input path
+  spuriously. Probing liveness directly would mean injecting a key into the
+  user's focused window, which is the exact bug class the 2026-09-09/09-10 work
+  removed. 292 logged hotkey presses show no instance of it here, so it stays
+  documented rather than mitigated. Revisit only with log evidence.
 - **The model loads from the CACHE first** (`Transcriber._open_model`). faster-whisper
   otherwise revalidates against huggingface.co on EVERY launch: measured **176.3 s vs
   7.0 s** for an already-cached `large-v3`, i.e. ~3 minutes after each boot where the
@@ -441,6 +485,12 @@ All are editable inline — click a hotkey pill and press your combo (single key
   threads). **Read-aloud watchpoints:** no blocking speak-until-finished call on
   ANY TTS backend, the VLC warm-up's stop check, the neural voice id never
   reaching SAPI, and truncate-don't-re-read on a mid-utterance failure.
+  **Keyboard watchpoints:** modifiers are never suppressed or replayed; only a
+  matched non-modifier down/up PAIR may be consumed; hook callbacks must return
+  falsy to suppress (a Qt `Signal.emit()` returns `True`); `ReadHotkey._reconcile`
+  keeps its two exclusions (current key exempt, modifiers only) and fails open;
+  injected input stays one checked `SendInput` batch whose failure path releases
+  only and never repeats the action.
   **Capture-path watchpoints:** the always-open stream + pre-roll (never
   reintroduce per-recording stream opens), the audio callback staying signal-free, the
   three-way recorder teardown (weakref `atexit` — a strong ref defeats `__del__` and
