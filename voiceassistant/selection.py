@@ -23,7 +23,6 @@ this module simply reports that it found nothing and lets the caller escalate.
 
 import time
 
-import keyboard as kb
 import pyperclip
 
 from . import applog, uia, winapi

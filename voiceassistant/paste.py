@@ -9,7 +9,6 @@ snapshot/restore logic is thread-confined and race-free by construction.
 
 import time
 
-import keyboard as kb
 import pyperclip
 
 from . import applog, winapi

@@ -47,7 +47,6 @@ def env(monkeypatch):
     esc = {"n": 0}
     monkeypatch.setattr(sel_mod, "pyperclip", clip)
     monkeypatch.setattr(sel_mod.time, "sleep", lambda *_a, **_k: None)
-    monkeypatch.setattr(sel_mod.kb, "is_pressed", lambda *_a, **_k: False)
     focus = [None]
     monkeypatch.setattr(sel_mod.winapi, "wait_for_modifiers_released", lambda timeout: True)
     monkeypatch.setattr(sel_mod.winapi, "get_foreground_window", lambda: focus[0])
@@ -197,7 +196,6 @@ def test_capture_via_worker_invokes_callback(monkeypatch):
     clip = _FakeClip("ORIG")
     monkeypatch.setattr(sel_mod, "pyperclip", clip)
     monkeypatch.setattr(sel_mod.time, "sleep", lambda *_a, **_k: None)
-    monkeypatch.setattr(sel_mod.kb, "is_pressed", lambda *_a, **_k: False)
     focus = [None]
     monkeypatch.setattr(sel_mod.winapi, "wait_for_modifiers_released", lambda timeout: True)
     monkeypatch.setattr(sel_mod.winapi, "get_foreground_window", lambda: focus[0])
