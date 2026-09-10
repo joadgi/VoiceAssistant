@@ -1,4 +1,4 @@
-"""ALL Win32/ctypes calls live in this module â€” nothing else touches ctypes.
+"""ALL Win32/ctypes calls live in this module — nothing else touches ctypes.
 
 Keeping the platform surface in one file makes every other module mockable
 and gives Win32 changes exactly one place to break.
@@ -18,7 +18,7 @@ kernel32 = ctypes.windll.kernel32
 
 # Declare handle-returning functions as pointer-width. Without this, ctypes
 # defaults their return to C int and SIGN-TRUNCATES HWNDs to 32 bits on 64-bit
-# Windows â€” so a handle from GetForegroundWindow() could never compare equal to
+# Windows — so a handle from GetForegroundWindow() could never compare equal to
 # a full-width handle from Qt's winId(), silently breaking the is-own-window /
 # focus checks. (Found by the live paste test.)
 user32.GetForegroundWindow.restype = wintypes.HWND
@@ -53,7 +53,7 @@ def get_cursor_pos():
     """Cursor position in PHYSICAL screen pixels.
 
     Qt6 makes the process per-monitor DPI aware, so GetCursorPos returns true
-    physical coordinates â€” the same space mss captures in. Qt's own
+    physical coordinates — the same space mss captures in. Qt's own
     QCursor.pos() is in LOGICAL (scaled) coordinates and was the reason OCR
     grabbed the wrong region on 125%/150% displays.
     """
@@ -63,7 +63,7 @@ def get_cursor_pos():
 
 
 # Window classes that treat Ctrl+C as INTERRUPT rather than copy. Sending our
-# synthetic Ctrl+C into one of these kills whatever command is running â€” a real
+# synthetic Ctrl+C into one of these kills whatever command is running — a real
 # data-loss hazard, and read-aloud used to do it unconditionally.
 CONSOLE_WINDOW_CLASSES = {
     "consolewindowclass",              # conhost (cmd, classic PowerShell)
@@ -107,7 +107,7 @@ def set_foreground_window(hwnd):
     refused (returns without effect) when the calling process isn't the
     current foreground process. If we don't verify, the caller believes it
     refocused the target and pastes Ctrl+V into whatever window is REALLY in
-    front â€” silently mis-delivering the user's dictation. So we confirm
+    front — silently mis-delivering the user's dictation. So we confirm
     GetForegroundWindow() == hwnd (briefly polling for the async switch) and
     return False if the refocus did not take; the paste path treats False as
     "leave the text on the clipboard + panel" rather than blindly pasting.
@@ -127,7 +127,7 @@ def set_foreground_window(hwnd):
     finally:
         if attached:
             user32.AttachThreadInput(current_thread, target_thread, False)
-    # The switch is asynchronous â€” poll briefly for it to actually take.
+    # The switch is asynchronous — poll briefly for it to actually take.
     for _ in range(15):
         if get_foreground_window() == hwnd:
             return True
@@ -265,7 +265,7 @@ def send_ctrl_c():
 
 def send_escape():
     """Tap Escape (used ONLY to dismiss the Start menu after a Windows-key
-    hotkey â€” never inject Escape into an ordinary target window)."""
+    hotkey — never inject Escape into an ordinary target window)."""
     user32.keybd_event(VK_ESCAPE, 0, 0, 0)
     user32.keybd_event(VK_ESCAPE, 0, KEYEVENTF_KEYUP, 0)
 
