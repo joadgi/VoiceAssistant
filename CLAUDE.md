@@ -466,17 +466,33 @@ selection never changes into SAPI; `pyttsx3` runs only when explicitly selected.
 
 ## Default hotkeys
 
-> **Recommended dictate key: `caps lock`** (what Josh runs). It is the only class of key
-> whose scan code never overlaps normal typing, it is the most comfortable key to hold
-> while speaking, and the app suppresses it so it no longer toggles caps. A modifier-only
-> combo like `ctrl+alt` works but is the weakest option — every `Ctrl+Alt+<key>` shortcut
-> also starts a recording.
+> **Recommended: a dedicated key per action.** `caps lock` for dictate — the only class
+> of key whose scan code never overlaps normal typing, the most comfortable to hold
+> while speaking, and suppressed so it no longer toggles caps. `scroll lock` for read —
+> nothing else on a modern system uses it, and the matcher consumes it so no app sees it.
+>
+> **Never bind read or OCR to a modifier-only combo.** It is the ONE shape the app cannot
+> keep to itself (a modifier must pass through), so `ctrl+alt` fires the action on every
+> `Ctrl+Alt+<key>` shortcut in every app. That was the shipped read binding until
+> 2026-09-10 and it is what made read-aloud feel like it was "messing with Chrome".
+
+**Factory defaults** (`DEFAULTS` in `config.py` — these are starting points, not what any
+user necessarily runs):
 
 | Action | Default | Behavior |
 |---|---|---|
 | Dictate | `Ctrl+Shift+R` | Hold to record, release to transcribe + paste |
 | Read selection | `Ctrl+Shift+T` | Press to read highlighted text; press again to stop |
 | OCR at cursor | `Ctrl+Shift+S` | Capture region around cursor, OCR, read aloud |
+
+**What Josh actually runs** (his `settings.json`, as of 2026-09-10) — all three triggers
+are withheld from the focused app:
+
+| Action | Binding | Withheld how |
+|---|---|---|
+| Dictate | `caps lock` | suppressed as a dedicated solo key |
+| Read selection | `scroll lock` | consumed by `ChordHotkey` |
+| OCR at cursor | `ctrl+shift+s` | consumed by `ChordHotkey` (so Save As is gone app-wide) |
 
 All are editable inline — click a hotkey pill and press your combo (single key or combo).
 
