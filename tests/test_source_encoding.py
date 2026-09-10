@@ -35,7 +35,13 @@ _TEXT_SUFFIXES = (".py", ".md", ".bat", ".txt")
 
 
 def _source_files():
-    """Every text file we author, excluding runtime state and dependencies."""
+    """Every text file we author, excluding runtime state and dependencies.
+
+    The root files are globbed rather than listed. A hardcoded list of four
+    names was tried first and left setup.bat / run.bat / uninstall.bat /
+    create_shortcut.bat unguarded — scripts that print text the user reads,
+    and exactly the kind of file the corruption would be invisible in.
+    """
     found = []
     for relative_dir in _SOURCE_DIRS:
         for dirpath, dirnames, filenames in os.walk(
@@ -45,9 +51,11 @@ def _source_files():
             for name in sorted(filenames):
                 if name.endswith(_TEXT_SUFFIXES):
                     found.append(os.path.join(dirpath, name))
-    for name in ("CLAUDE.md", "AGENTS.md", "README.md", "main.py"):
+    for name in sorted(os.listdir(_REPO_ROOT)):
         path = os.path.join(_REPO_ROOT, name)
-        if os.path.exists(path):
+        # settings.json is local runtime state, not authored source.
+        if (os.path.isfile(path) and name.endswith(_TEXT_SUFFIXES)
+                and name != "settings.json"):
             found.append(path)
     return found
 
