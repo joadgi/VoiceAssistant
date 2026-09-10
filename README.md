@@ -30,7 +30,7 @@ SAPI locally.
 | Screen capture | `mss` |
 | OCR | **Windows-native OCR** (the same engine PowerToys Text Extractor uses — instant, no downloads); EasyOCR available as an optional fallback |
 | Global hotkeys | `keyboard` |
-| Clipboard | `pyperclip` + raw Win32 `keybd_event` |
+| Clipboard | `pyperclip` + checked Win32 `SendInput` batches |
 
 ## How It Works
 
@@ -246,3 +246,10 @@ everything it creates lives inside its own folder.
 ## License
 
 [MIT](LICENSE) — use it, change it, redistribute it. No warranty of any kind.
+
+### Keyboard input reliability
+
+Read-aloud preserves modifier keys: Ctrl+Alt remains usable without withholding
+or replaying Ctrl/Alt presses. Dictation still uses the saved push-to-talk key.
+Copy/paste waits for modifiers to be released; if input is busy, dictation stays
+available for manual paste instead of sending an unintended shortcut.

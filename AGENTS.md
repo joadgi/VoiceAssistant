@@ -31,7 +31,7 @@ Three features, in priority order:
 | Screen capture | `mss` |
 | OCR | **Windows-native `Windows.Media.Ocr`** via `winsdk` (default — ~10ms, zero heavy deps; DPI-correct physical-pixel capture); EasyOCR optional fallback (`pip install easyocr`, pulls the multi-GB torch stack) |
 | Global hotkeys | `keyboard` |
-| Paste/copy | `pyperclip` + raw Win32 `keybd_event` (via `ctypes`) |
+| Paste/copy | `pyperclip` + checked Win32 `SendInput` batches (via `ctypes`) |
 
 ## File map
 
@@ -49,6 +49,7 @@ run.bat/shortcuts/startup-registry compatibility.
 | `voiceassistant/transcriber.py` | `Transcriber` + `TranscriptionResult` (faster-whisper, both-pass guards, job-bound context). |
 | `voiceassistant/tts.py` | `TTSEngine` — local Kokoro blocks or one online edge-tts generator → one VLC stream, per-utterance generations, explicit pyttsx3 option, bounded waits. Carries the STOP CONTRACT and VOICE CONTRACT (in-file). |
 | `voiceassistant/ocr.py` | `ScreenCapture` (mss) + `OCREngine` (Windows-native OCR default, EasyOCR fallback) + `RegionSelector`. |
+| `voiceassistant/read_hotkey.py` | Read-aloud chord matcher; modifiers always pass through, only matched non-modifier down/up pairs can be consumed. |
 | `voiceassistant/paste.py` | `Paster` — the paste worker: clipboard snapshot/restore + Win32 Ctrl+V, off the GUI thread. |
 | `voiceassistant/selection.py` | `SelectionReader` — read-aloud's 3-tier selection grab (UIA → Ctrl+C sentinel → tell caller to OCR), off the GUI thread (mirrors `Paster`). |
 | `voiceassistant/uia.py` | UI Automation selection reader — highlighted text with **no clipboard, no keystrokes, no focus switch**. |
@@ -146,10 +147,19 @@ selection never changes into SAPI; `pyttsx3` runs only when explicitly selected.
 - **Never send Ctrl+C into a console** (`winapi.is_console_window`). There it means
   INTERRUPT: read-aloud used to kill whatever command was running in the focused
   terminal. Covers conhost, Windows Terminal, ConEmu, mintty, PuTTY.
-- **The read hotkey is SUPPRESSED.** It is a dedicated action key, and letting it
-  through means it ALSO fires whatever the focused app binds to it — `ctrl+m` is
-  Send/Receive in Outlook and indent in Word, so reading a selection was quietly
-  acting on the user's documents.
+- **Read-aloud never suppresses or replays modifiers.** `ReadHotkey` observes
+  both press orders of modifier-only combos (including the saved Ctrl+Alt),
+  latches one action per hold, and always returns True for Ctrl/Alt/Shift/Win.
+  For a chord with a normal key, it consumes only a matched trigger down/up
+  pair. Do not restore `keyboard.add_hotkey(..., suppress=True)`: its modifier
+  state machine was found delaying and replaying Ctrl/Alt.
+- **Copy and paste share one clipboard/input transaction lock.** Workers wait
+  for Windows modifier state to be clear and abort safely on timeout. One
+  checked SendInput batch contains Ctrl-down, key-down/up, Ctrl-up; partial or
+  exceptional delivery attempts release-only cleanup, never repeats the action.
+  Zero accepted events do not trigger cleanup because the app owns no key.
+  Paste failure retains the dictation for manual paste; copy restores its
+  clipboard snapshot in a finally block. No transcript text goes into logs.
 - **A dedicated solo key is SUPPRESSED; a modifier never is** (`DEDICATED_SOLO_KEYS`,
   `should_suppress_hotkey`). Caps Lock is the best push-to-talk key available — home row,
   huge, and its scan code (58) is the only kind that does **not** overlap anything used in
@@ -170,12 +180,12 @@ selection never changes into SAPI; `pyttsx3` runs only when explicitly selected.
   - Note when testing hooks: `keyboard` passes its **own injected** events straight
     through (`is_replaying`), so `kb.press(scan_code)` does NOT fire your hooks. Synthetic
     keypresses cannot verify hook behavior here — reason from the scan-code tables.
-- **Never trust a keyup — poll the key state** (`_on_ptt_watchdog`, 100 ms). Windows
-  silently drops a low-level keyboard hook whose callback exceeds
-  `LowLevelHooksTimeout`, and elevated/secure-desktop windows eat events. When that
-  happened the release never fired and recording ran to the 120 s cap — `debug.log`
-  shows it three times (08-08, 08-13, 08-17), once next to the overflow message,
-  i.e. exactly the under-load hook-timeout case. A lost keyup now costs ~100 ms.
+- **The PTT watchdog has an explicit evidence boundary.** Unsuppressed
+  bindings use native Windows state, independent of the hook cache. Suppressed
+  Caps Lock/solo keys never reach Windows' accepted state, so polling that
+  state would incorrectly end recording. Those bindings retain hook-event
+  state and the recording-duration cap. They are not independently protected
+  against a completely lost raw key-up; do not claim otherwise.
 - **The model loads from the CACHE first** (`Transcriber._open_model`). faster-whisper
   otherwise revalidates against huggingface.co on EVERY launch: measured **176.3 s vs
   7.0 s** for an already-cached `large-v3`, i.e. ~3 minutes after each boot where the

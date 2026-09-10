@@ -35,13 +35,21 @@ class Paster:
 
     # ------------------------------------------------------------------ #
     def _job(self, hwnd, text, done_cb):
-        ok = self._paste(hwnd, text)
+        try:
+            ok = self._paste(hwnd, text)
+        except Exception:
+            applog.exception("paste failed; text retained in the app")
+            ok = False
         try:
             done_cb(ok, text)
         except Exception:
             applog.exception("paste done_cb failed")
 
     def _paste(self, hwnd, text):
+        with winapi.clipboard_input_lock:
+            return self._paste_locked(hwnd, text)
+
+    def _paste_locked(self, hwnd, text):
         applog.dbg(f"paste ENTER target_hwnd={hwnd} fg={winapi.get_foreground_window()}")
         text = sanitize_for_paste(text)
         if not text:
@@ -66,14 +74,10 @@ class Paster:
             return False
         applog.dbg(f"  clipboard set ({len(text)} chars)")
 
-        # Wait until the user has released modifier keys (their hotkey), so
-        # our Ctrl+V isn't corrupted into Ctrl+Shift+V etc.
-        for i in range(100):
-            if not (kb.is_pressed("ctrl") or kb.is_pressed("shift")
-                    or kb.is_pressed("alt") or kb.is_pressed("windows")):
-                applog.dbg(f"  mods released after {i * 20}ms")
-                break
-            time.sleep(0.02)
+        if not winapi.wait_for_modifiers_released(2.0):
+            applog.info("paste deferred: modifiers held; text retained for manual paste")
+            self._pending_snapshot = None
+            return False
 
         # If focus drifted off the target, refocus it. We deliberately do NOT
         # inject Escape — sending Esc into the target app is what produced the
@@ -92,7 +96,10 @@ class Paster:
         else:
             time.sleep(0.05)
 
-        winapi.send_ctrl_v()
+        if winapi.get_foreground_window() != hwnd or winapi.send_ctrl_v() is False:
+            applog.info("paste deferred: focus/input changed; text retained for manual paste")
+            self._pending_snapshot = None
+            return False
         applog.dbg("paste DONE")
 
         # Deferred clipboard restore. If another paste is already queued,

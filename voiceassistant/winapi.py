@@ -1,4 +1,4 @@
-"""ALL Win32/ctypes calls live in this module — nothing else touches ctypes.
+"""ALL Win32/ctypes calls live in this module â€” nothing else touches ctypes.
 
 Keeping the platform surface in one file makes every other module mockable
 and gives Win32 changes exactly one place to break.
@@ -8,6 +8,7 @@ import ctypes
 import os
 import sys
 import time
+import threading
 from ctypes import wintypes
 
 from . import applog
@@ -17,7 +18,7 @@ kernel32 = ctypes.windll.kernel32
 
 # Declare handle-returning functions as pointer-width. Without this, ctypes
 # defaults their return to C int and SIGN-TRUNCATES HWNDs to 32 bits on 64-bit
-# Windows — so a handle from GetForegroundWindow() could never compare equal to
+# Windows â€” so a handle from GetForegroundWindow() could never compare equal to
 # a full-width handle from Qt's winId(), silently breaking the is-own-window /
 # focus checks. (Found by the live paste test.)
 user32.GetForegroundWindow.restype = wintypes.HWND
@@ -52,7 +53,7 @@ def get_cursor_pos():
     """Cursor position in PHYSICAL screen pixels.
 
     Qt6 makes the process per-monitor DPI aware, so GetCursorPos returns true
-    physical coordinates — the same space mss captures in. Qt's own
+    physical coordinates â€” the same space mss captures in. Qt's own
     QCursor.pos() is in LOGICAL (scaled) coordinates and was the reason OCR
     grabbed the wrong region on 125%/150% displays.
     """
@@ -62,7 +63,7 @@ def get_cursor_pos():
 
 
 # Window classes that treat Ctrl+C as INTERRUPT rather than copy. Sending our
-# synthetic Ctrl+C into one of these kills whatever command is running — a real
+# synthetic Ctrl+C into one of these kills whatever command is running â€” a real
 # data-loss hazard, and read-aloud used to do it unconditionally.
 CONSOLE_WINDOW_CLASSES = {
     "consolewindowclass",              # conhost (cmd, classic PowerShell)
@@ -106,7 +107,7 @@ def set_foreground_window(hwnd):
     refused (returns without effect) when the calling process isn't the
     current foreground process. If we don't verify, the caller believes it
     refocused the target and pastes Ctrl+V into whatever window is REALLY in
-    front — silently mis-delivering the user's dictation. So we confirm
+    front â€” silently mis-delivering the user's dictation. So we confirm
     GetForegroundWindow() == hwnd (briefly polling for the async switch) and
     return False if the refocus did not take; the paste path treats False as
     "leave the text on the clipboard + panel" rather than blindly pasting.
@@ -126,7 +127,7 @@ def set_foreground_window(hwnd):
     finally:
         if attached:
             user32.AttachThreadInput(current_thread, target_thread, False)
-    # The switch is asynchronous — poll briefly for it to actually take.
+    # The switch is asynchronous â€” poll briefly for it to actually take.
     for _ in range(15):
         if get_foreground_window() == hwnd:
             return True
@@ -137,31 +138,134 @@ def set_foreground_window(hwnd):
 # ---------------------------------------------------------------------------
 # Synthetic keystrokes
 # ---------------------------------------------------------------------------
+# Shared by clipboard copy and paste workers. Hold it for the complete
+# clipboard transaction, not just the individual keystroke sequence.
+clipboard_input_lock = threading.RLock()
+
+
+class _MOUSEINPUT(ctypes.Structure):
+    _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG),
+                ("mouseData", wintypes.DWORD), ("dwFlags", wintypes.DWORD),
+                ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
+
+
+class _KEYBDINPUT(ctypes.Structure):
+    _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD),
+                ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD),
+                ("dwExtraInfo", ctypes.c_size_t)]
+
+
+class _HARDWAREINPUT(ctypes.Structure):
+    _fields_ = [("uMsg", wintypes.DWORD), ("wParamL", wintypes.WORD),
+                ("wParamH", wintypes.WORD)]
+
+
+class _INPUTUNION(ctypes.Union):
+    _fields_ = [("mi", _MOUSEINPUT), ("ki", _KEYBDINPUT), ("hi", _HARDWAREINPUT)]
+
+
+class _INPUT(ctypes.Structure):
+    _anonymous_ = ("data",)
+    _fields_ = [("type", wintypes.DWORD), ("data", _INPUTUNION)]
+
+
+user32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(_INPUT), ctypes.c_int]
+user32.SendInput.restype = wintypes.UINT
+user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+user32.GetAsyncKeyState.restype = ctypes.c_short
+user32.MapVirtualKeyW.argtypes = [wintypes.UINT, wintypes.UINT]
+user32.MapVirtualKeyW.restype = wintypes.UINT
+
+_MODIFIER_VKS = (0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0x5B, 0x5C)
+
+
+def modifiers_down():
+    """Windows' accepted input state, not keyboard's cached hook events."""
+    return tuple(vk for vk in _MODIFIER_VKS if user32.GetAsyncKeyState(vk) & 0x8000)
+
+
+def wait_for_modifiers_released(timeout=2.0):
+    deadline = time.monotonic() + timeout
+    while modifiers_down():
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.01)
+    return True
+
+
+def hotkey_is_down(combo):
+    """Independent state for NON-suppressed shortcuts; never use for blocked Caps."""
+    import keyboard
+    direct = {"ctrl": 0x11, "alt": 0x12, "shift": 0x10,
+              "left ctrl": 0xA2, "right ctrl": 0xA3,
+              "left alt": 0xA4, "right alt": 0xA5,
+              "left shift": 0xA0, "right shift": 0xA1}
+    for part in combo.split("+"):
+        if part in ("windows", "cmd", "meta"):
+            vks = (0x5B, 0x5C)
+        elif part in direct:
+            vks = (direct[part],)
+        else:
+            vks = tuple(user32.MapVirtualKeyW(code, 3)
+                        for code in keyboard.key_to_scan_codes(part))
+        if not any(vk and user32.GetAsyncKeyState(vk) & 0x8000 for vk in vks):
+            return False
+    return True
+
+
+def _input_batch(events):
+    inputs = (_INPUT * len(events))()
+    for index, (vk, up) in enumerate(events):
+        inputs[index].type = 1  # INPUT_KEYBOARD
+        inputs[index].ki = _KEYBDINPUT(vk, 0, KEYEVENTF_KEYUP if up else 0,
+                                       0, 0x56414B42)
+    return int(user32.SendInput(len(inputs), inputs, ctypes.sizeof(_INPUT)))
+
+
+def _send_ctrl_shortcut(key):
+    with clipboard_input_lock:
+        # Recheck immediately before the indivisible batch, even if the caller
+        # already waited. Never force-release a modifier the user is holding.
+        if modifiers_down():
+            applog.info("keyboard input deferred: a modifier is still held")
+            return False
+        inserted = None
+        attempted = False
+        try:
+            attempted = True
+            inserted = _input_batch(((VK_CONTROL, False), (key, False),
+                                     (key, True), (VK_CONTROL, True)))
+            if inserted != 4:
+                applog.error(f"keyboard input incomplete: {inserted}/4 events")
+                return False
+            return True
+        except Exception:
+            applog.exception("keyboard input failed")
+            return False
+        finally:
+            # A failed or interrupted batch may have inserted Ctrl-down. Send
+            # only releases, never retry the action and risk duplicate pasting.
+            # Zero accepted events own no keys: do not release user input.
+            if attempted and (inserted is None or 0 < inserted < 4):
+                try:
+                    released = _input_batch(((key, True), (VK_CONTROL, True)))
+                    if released != 2:
+                        applog.error("keyboard input cleanup was not accepted")
+                except Exception:
+                    applog.exception("keyboard input cleanup failed")
+
+
 def send_ctrl_v():
-    """Send Ctrl+V via raw Win32 API — no keyboard-library involvement."""
-    user32.keybd_event(VK_CONTROL, 0, 0, 0)
-    time.sleep(0.015)
-    user32.keybd_event(VK_V, 0, 0, 0)
-    time.sleep(0.03)
-    user32.keybd_event(VK_V, 0, KEYEVENTF_KEYUP, 0)
-    time.sleep(0.015)
-    user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
+    return _send_ctrl_shortcut(VK_V)
 
 
 def send_ctrl_c():
-    """Send Ctrl+C via raw Win32 API (selection copy for read-aloud)."""
-    user32.keybd_event(VK_CONTROL, 0, 0, 0)
-    time.sleep(0.015)
-    user32.keybd_event(VK_C, 0, 0, 0)
-    time.sleep(0.03)
-    user32.keybd_event(VK_C, 0, KEYEVENTF_KEYUP, 0)
-    time.sleep(0.015)
-    user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
+    return _send_ctrl_shortcut(VK_C)
 
 
 def send_escape():
     """Tap Escape (used ONLY to dismiss the Start menu after a Windows-key
-    hotkey — never inject Escape into an ordinary target window)."""
+    hotkey â€” never inject Escape into an ordinary target window)."""
     user32.keybd_event(VK_ESCAPE, 0, 0, 0)
     user32.keybd_event(VK_ESCAPE, 0, KEYEVENTF_KEYUP, 0)
 

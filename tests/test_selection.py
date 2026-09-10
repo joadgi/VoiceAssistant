@@ -48,7 +48,10 @@ def env(monkeypatch):
     monkeypatch.setattr(sel_mod, "pyperclip", clip)
     monkeypatch.setattr(sel_mod.time, "sleep", lambda *_a, **_k: None)
     monkeypatch.setattr(sel_mod.kb, "is_pressed", lambda *_a, **_k: False)
-    monkeypatch.setattr(sel_mod.winapi, "set_foreground_window", lambda hwnd: True)
+    focus = [None]
+    monkeypatch.setattr(sel_mod.winapi, "wait_for_modifiers_released", lambda timeout: True)
+    monkeypatch.setattr(sel_mod.winapi, "get_foreground_window", lambda: focus[0])
+    monkeypatch.setattr(sel_mod.winapi, "set_foreground_window", lambda hwnd: focus.__setitem__(0, hwnd) or True)
     monkeypatch.setattr(sel_mod.winapi, "is_console_window", lambda hwnd: False)
     monkeypatch.setattr(sel_mod.winapi, "send_escape",
                         lambda: esc.__setitem__("n", esc["n"] + 1))
@@ -195,7 +198,10 @@ def test_capture_via_worker_invokes_callback(monkeypatch):
     monkeypatch.setattr(sel_mod, "pyperclip", clip)
     monkeypatch.setattr(sel_mod.time, "sleep", lambda *_a, **_k: None)
     monkeypatch.setattr(sel_mod.kb, "is_pressed", lambda *_a, **_k: False)
-    monkeypatch.setattr(sel_mod.winapi, "set_foreground_window", lambda hwnd: True)
+    focus = [None]
+    monkeypatch.setattr(sel_mod.winapi, "wait_for_modifiers_released", lambda timeout: True)
+    monkeypatch.setattr(sel_mod.winapi, "get_foreground_window", lambda: focus[0])
+    monkeypatch.setattr(sel_mod.winapi, "set_foreground_window", lambda hwnd: focus.__setitem__(0, hwnd) or True)
     monkeypatch.setattr(sel_mod.winapi, "is_console_window", lambda hwnd: False)
     monkeypatch.setattr(sel_mod.winapi, "send_escape", lambda: None)
     monkeypatch.setattr(sel_mod.uia, "get_selection", lambda hwnd=None: "")

@@ -309,6 +309,14 @@ class _FakeKb:
     def add_hotkey(self, combo, cb, *a, **k):
         self.hotkeys.append(combo)
 
+    def hook(self, callback, suppress=False):
+        self.read_hook = callback
+        return callback
+
+    def key_to_scan_codes(self, key):
+        import keyboard
+        return keyboard.key_to_scan_codes(key)
+
     def is_pressed(self, key):
         return key in self.held
 
@@ -332,6 +340,7 @@ def fake_kb(main_window, monkeypatch):
 
     fk = _FakeKb()
     monkeypatch.setattr(win_mod, "kb", fk)
+    monkeypatch.setattr(win_mod.winapi, "hotkey_is_down", lambda combo: all(p in fk.held for p in combo.split("+")))
     return fk
 
 

@@ -1,4 +1,4 @@
-"""MainWindow — orchestration and signal wiring.
+"""MainWindow â€” orchestration and signal wiring.
 
 All engine callbacks arrive as queued Qt signals; all blocking work happens on
 subsystem workers (recorder callback thread, transcriber/tts/ocr/paste/read
@@ -27,9 +27,10 @@ from .config import (
 )
 from .ocr import OCREngine, RegionSelector, ScreenCapture
 from .paste import Paster
+from .read_hotkey import ReadHotkey
 from .recorder import VoiceRecorder
 from .selection import (
-    SRC_CONSOLE_BLOCKED, SRC_EMPTY, SRC_REFOCUS_FAILED, SelectionReader,
+    SRC_CONSOLE_BLOCKED, SRC_EMPTY, SRC_REFOCUS_FAILED, SRC_INPUT_BUSY, SelectionReader,
 )
 from .settings_dialog import SettingsDialog
 from .text import clean_transcript, is_probable_hallucination
@@ -44,7 +45,7 @@ class MainWindow(QMainWindow):
     _sig_hotkey_release = Signal()
     _sig_hotkey_screen = Signal()
     _sig_hotkey_read = Signal()
-    # Worker → GUI marshalling
+    # Worker â†’ GUI marshalling
     _sig_read_text_ready = Signal(int, str, str)  # (request generation, text, source tier)
     _sig_paste_done = Signal(bool, str)
     _sig_crash_notice = Signal(str)
@@ -91,7 +92,7 @@ class MainWindow(QMainWindow):
         # _pending_target_hwnd is only a hand-off between record-START (where
         # the foreground window is captured) and record-STOP (where it is bound
         # into the transcription job). From then on the HWND travels WITH the
-        # job (TranscriptionResult.context) — overlapping dictations can no
+        # job (TranscriptionResult.context) â€” overlapping dictations can no
         # longer paste into each other's windows.
         self._pending_target_hwnd = None
         self._read_target_hwnd = None  # window to refocus for read-selection copy
@@ -117,8 +118,8 @@ class MainWindow(QMainWindow):
         # callback to a generation so that stale text can never start speaking
         # after the user pressed Stop or began a newer read.
         self._read_gen = 0
-        # Polls real key state while PTT is held, so a dropped keyup can't
-        # wedge the recording open (see _on_ptt_watchdog).
+        # Watch PTT release; native polling is valid only for unsuppressed
+        # bindings. Dedicated blocked keys retain their duration backstop.
         # Metrics for the in-flight dictation. Keyed by transcription job id
         # so overlapping dictations can't be attributed to each other; the
         # paste leg is a FIFO because Paster jobs complete in order.
@@ -222,7 +223,7 @@ class MainWindow(QMainWindow):
         top_row.addWidget(screen_group, 1)
         root_layout.addLayout(top_row)
 
-        # ---- Model status (the model SELECTOR lives in Settings — its one
+        # ---- Model status (the model SELECTOR lives in Settings â€” its one
         # home; it used to be duplicated here and in the dialog) ----
         model_row = QHBoxLayout()
         model_row.addStretch()
@@ -431,7 +432,7 @@ class MainWindow(QMainWindow):
         self.indicator.customContextMenuRequested.connect(self._on_pill_menu)
 
     # -----------------------------------------------------------------------
-    # Global hotkeys — fully user-configurable (see config.py contract)
+    # Global hotkeys â€” fully user-configurable (see config.py contract)
     # -----------------------------------------------------------------------
     def _setup_hotkeys(self):
         try:
@@ -445,7 +446,7 @@ class MainWindow(QMainWindow):
         errors = []
 
         try:
-            # Hook press AND release on EVERY key in the combo — not just a
+            # Hook press AND release on EVERY key in the combo â€” not just a
             # single "trigger" key.
             #
             # THIS WAS THE BUG that made dictation feel broken. With a
@@ -467,12 +468,12 @@ class MainWindow(QMainWindow):
             #
             # A dedicated solo key (Caps Lock etc.) is SUPPRESSED so pressing it
             # doesn't also toggle caps / overtype / Excel's scroll mode on every
-            # dictation. Modifiers are never suppressed — swallowing `ctrl` would
+            # dictation. Modifiers are never suppressed â€” swallowing `ctrl` would
             # break Ctrl system-wide.
             #
             # CAREFUL: these callbacks must return a FALSY value. `keyboard`
             # blocks a suppressed event only when the handler returns falsy, and
-            # in PySide6 `Signal.emit()` returns **True** — so
+            # in PySide6 `Signal.emit()` returns **True** â€” so
             # `lambda e: sig.emit()` would quietly stop suppressing and Caps Lock
             # would start toggling caps again. Hence explicit functions that emit
             # as a statement and fall off the end (returning None).
@@ -501,26 +502,20 @@ class MainWindow(QMainWindow):
         except Exception as e:
             errors.append(f"Screen hotkey ({hk_screen}): {e}")
 
-        # SUPPRESS the read hotkey. It is a dedicated action key, and letting it
-        # through means it ALSO fires whatever the focused app binds to it —
-        # `ctrl+m` is Send/Receive in Outlook and indent in Word, so reading a
-        # selection was quietly acting on the user's documents.
+        # Never suppress/replay Ctrl, Alt, Shift, or Win. Only consume a
+        # matched non-modifier trigger, with a paired release. Modifier-only
+        # read chords remain supported and pass through unchanged.
         try:
-            kb.add_hotkey(hk_read, lambda: self._sig_hotkey_read.emit(),
-                          suppress=True)
-        except Exception:
-            # Suppression refused — a working un-suppressed hotkey beats none.
-            try:
-                kb.add_hotkey(hk_read, lambda: self._sig_hotkey_read.emit())
-                applog.error(f"read hotkey {hk_read}: suppression refused; "
-                             "it will also reach the focused app")
-            except Exception as e2:
-                errors.append(f"Read aloud hotkey ({hk_read}): {e2}")
+            self._read_hotkey = ReadHotkey(hk_read, self._sig_hotkey_read.emit, kb)
+            kb.hook(self._read_hotkey, suppress=True)
+        except Exception as e:
+            errors.append(f"Read aloud hotkey ({hk_read}): {e}")
 
         if errors:
             self._update_status("Hotkey errors: " + "; ".join(errors))
         else:
             self._update_status(f"Hotkeys: {hk_record}=dictate  {hk_read}=read selection  {hk_screen}=OCR")
+            applog.info("keyboard safety active: modifier passthrough and checked input batches")
 
     def _clean_hotkey(self, config_key):
         combo = normalize_hotkey(self.config.get(config_key, DEFAULTS[config_key]))
@@ -557,18 +552,18 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _hotkey_press_handler(self):
-        """Hotkey pressed — start recording.
+        """Hotkey pressed â€” start recording.
 
         NOTE: OS key-autorepeat re-fires this at ~30Hz for the whole time the
         hotkey is held. Autorepeat is absorbed by the state check below, NOT by
-        the time debounce — the debounce timestamp only advances when we
+        the time debounce â€” the debounce timestamp only advances when we
         actually start. (It used to advance on every autorepeat tick, which
         meant a genuine second dictation started within 250ms of the previous
         hold was silently swallowed: another "I pressed it and nothing
         happened" path.)
         """
         if self.recorder.is_recording or self._ptt_active:
-            return  # autorepeat during an active hold — silent no-op
+            return  # autorepeat during an active hold â€” silent no-op
         now = time.monotonic()
         if now - self._last_hotkey_press_time < 0.15:
             return  # true double-fire immediately after a stop
@@ -579,8 +574,8 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _hotkey_release_handler(self):
-        """A combo key was released — stop recording if push-to-talk is active."""
-        # No-op (and no logging) unless PTT is active — this fires on every
+        """A combo key was released â€” stop recording if push-to-talk is active."""
+        # No-op (and no logging) unless PTT is active â€” this fires on every
         # combo-key release during normal typing.
         if not self._ptt_active:
             return
@@ -590,18 +585,9 @@ class MainWindow(QMainWindow):
         if self.recorder.is_recording:
             self._on_stop_record()
 
-    # --- lost-keyup watchdog -------------------------------------------- #
-    # A keyup is not guaranteed to arrive. Windows silently drops the
-    # low-level keyboard hook when a callback exceeds LowLevelHooksTimeout
-    # (~300ms), and a UAC-elevated foreground window or a secure-desktop
-    # switch eats events outright. When that happened the release never fired
-    # and the recording ran to the 120s safety cap — debug.log shows this
-    # three times (08-08, 08-13, 08-17), once alongside "audio input overflow
-    # x29 ... system under load", which is exactly the hook-timeout condition.
-    #
-    # So we never rely on the keyup alone: while PTT is active, poll the real
-    # key state. A dropped keyup now costs ~100ms of extra recording instead
-    # of a two-minute runaway and a wall of garbage text.
+    # Release watchdog. Hook-cache state is not independent evidence of a
+    # physical hold. Native checks cover unsuppressed keys; the blocked Caps
+    # path still relies on event delivery and the maximum recording duration.
     def _start_ptt_watchdog(self):
         self._ptt_watchdog.start()
 
@@ -615,14 +601,21 @@ class MainWindow(QMainWindow):
             return
         try:
             parts = self._hotkey_parts(self.config["hotkey_record"])
-            still_held = all(kb.is_pressed(p) for p in parts)
+            # Suppressed Caps/solo keys never reach Windows' accepted state.
+            # Keep their event state and duration cap. Unsuppressed bindings
+            # get an independent Windows check, so a stale hook cache cannot
+            # keep a modifier-based recording running indefinitely.
+            combo = self.config["hotkey_record"]
+            still_held = (all(kb.is_pressed(p) for p in parts)
+                          if should_suppress_hotkey(combo)
+                          else winapi.hotkey_is_down(combo))
         except Exception as e:
-            # Can't read key state — do NOT cut the user off mid-sentence.
+            # Can't read key state â€” do NOT cut the user off mid-sentence.
             # The max-duration cap remains the backstop.
             applog.dbg(f"ptt watchdog state check failed: {e}")
             return
         if not still_held:
-            applog.info("PTT watchdog: hotkey no longer held (keyup was lost) — stopping")
+            applog.info("PTT watchdog: hotkey no longer held (keyup was lost) â€” stopping")
             self._keyup_lost_pending = True
             self._ptt_active = False
             self._stop_ptt_watchdog()
@@ -634,14 +627,14 @@ class MainWindow(QMainWindow):
     # -----------------------------------------------------------------------
     @Slot()
     def _on_record_from_hotkey(self):
-        """Start recording via hotkey — capture the currently focused window first."""
+        """Start recording via hotkey â€” capture the currently focused window first."""
         applog.dbg(f"_on_record_from_hotkey: transcriber_loaded={self.transcriber.is_loaded}")
         if not self.transcriber.is_loaded:
-            # Clear PTT — leaving it set meant the next press was treated as
+            # Clear PTT â€” leaving it set meant the next press was treated as
             # "already active" and silently ignored.
             self._ptt_active = False
             self._update_status("Whisper model still loading, please wait...")
-            self.indicator.show_error("Model still loading…")
+            self.indicator.show_error("Model still loadingâ€¦")
             return
         if self._dictation_active:
             self._pending_target_hwnd = winapi.get_foreground_window()
@@ -650,11 +643,11 @@ class MainWindow(QMainWindow):
         if self.recorder.is_recording:
             self._start_ptt_watchdog()
         else:
-            self._ptt_active = False  # start() failed (dead mic) — don't wedge
+            self._ptt_active = False  # start() failed (dead mic) â€” don't wedge
 
     @Slot()
     def _on_indicator_clicked(self):
-        """Click the floating pill to toggle dictation (capture → record → paste)."""
+        """Click the floating pill to toggle dictation (capture â†’ record â†’ paste)."""
         if self.recorder.is_recording:
             self._ptt_active = False
             self._on_stop_record()
@@ -668,7 +661,7 @@ class MainWindow(QMainWindow):
         self.recorder.start()
 
     def _build_pill_menu(self):
-        """Right-click menu on the floating pill — full app control without
+        """Right-click menu on the floating pill â€” full app control without
         the main window (tray-first). Returns a QMenu (parented to self)."""
         menu = QMenu(self)
         act_dictate = QAction(
@@ -684,7 +677,7 @@ class MainWindow(QMainWindow):
         act_pause.setChecked(not self._dictation_active)
         act_pause.toggled.connect(lambda paused: self.btn_dictation.setChecked(not paused))
         menu.addAction(act_pause)
-        act_settings = QAction("Settings…", self)
+        act_settings = QAction("Settingsâ€¦", self)
         act_settings.triggered.connect(self._on_settings)
         menu.addAction(act_settings)
         act_show = QAction("Show window", self)
@@ -708,7 +701,7 @@ class MainWindow(QMainWindow):
             return
         # Guard the hand-off race: if a dictation is already recording (e.g.
         # a held push-to-talk into another window), do NOT clobber its pending
-        # target — clicking this button mid-hold used to null _pending_target_hwnd
+        # target â€” clicking this button mid-hold used to null _pending_target_hwnd
         # and mis-route that dictation to the panel. recorder.start() would
         # no-op anyway; bail so the in-flight target survives to paste.
         if self.recorder.is_recording:
@@ -722,7 +715,7 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _on_max_duration(self):
-        """Recording hit the safety cap — stop and transcribe what we have.
+        """Recording hit the safety cap â€” stop and transcribe what we have.
 
         Clear PTT so the eventual key-release is a clean no-op (recording is
         already stopped). The captured audio is preserved and still pasted.
@@ -761,7 +754,7 @@ class MainWindow(QMainWindow):
         self.btn_stop.setEnabled(False)
         self.level_bar.setValue(0)
 
-        # Consume the pending target exactly once — from here on it travels
+        # Consume the pending target exactly once â€” from here on it travels
         # WITH the job. (The old shared-field approach let a second dictation
         # overwrite the first one's paste target: confirmed wrong-window race.)
         target_hwnd = self._pending_target_hwnd
@@ -769,7 +762,7 @@ class MainWindow(QMainWindow):
 
         # The captured slice now includes the pre-roll and the tail drain, so
         # measure the user's ACTUAL hold time against the minimum-length gate
-        # — otherwise the padding alone would clear the floor and every stray
+        # â€” otherwise the padding alone would clear the floor and every stray
         # tap would go to Whisper.
         pad = (self.recorder.preroll_ms / 1000.0) + 0.16
         hold_duration = max(0.0, duration - pad)
@@ -788,20 +781,20 @@ class MainWindow(QMainWindow):
         min_peak = float(self.config.get("min_record_peak", 0.008))
         # Silent drops were invisible: the app normally lives in the tray, so a
         # status-bar message nobody can see read as "it just didn't work".
-        # The pill is always on screen — say why, on the pill.
+        # The pill is always on screen â€” say why, on the pill.
         if hold_duration < min_seconds:
             applog.dbg(f"  ignored - hold too short ({hold_duration:.2f}s < {min_seconds}s)")
-            self._update_status("Ignored — hotkey tapped, not held. Hold it while you speak.")
-            self.indicator.show_error("Too short — hold to talk")
+            self._update_status("Ignored â€” hotkey tapped, not held. Hold it while you speak.")
+            self.indicator.show_error("Too short â€” hold to talk")
             metrics.record(metrics.OUTCOME_DROPPED_SHORT, **base)
             return
         if max_amp < min_peak:
             applog.dbg(f"  ignored - too quiet (peak {max_amp:.4f} < {min_peak})")
             self._update_status(
-                f"Ignored — no sound detected (peak {max_amp:.3f}). "
+                f"Ignored â€” no sound detected (peak {max_amp:.3f}). "
                 "Check the mic is unmuted and selected in Settings."
             )
-            self.indicator.show_error("No sound — check mic")
+            self.indicator.show_error("No sound â€” check mic")
             metrics.record(metrics.OUTCOME_DROPPED_QUIET, **base)
             return
 
@@ -845,7 +838,7 @@ class MainWindow(QMainWindow):
     def _on_degraded(self, msg):
         """A subsystem loaded but in a much worse mode than asked for.
 
-        The app lives in the tray, so the model label alone is invisible — a
+        The app lives in the tray, so the model label alone is invisible â€” a
         CPU-instead-of-GPU session just feels like "dictation got slow" with no
         explanation. Use the one channel that reaches the user in the tray: a
         balloon, plus a label that STAYS marked degraded.
@@ -878,7 +871,7 @@ class MainWindow(QMainWindow):
         )
         # Duplicate/stale-delivery guard. Job ids are monotonic, so anything
         # <= the last handled id is a repeat or an out-of-order straggler, not
-        # a new dictation — drop it. (Replaces the old id(audio) guard, which
+        # a new dictation â€” drop it. (Replaces the old id(audio) guard, which
         # could discard a REAL second dictation after CPython reused an address.)
         if self._last_job_id is not None and result.job_id <= self._last_job_id:
             applog.dbg("  duplicate/stale job delivery ignored")
@@ -900,7 +893,7 @@ class MainWindow(QMainWindow):
         )
 
         # Cleanup can reduce a filler-only utterance ("um") to nothing. Route
-        # off the CLEANED text, not just the raw no_speech flag — otherwise a
+        # off the CLEANED text, not just the raw no_speech flag â€” otherwise a
         # blank "[Voice]" marker gets appended to the panel.
         if not text.strip():
             self.indicator.show_idle()
@@ -923,7 +916,7 @@ class MainWindow(QMainWindow):
 
         if (self._dictation_active and self.config.get("auto_paste", True)
                 and target_hwnd and not is_own_window and text.strip()):
-            # Paste runs on the paste worker — the GUI thread never blocks.
+            # Paste runs on the paste worker â€” the GUI thread never blocks.
             self.indicator.show_pasting()
             self._update_status("Pasting...")
             m["chars"] = len(text)
@@ -947,7 +940,7 @@ class MainWindow(QMainWindow):
         else:
             self.indicator.show_error()
             self._update_status(
-                "Paste failed — text is in the panel and on the clipboard (Ctrl+V to paste manually)"
+                "Paste failed â€” text is in the panel and on the clipboard (Ctrl+V to paste manually)"
             )
             self._append_output(text, prefix="[Voice]")
 
@@ -985,7 +978,7 @@ class MainWindow(QMainWindow):
         self._append_output(text, prefix="[Screen]")
         self._update_status("Screen read complete")
         if text.strip() and "[No text" not in text:
-            # speak() interrupts any current speech — a new OCR capture is
+            # speak() interrupts any current speech â€” a new OCR capture is
             # never silently dropped while TTS is busy.
             self.tts.speak(text)
 
@@ -1106,7 +1099,7 @@ class MainWindow(QMainWindow):
             self._update_status(f"Reading {len(text)} chars aloud ({source})...")
             return
 
-        # TIER 3: nothing readable as text. Fall back to OCR of the screen —
+        # TIER 3: nothing readable as text. Fall back to OCR of the screen â€”
         # this is what makes scanned PDFs, images and copy-protected content
         # readable at all. Say so, so the behaviour isn't surprising.
         if source in (SRC_CONSOLE_BLOCKED, SRC_EMPTY, SRC_REFOCUS_FAILED):
@@ -1116,13 +1109,15 @@ class MainWindow(QMainWindow):
         self._update_status(self._read_failure_message(source))
 
     def _read_failure_message(self, source):
+        if source == SRC_INPUT_BUSY:
+            return "Release Ctrl, Alt, Shift, and Windows, then try reading the selection again."
         if source == SRC_CONSOLE_BLOCKED:
-            return ("That's a terminal — Ctrl+C there would interrupt your command, "
+            return ("That's a terminal â€” Ctrl+C there would interrupt your command, "
                     "so it wasn't sent. Nothing readable found on screen either.")
         if source == SRC_REFOCUS_FAILED:
             return ("Couldn't switch back to that window (Windows blocked it), so the "
-                    "selection wasn't read — click the window, then press the hotkey.")
-        return "Nothing to read — highlight some text first, then press the hotkey."
+                    "selection wasn't read â€” click the window, then press the hotkey.")
+        return "Nothing to read â€” highlight some text first, then press the hotkey."
 
     def _read_ocr_fallback(self, source):
         """OCR the area around the cursor and read that. Returns True if it
@@ -1139,7 +1134,7 @@ class MainWindow(QMainWindow):
             return False
         applog.dbg(f"read-aloud: escalating to OCR (source={source})")
         self._update_status(
-            "No selectable text — reading the area around your cursor instead..."
+            "No selectable text â€” reading the area around your cursor instead..."
         )
         metrics.record("read_ocr", chars=0)
         self.ocr.read_image(img)
@@ -1199,7 +1194,7 @@ class MainWindow(QMainWindow):
         hk = self.config["hotkey_record"]
         if self._dictation_active:
             self.dictation_hint.setText(
-                f"Hold {hk} and speak — release to paste where your cursor is"
+                f"Hold {hk} and speak â€” release to paste where your cursor is"
             )
         else:
             self.dictation_hint.setText(
@@ -1228,7 +1223,7 @@ class MainWindow(QMainWindow):
         speed = value / 100.0
         self.speed_label.setText(f"{speed:.2f}x")
         self.tts.set_speed(speed)
-        # defer_save: the slider fires per tick — one disk write per pixel of
+        # defer_save: the slider fires per tick â€” one disk write per pixel of
         # drag was a real I/O storm. Flushed on sliderReleased + closeEvent.
         self.config.set("tts_speed", speed, defer_save=True)
 
@@ -1236,7 +1231,7 @@ class MainWindow(QMainWindow):
     def _on_speed_released(self):
         self.config.flush()
         self._update_status(
-            f"Speed set to {self.speed_slider.value() / 100.0:.2f}x — "
+            f"Speed set to {self.speed_slider.value() / 100.0:.2f}x â€” "
             "press Speak to use it"
         )
 
@@ -1309,7 +1304,7 @@ class MainWindow(QMainWindow):
 
     @Slot(bool, str)
     def _on_mic_stream_state(self, alive, reason):
-        """Mic came up / went away. A dead mic must be visible, not silent —
+        """Mic came up / went away. A dead mic must be visible, not silent â€”
         recording into a stream that delivers nothing looks identical to
         success right up until the empty transcript."""
         if alive:
@@ -1399,7 +1394,7 @@ class MainWindow(QMainWindow):
         else:
             flags &= ~Qt.WindowType.WindowStaysOnTopHint
         self.setWindowFlags(flags)
-        # setWindowFlags recreates the native handle — record the new one so
+        # setWindowFlags recreates the native handle â€” record the new one so
         # the own-window paste guard still recognizes us afterward.
         self._own_hwnds.add(int(self.winId()))
         if was_visible:
@@ -1411,7 +1406,7 @@ class MainWindow(QMainWindow):
             self.hide()
             self._update_status("Still running in the tray")
             return
-        # Full teardown — hooks, timers, workers, players, temp files.
+        # Full teardown â€” hooks, timers, workers, players, temp files.
         try:
             kb.unhook_all()
         except Exception:
