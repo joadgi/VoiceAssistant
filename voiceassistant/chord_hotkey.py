@@ -1,29 +1,49 @@
-"""Read-aloud chord detection without suppressing or replaying modifiers.
+"""Global chord matcher that consumes only the input it is entitled to.
 
-The keyboard library's suppressing-hotkey state machine delays Ctrl/Alt and
-replays them. Use a small event-driven matcher instead. Only a non-modifier
-trigger's matched down/up pair may be consumed; modifiers always pass through.
+Serves the read-aloud AND OCR hotkeys. Both want the same thing: fire once
+per chord press, keep the trigger out of the focused app, and never disturb
+anything else the user types.
 
-A hook only ever knows the events it is delivered, so this matcher's own
-`_held` set is NOT independent evidence that a key is physically down. One
-dropped key-up latches a modifier in it permanently, and `--report` confirms
-Windows really does drop key-ups on this machine. Measured consequences, with
-the shipped `ctrl+alt` read chord: after a lost Ctrl key-up EVERY later Alt
-press fired read-aloud (so Alt+Tab triggered it), and for a chord with a
-normal trigger such as `ctrl+shift+t` a plain capital T both fired read-aloud
-AND was swallowed before reaching the document. If every combo key latches,
-`_latched` can never reset and read-aloud goes silently dead until restart.
+WHY NOT `keyboard.add_hotkey`: its suppressing state machine was found
+delaying and replaying Ctrl/Alt, and the non-suppressing variant runs the
+same machine while leaving the shortcut to also reach the focused app --
+`ctrl+shift+s` for OCR was arriving in Chrome and VS Code as Save As. With
+this matcher there is no `add_hotkey` left anywhere in the app.
+
+THE RULES, in priority order:
+
+1. **Modifiers always pass through.** Suppressing `ctrl` would break Ctrl
+   system-wide. A consequence, not a bug: a modifier-ONLY chord such as
+   `ctrl+alt` can never be kept out of the focused app, so every
+   `Ctrl+Alt+<key>` shortcut also reaches it. That is why a dedicated key is
+   the better binding for these actions.
+2. **Only a matched non-modifier trigger is consumed, as a down/up PAIR.**
+   Never a lone down whose key-up escapes, and never an unmatched up.
+3. **A single-key binding also captures its modifier variants.** With
+   `scroll lock` bound, Shift+ScrollLock and Ctrl+ScrollLock fire too, since
+   the chord only requires that key to be held. Pick a key whose variants the
+   user does not need.
+
+A hook only knows the events it is delivered, so `_held` is NOT independent
+evidence that a key is physically down. One dropped key-up latches a modifier
+in it permanently, and `--report` confirms Windows really does drop key-ups on
+this machine. Measured consequences with the old `ctrl+alt` read chord: after
+a lost Ctrl key-up EVERY later Alt press fired read-aloud (so Alt+Tab
+triggered it), and for a chord with a normal trigger a plain capital T both
+fired the action AND was swallowed before reaching the document. If every
+combo key latches, `_latched` can never reset and the action goes silently
+dead until restart.
 
 So `_held` is reconciled against Windows' accepted state on every event, via
-an injected probe. The probe is a constructor argument rather than an import
-so this module keeps making no Windows calls of its own and stays hermetically
+an injected probe -- a constructor argument rather than an import, so this
+module keeps making no Windows calls of its own and stays hermetically
 testable. Reconciliation is limited to MODIFIERS and skips the current
-event's own key — see `_reconcile`. Cost is bounded and measured; no
-clipboard work, sleeps, or model work run in this handler.
+event's own key; see `_reconcile`. Cost is bounded and measured; no clipboard
+work, sleeps, or model work run in this handler.
 """
 
 
-class ReadHotkey:
+class ChordHotkey:
     def __init__(self, combo, callback, keyboard, released_probe=None):
         """`released_probe(codes) -> set` names which of `codes` Windows
         reports as physically released. Optional: without it the matcher
@@ -33,7 +53,7 @@ class ReadHotkey:
             for part in combo.split("+") if part
         )
         if not self._parts or any(not part for part in self._parts):
-            raise ValueError("Read shortcut contains an unmapped key")
+            raise ValueError("Shortcut contains an unmapped key")
         self._modifiers = set()
         for name in ("ctrl", "alt", "shift", "windows", "alt gr"):
             try:

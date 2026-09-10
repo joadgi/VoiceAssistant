@@ -49,7 +49,7 @@ run.bat/shortcuts/startup-registry compatibility.
 | `voiceassistant/transcriber.py` | `Transcriber` + `TranscriptionResult` (faster-whisper, both-pass guards, job-bound context). |
 | `voiceassistant/tts.py` | `TTSEngine` — local Kokoro blocks or one online edge-tts generator → one VLC stream, per-utterance generations, explicit pyttsx3 option, bounded waits. Carries the STOP CONTRACT and VOICE CONTRACT (in-file). |
 | `voiceassistant/ocr.py` | `ScreenCapture` (mss) + `OCREngine` (Windows-native OCR default, EasyOCR fallback) + `RegionSelector`. |
-| `voiceassistant/read_hotkey.py` | Read-aloud chord matcher; modifiers always pass through, only matched non-modifier down/up pairs can be consumed. |
+| `voiceassistant/chord_hotkey.py` | `ChordHotkey` — the global chord matcher shared by read-aloud AND OCR; modifiers always pass through, only matched non-modifier down/up pairs can be consumed, cached key state reconciled against Windows. The app contains no `keyboard.add_hotkey`. |
 | `voiceassistant/paste.py` | `Paster` — the paste worker: clipboard snapshot/restore + Win32 Ctrl+V, off the GUI thread. |
 | `voiceassistant/selection.py` | `SelectionReader` — read-aloud's 3-tier selection grab (UIA → Ctrl+C sentinel → tell caller to OCR), off the GUI thread (mirrors `Paster`). |
 | `voiceassistant/uia.py` | UI Automation selection reader — highlighted text with **no clipboard, no keystrokes, no focus switch**. |
@@ -147,12 +147,26 @@ selection never changes into SAPI; `pyttsx3` runs only when explicitly selected.
 - **Never send Ctrl+C into a console** (`winapi.is_console_window`). There it means
   INTERRUPT: read-aloud used to kill whatever command was running in the focused
   terminal. Covers conhost, Windows Terminal, ConEmu, mintty, PuTTY.
-- **Read-aloud never suppresses or replays modifiers.** `ReadHotkey` observes
-  both press orders of modifier-only combos (including the saved Ctrl+Alt),
+- **Read-aloud and OCR never suppress or replay modifiers, and share ONE
+  matcher.** `ChordHotkey` observes both press orders of modifier-only combos,
   latches one action per hold, and always returns True for Ctrl/Alt/Shift/Win.
-  For a chord with a normal key, it consumes only a matched trigger down/up
-  pair. Do not restore `keyboard.add_hotkey(..., suppress=True)`: its modifier
-  state machine was found delaying and replaying Ctrl/Alt.
+  For a chord with a normal key it consumes only a matched trigger down/up pair.
+  OCR used to run on `kb.add_hotkey`, which does **not** suppress, so
+  `ctrl+shift+s` also reached the focused window — arriving in Chrome and VS
+  Code as Save As. Routing it through the same matcher removed the **last**
+  `add_hotkey` in the app; do not reintroduce it in either form, since the
+  non-suppressing variant runs the same modifier state machine that was found
+  delaying and replaying Ctrl/Alt.
+  Two consequences worth knowing before changing a binding:
+  - A **modifier-only** chord can never be kept out of the focused app (a
+    modifier must pass through), so `ctrl+alt` also fires every
+    `Ctrl+Alt+<key>` shortcut. Measured: it is the ONLY shape the app cannot
+    swallow. That is why read-aloud ships on a dedicated key.
+  - A **single-key** binding also captures its modifier variants: with
+    `scroll lock` bound, Shift+ScrollLock and Ctrl+ScrollLock fire too, because
+    the chord only requires that key to be held. Pick a key whose variants the
+    user does not need — this rules out `insert` (Shift+Insert pastes in
+    terminals) and F-keys (Shift/Ctrl+F9 are live in editors).
 - **Copy and paste share one clipboard/input transaction lock.** Workers wait
   for Windows modifier state to be clear and abort safely on timeout. One
   checked SendInput batch contains Ctrl-down, key-down/up, Ctrl-up; partial or
@@ -187,9 +201,9 @@ selection never changes into SAPI; `pyttsx3` runs only when explicitly selected.
   state and the recording-duration cap. They are not independently protected
   against a completely lost raw key-up; do not claim otherwise.
 - **A hook's own cached key state is NOT evidence that a key is held**
-  (`read_hotkey.py` `_reconcile`). This is the half of the 2026-09-09 Ctrl fix
+  (`chord_hotkey.py` `_reconcile`). This is the half of the 2026-09-09 Ctrl fix
   that was missed: that commit stopped the app *sending* keystrokes while a
-  modifier is held, but `ReadHotkey` still *believed* a stale cached one, because
+  modifier is held, but the matcher still *believed* a stale cached one, because
   a hook only knows the events it is delivered. One dropped key-up latched a
   modifier forever with no recovery short of a restart. Measured with the shipped
   `ctrl+alt` chord: after a lost Ctrl key-up **every later Alt press fired
@@ -501,7 +515,7 @@ All are editable inline — click a hotkey pill and press your combo (single key
   reaching SAPI, and truncate-don't-re-read on a mid-utterance failure.
   **Keyboard watchpoints:** modifiers are never suppressed or replayed; only a
   matched non-modifier down/up PAIR may be consumed; hook callbacks must return
-  falsy to suppress (a Qt `Signal.emit()` returns `True`); `ReadHotkey._reconcile`
+  falsy to suppress (a Qt `Signal.emit()` returns `True`); `ChordHotkey._reconcile`
   keeps its two exclusions (current key exempt, modifiers only) and fails open;
   injected input stays one checked `SendInput` batch whose failure path releases
   only and never repeats the action.

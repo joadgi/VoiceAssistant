@@ -21,13 +21,13 @@ from PySide6.QtWidgets import (
 )
 
 from . import applog, metrics, winapi
+from .chord_hotkey import ChordHotkey
 from .config import (
     Config, DEFAULTS, MODIFIER_KEYS, normalize_hotkey, should_suppress_hotkey,
     validate_hotkey,
 )
 from .ocr import OCREngine, RegionSelector, ScreenCapture
 from .paste import Paster
-from .read_hotkey import ReadHotkey
 from .recorder import VoiceRecorder
 from .selection import (
     SRC_CONSOLE_BLOCKED, SRC_EMPTY, SRC_REFOCUS_FAILED, SRC_INPUT_BUSY, SelectionReader,
@@ -497,25 +497,32 @@ class MainWindow(QMainWindow):
         except Exception as e:
             errors.append(f"Record hotkey ({hk_record}): {e}")
 
-        try:
-            kb.add_hotkey(hk_screen, lambda: self._sig_hotkey_screen.emit())
-        except Exception as e:
-            errors.append(f"Screen hotkey ({hk_screen}): {e}")
-
-        # Never suppress/replay Ctrl, Alt, Shift, or Win. Only consume a
-        # matched non-modifier trigger, with a paired release. Modifier-only
-        # read chords remain supported and pass through unchanged.
-        try:
-            # released_probe gives the matcher independent evidence of what is
-            # physically held. Without it a single dropped Ctrl key-up made
-            # every later Alt press fire read-aloud (measured with the shipped
-            # ctrl+alt chord) and could swallow a keystroke on a normal chord.
-            self._read_hotkey = ReadHotkey(
-                hk_read, self._sig_hotkey_read.emit, kb,
-                released_probe=winapi.released_modifier_scan_codes)
-            kb.hook(self._read_hotkey, suppress=True)
-        except Exception as e:
-            errors.append(f"Read aloud hotkey ({hk_read}): {e}")
+        # Read-aloud and OCR share ONE matcher (`ChordHotkey`): fire once per
+        # chord press, keep the trigger out of the focused app, never suppress
+        # or replay a modifier.
+        #
+        # OCR used `kb.add_hotkey`, which does not suppress, so `ctrl+shift+s`
+        # ALSO reached the focused window -- arriving in Chrome and VS Code as
+        # Save As. That was the last `add_hotkey` in the app; its modifier
+        # state machine is the one documented as delaying and replaying
+        # Ctrl/Alt, so nothing should reintroduce it.
+        #
+        # released_probe gives each matcher independent evidence of what is
+        # physically held. Without it a single dropped Ctrl key-up made every
+        # later Alt press fire read-aloud (measured with the old ctrl+alt
+        # chord) and could swallow a keystroke on a normal chord.
+        for label, combo, emit, attr in (
+            ("Read aloud", hk_read, self._sig_hotkey_read.emit, "_read_hotkey"),
+            ("Screen", hk_screen, self._sig_hotkey_screen.emit, "_screen_hotkey"),
+        ):
+            try:
+                matcher = ChordHotkey(
+                    combo, emit, kb,
+                    released_probe=winapi.released_modifier_scan_codes)
+                setattr(self, attr, matcher)
+                kb.hook(matcher, suppress=True)
+            except Exception as e:
+                errors.append(f"{label} hotkey ({combo}): {e}")
 
         if errors:
             self._update_status("Hotkey errors: " + "; ".join(errors))

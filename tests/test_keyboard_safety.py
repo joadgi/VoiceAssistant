@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from voiceassistant import winapi, paste, selection
-from voiceassistant.read_hotkey import ReadHotkey
+from voiceassistant.chord_hotkey import ChordHotkey
 
 
 class Keys:
@@ -28,7 +28,7 @@ def test_modifier_only_read_chord_passes_every_edge_and_fires_once(ctrl, alt):
     for order in ((ctrl, alt), (alt, ctrl)):
         for release in ((ctrl, alt), (alt, ctrl)):
             fired = []
-            hook = ReadHotkey("ctrl+alt", lambda: fired.append(1) or True, Keys)
+            hook = ChordHotkey("ctrl+alt", lambda: fired.append(1) or True, Keys)
             edges = [("down", k) for k in order]
             edges += [("down", order[-1])] * 4  # autorepeat
             edges += [("up", k) for k in release]
@@ -42,7 +42,7 @@ def test_modifier_only_read_chord_passes_every_edge_and_fires_once(ctrl, alt):
 
 def test_nonmodifier_read_blocks_only_its_paired_edges_even_for_truthy_callback():
     fired = []
-    hook = ReadHotkey("ctrl+m", lambda: fired.append(1) or True, Keys)
+    hook = ChordHotkey("ctrl+m", lambda: fired.append(1) or True, Keys)
     assert hook(event("down", 29)) is True
     assert hook(event("down", 50)) is False
     assert hook(event("down", 50)) is False
@@ -55,7 +55,7 @@ def test_nonmodifier_read_blocks_only_its_paired_edges_even_for_truthy_callback(
 
 def test_modifier_pressed_last_never_gets_suppressed():
     fired = []
-    hook = ReadHotkey("ctrl+m", lambda: fired.append(1), Keys)
+    hook = ChordHotkey("ctrl+m", lambda: fired.append(1), Keys)
     assert hook(event("down", 50)) is True
     assert hook(event("down", 29)) is True
     assert hook(event("up", 50)) is True
@@ -232,7 +232,7 @@ def test_native_wait_reads_current_state_and_stops_at_timeout(monkeypatch):
 def test_callback_exception_preserves_release_pairing():
     def broken():
         raise RuntimeError("disposed Qt receiver")
-    hook = ReadHotkey("ctrl+m", broken, Keys)
+    hook = ChordHotkey("ctrl+m", broken, Keys)
     assert hook(event("down", 29)) is True
     assert hook(event("down", 50)) is False
     assert hook(event("up", 50)) is False
@@ -244,7 +244,7 @@ def test_callback_exception_preserves_release_pairing():
 # --------------------------------------------------------------------------- #
 # Stale cached key state (the half of the Ctrl problem the first fix missed).
 #
-# A hook only knows the events it is delivered, so ReadHotkey's `_held` set is
+# A hook only knows the events it is delivered, so ChordHotkey's `_held` set is
 # not independent evidence that a key is physically down. `--report` confirms
 # Windows really does drop key-ups on this machine, and CLAUDE.md documents
 # both causes (hook dropped past LowLevelHooksTimeout; UAC/secure-desktop
@@ -259,12 +259,12 @@ _MOD_CODES = {CTRL, 285, ALT, 312, SHIFT, 54, 91, 92}
 
 
 class World:
-    """Windows' keyboard state plus a ReadHotkey wired to probe it."""
+    """Windows' keyboard state plus a ChordHotkey wired to probe it."""
 
     def __init__(self, combo):
         self.physical = set()
         self.fired = []
-        self.hook = ReadHotkey(combo, lambda: self.fired.append(1) or True,
+        self.hook = ChordHotkey(combo, lambda: self.fired.append(1) or True,
                                Keys, released_probe=self._probe)
 
     def _probe(self, codes):
@@ -341,7 +341,7 @@ def test_reconciliation_never_checks_the_current_events_own_key():
         seen.append(set(codes))
         return set(codes)        # claim everything is released
 
-    hook = ReadHotkey("ctrl+alt", lambda: None, Keys, released_probe=probe)
+    hook = ChordHotkey("ctrl+alt", lambda: None, Keys, released_probe=probe)
     hook(event("down", CTRL))
     # Nothing else was held, so after exempting Ctrl there is nothing to
     # check and the probe is skipped outright -- the fast path.
@@ -370,7 +370,7 @@ def test_probe_failure_falls_back_to_cached_state_without_breaking_the_hook():
         raise OSError("GetAsyncKeyState unavailable")
 
     fired = []
-    hook = ReadHotkey("ctrl+alt", lambda: fired.append(1), Keys,
+    hook = ChordHotkey("ctrl+alt", lambda: fired.append(1), Keys,
                       released_probe=boom)
     assert hook(event("down", CTRL)) is True
     assert hook(event("down", ALT)) is True
@@ -381,7 +381,7 @@ def test_probe_failure_falls_back_to_cached_state_without_breaking_the_hook():
 def test_matcher_without_a_probe_keeps_its_previous_behaviour():
     """The probe is optional, so the matcher stays hermetically testable."""
     fired = []
-    hook = ReadHotkey("ctrl+alt", lambda: fired.append(1), Keys)
+    hook = ChordHotkey("ctrl+alt", lambda: fired.append(1), Keys)
     assert hook(event("down", CTRL)) is True
     assert hook(event("down", ALT)) is True
     assert fired == [1]
@@ -411,7 +411,7 @@ def test_released_probe_fails_open_on_error(monkeypatch):
 
 # --------------------------------------------------------------------------- #
 # The shipped configuration: dictation on SUPPRESSED `caps lock`, read-aloud on
-# `ctrl+alt`. ReadHotkey is a GLOBAL blocking hook, so it sees Caps Lock too.
+# `ctrl+alt`. ChordHotkey is a GLOBAL blocking hook, so it sees Caps Lock too.
 # --------------------------------------------------------------------------- #
 CAPS = 58
 
@@ -446,3 +446,69 @@ def test_read_chord_still_works_while_caps_lock_is_held():
     world.press(ALT)
     assert world.fired == [1]
     assert world.release(CAPS) is True
+
+
+# --------------------------------------------------------------------------- #
+# Read-aloud and OCR share ONE matcher, and neither may leak its trigger into
+# the focused app. OCR previously ran on kb.add_hotkey, which does not
+# suppress, so `ctrl+shift+s` also arrived in Chrome and VS Code as Save As.
+# --------------------------------------------------------------------------- #
+S = 31
+
+
+def test_ocr_chord_keeps_its_trigger_out_of_the_focused_app():
+    """The regression: ctrl+shift+s must fire OCR and be consumed, so the
+    focused app never also runs Save As."""
+    keys = type("K", (Keys,), {"codes": dict(Keys.codes, s=(S,))})
+    fired = []
+    hook = ChordHotkey("ctrl+shift+s", lambda: fired.append(1) or True, keys)
+    assert hook(event("down", 29)) is True      # ctrl passes through
+    assert hook(event("down", 42)) is True      # shift passes through
+    assert hook(event("down", S)) is False      # S is consumed
+    assert hook(event("up", S)) is False        # ...and so is its release
+    assert fired == [1]
+    # Release the modifiers, then an ordinary S must still reach the app.
+    assert hook(event("up", 42)) is True
+    assert hook(event("up", 29)) is True
+    assert hook(event("down", S)) is True
+    assert hook(event("up", S)) is True
+    assert fired == [1]
+
+
+def test_a_bare_dedicated_key_is_consumed_for_read():
+    """`scroll lock` bound to Read must not reach the focused app at all."""
+    scroll_lock = 70
+    keys = type("K", (Keys,), {"codes": dict(Keys.codes, **{"scroll lock": (scroll_lock,)})})
+    fired = []
+    hook = ChordHotkey("scroll lock", lambda: fired.append(1) or True, keys)
+    assert hook(event("down", scroll_lock)) is False
+    assert hook(event("up", scroll_lock)) is False
+    assert fired == [1]
+
+
+def test_a_single_key_binding_also_captures_its_modifier_variants():
+    """Documented consequence, pinned so it is a known trade-off rather than a
+    surprise: the chord only requires that key to be held, so Shift+<key> and
+    Ctrl+<key> fire too. This is why `insert` and F-keys are poor choices."""
+    scroll_lock = 70
+    keys = type("K", (Keys,), {"codes": dict(Keys.codes, **{"scroll lock": (scroll_lock,)})})
+    for modifier in (42, 29):               # shift, ctrl
+        fired = []
+        hook = ChordHotkey("scroll lock", lambda: fired.append(1) or True, keys)
+        assert hook(event("down", modifier)) is True
+        assert hook(event("down", scroll_lock)) is False
+        assert fired == [1], modifier
+
+
+def test_the_app_registers_no_keyboard_add_hotkey():
+    """add_hotkey's modifier state machine is the one documented as delaying
+    and replaying Ctrl/Alt. The non-suppressing variant runs the same machine,
+    so neither form should come back."""
+    import os
+
+    window_src = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                              "voiceassistant", "window.py")
+    with open(window_src, encoding="utf-8") as fh:
+        source = fh.read()
+    for call in ("kb.add_hotkey(", "keyboard.add_hotkey("):
+        assert call not in source, "%s was reintroduced" % call

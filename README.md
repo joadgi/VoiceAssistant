@@ -162,9 +162,11 @@ All hotkeys are customizable inline on the main window — click the pill, press
 ## Notes
 
 - Avoid hotkeys with the **Windows key** — the OS intercepts it and opens the Start menu
-- Browser users: the default Read hotkey `Ctrl+Shift+T` doubles as "reopen closed tab" in Chrome/Edge — rebind it (any pill, any combo) if that bothers you. Likewise `Ctrl+T`, `Ctrl+W`, `Ctrl+R` collide with browser shortcuts.
-- Modifier-only combos (e.g. `Ctrl+Alt`) work well for hold-to-talk, but note `Ctrl+Alt` doubles as **AltGr** on many international keyboard layouts — if you type with one of those, pick a different combo.
-- Safe picks: function keys (`F9`, `F10`, `F11`), `Ctrl+Shift+[letter]`, `Alt+[letter]`
+- **Read and OCR keep their trigger key to themselves.** Both run through one chord matcher that consumes the matched non-modifier key, so the focused app never sees it — the default Read hotkey `Ctrl+Shift+T` no longer also reopens a closed tab in Chrome/Edge, and `Ctrl+Shift+S` no longer arrives in editors as Save As. The flip side: while one of these is bound, that shortcut is gone from every app.
+- **Dictate is different:** it only withholds a *single dedicated key* (`Caps Lock`, `Scroll Lock`, `Insert`, `Menu`, `Num Lock`). Bind Dictate to a combo and its letter still reaches the focused app — so `Ctrl+Shift+R` also reloads the page in a browser. Another reason `Caps Lock` is the recommended dictate key.
+- **A modifier-only combo can never be withheld** (suppressing `Ctrl` would break Ctrl system-wide), so `Ctrl+Alt` fires the action on *every* `Ctrl+Alt+<key>` shortcut you press in any app. It is the one binding shape the app cannot keep to itself. It also doubles as **AltGr** on many international layouts. Fine for hold-to-talk if you accept that; a poor choice for Read or OCR.
+- **A single-key binding also captures its modifier variants.** With `Scroll Lock` bound, `Shift+Scroll Lock` and `Ctrl+Scroll Lock` trigger it too. Pick a key whose variants you do not need — which argues against `Insert` (`Shift+Insert` pastes in terminals) and function keys (`Shift+F9` / `Ctrl+F9` are live in editors).
+- Safe picks: `Scroll Lock` or `Menu` for Read/OCR (nothing else uses them), `Caps Lock` for Dictate, otherwise `Ctrl+Shift+[letter]`.
 
 ## Troubleshooting
 
@@ -249,7 +251,11 @@ everything it creates lives inside its own folder.
 
 ### Keyboard input reliability
 
-Read-aloud preserves modifier keys: Ctrl+Alt remains usable without withholding
-or replaying Ctrl/Alt presses. Dictation still uses the saved push-to-talk key.
+Read-aloud and OCR share one chord matcher that never withholds or replays
+Ctrl/Alt/Shift/Win, and consumes only a matched non-modifier trigger, so the
+shortcut does not also reach the focused app. Their cached key state is
+reconciled against Windows every event, so a dropped key-up cannot leave a
+phantom modifier that fires the action or swallows a keystroke. Dictation still
+uses the saved push-to-talk key.
 Copy/paste waits for modifiers to be released; if input is busy, dictation stays
 available for manual paste instead of sending an unintended shortcut.
