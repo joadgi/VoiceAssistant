@@ -74,8 +74,31 @@ def test_user_report_repeats_preserve_words_consistently(report):
         assert row["word_similarity"] >= 0.95, row
         assert row["word_error_rate"] <= 0.08, row
         assert row["audio_seconds"] > 5.0, row
-    scores = [row["word_similarity"] for row in rows]
-    assert max(scores) - min(scores) <= 0.02, scores
+
+    # Consistency is asserted on DURATION, not on word similarity.
+    #
+    # This guards the historical bug where one queued stream contained 2.60x,
+    # 2.50x, 2.20x and 1.90x blocks because the speed slider was re-read during
+    # generation. A `max - min <= 0.02` bound on word similarity was tried and
+    # is structurally flaky: measured 2026-09-10, Whisper is deterministic (three
+    # transcriptions of one fixed buffer are byte-identical) but KOKORO is not --
+    # three renders of the same text at the same speed gave 656768 / 656963 /
+    # 656816 samples with 98% of samples differing, because the model has
+    # stochastic components. That occasionally shifts a single word and moves
+    # similarity by ~0.027, failing a 0.02 bound on unchanged code. Comparing the
+    # PCM directly does not work either, for the same reason.
+    #
+    # Duration survives that noise and is what a mixed-speed stream would
+    # actually break: the same three renders spanned 27.365-27.373 s, a 0.03%
+    # spread, while a speed regression shows up as tens of percent. The 1%
+    # tolerance below is ~34x the observed noise and still far tighter than any
+    # real defect.
+    durations = [row["audio_seconds"] for row in rows]
+    spread = (max(durations) - min(durations)) / max(durations)
+    assert spread <= 0.01, (
+        "repeats of one text at one speed differ in length by %.2f%% "
+        "(durations=%s) -- the frozen-speed-per-utterance guarantee is broken"
+        % (spread * 100, durations))
 
 
 @pytest.mark.parametrize("speed", [1.0, 1.5, 1.98, 2.6])
