@@ -184,6 +184,43 @@ def modifiers_down():
     return tuple(vk for vk in _MODIFIER_VKS if user32.GetAsyncKeyState(vk) & 0x8000)
 
 
+def released_modifier_scan_codes(codes):
+    """Of `codes`, the MODIFIER scan codes Windows reports as physically UP.
+
+    Lets a hook reconcile its own cached key state against reality. A hook
+    only ever sees the events it is delivered, so one dropped key-up leaves a
+    modifier latched in that cache forever — and CLAUDE.md documents both
+    causes (Windows drops the low-level hook past LowLevelHooksTimeout; UAC
+    and secure-desktop switches eat events outright).
+
+    Deliberately restricted to MODIFIERS, for two independent reasons:
+
+    * A modifier is never suppressed anywhere in this app, so Windows'
+      accepted state is unconditionally authoritative for it. A key the app
+      CONSUMED never reaches that state, so the same check would wrongly call
+      a physically-held key released — the identical evidence boundary the PTT
+      watchdog observes for suppressed Caps Lock.
+    * MapVirtualKeyW is not trustworthy for every code `keyboard` enumerates:
+      measured here, ctrl's 57629 maps to VK_PAUSE (0x13), the Windows key's
+      non-extended 91/92 map to 0xF1/0xEA, and scroll lock's 57414 maps to
+      VK_CANCEL. Mapping first and then requiring the result to be a known
+      modifier VK rejects all of those.
+
+    Fails OPEN: on any error nothing is reported released, so a probe failure
+    degrades to the previous cache-only behaviour rather than cutting a
+    genuine hold short.
+    """
+    released = set()
+    try:
+        for code in codes:
+            vk = user32.MapVirtualKeyW(code, 3)  # MAPVK_VSC_TO_VK_EX
+            if vk in _MODIFIER_VKS and not (user32.GetAsyncKeyState(vk) & 0x8000):
+                released.add(code)
+    except Exception:
+        return set()
+    return released
+
+
 def wait_for_modifiers_released(timeout=2.0):
     deadline = time.monotonic() + timeout
     while modifiers_down():

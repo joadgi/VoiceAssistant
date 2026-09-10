@@ -239,3 +239,171 @@ def test_callback_exception_preserves_release_pairing():
     assert hook(event("up", 29)) is True
     assert hook.last_error == "disposed Qt receiver"
     assert not hook._held and not hook._blocked
+
+
+# --------------------------------------------------------------------------- #
+# Stale cached key state (the half of the Ctrl problem the first fix missed).
+#
+# A hook only knows the events it is delivered, so ReadHotkey's `_held` set is
+# not independent evidence that a key is physically down. `--report` confirms
+# Windows really does drop key-ups on this machine, and CLAUDE.md documents
+# both causes (hook dropped past LowLevelHooksTimeout; UAC/secure-desktop
+# switches eating events).
+#
+# These model PHYSICAL state separately from DELIVERED events -- a lost key-up
+# means the release happened but no event arrived. A harness that conflates the
+# two cannot express the bug at all.
+# --------------------------------------------------------------------------- #
+CTRL, ALT, SHIFT, M = 29, 56, 42, 50
+_MOD_CODES = {CTRL, 285, ALT, 312, SHIFT, 54, 91, 92}
+
+
+class World:
+    """Windows' keyboard state plus a ReadHotkey wired to probe it."""
+
+    def __init__(self, combo):
+        self.physical = set()
+        self.fired = []
+        self.hook = ReadHotkey(combo, lambda: self.fired.append(1) or True,
+                               Keys, released_probe=self._probe)
+
+    def _probe(self, codes):
+        # Mirrors winapi.released_modifier_scan_codes: modifiers only, since
+        # a consumed key never reaches Windows' accepted state.
+        return {c for c in codes if c in _MOD_CODES and c not in self.physical}
+
+    def press(self, code, deliver=True):
+        self.physical.add(code)
+        return self._edge("down", code, deliver)
+
+    def release(self, code, deliver=True):
+        self.physical.discard(code)
+        return self._edge("up", code, deliver)
+
+    def _edge(self, direction, code, deliver):
+        if not deliver:
+            return None
+        return self.hook(event(direction, code))
+
+
+def test_lost_modifier_keyup_does_not_leave_a_phantom_chord():
+    """The shipped ctrl+alt chord: a dropped Ctrl key-up must not turn every
+    later Alt press (Alt+Tab!) into a read-aloud trigger."""
+    world = World("ctrl+alt")
+    world.press(CTRL)
+    assert world.press(ALT) is True          # genuine read
+    world.release(ALT)
+    world.release(CTRL, deliver=False)       # physically up, event dropped
+
+    world.press(ALT)                         # user hits Alt+Tab
+    world.release(ALT)
+    assert world.fired == [1], "Alt alone fired read-aloud"
+    assert not world.hook._held
+
+
+def test_lost_modifier_keyup_does_not_swallow_an_ordinary_keystroke():
+    """With a normal trigger, the stale-modifier bug ALSO ate the keystroke:
+    a plain M fired read-aloud and never reached the document."""
+    world = World("ctrl+m")
+    world.press(CTRL)
+    assert world.press(M) is False           # genuine trigger, consumed
+    world.release(M)
+    world.release(CTRL, deliver=False)       # event dropped
+
+    assert world.press(M) is True, "ordinary M was swallowed"
+    assert world.release(M) is True
+    assert world.fired == [1], "ordinary M fired read-aloud"
+
+
+def test_every_combo_key_stuck_does_not_kill_read_aloud_permanently():
+    """If all combo keys latch, `active` can never go false, so `_latched`
+    never resets and the action can never fire again -- silently dead until
+    restart. Reconciliation must recover on the next genuine press."""
+    world = World("ctrl+alt")
+    world.press(CTRL)
+    world.press(ALT)
+    assert world.fired == [1]
+    world.release(CTRL, deliver=False)
+    world.release(ALT, deliver=False)
+
+    world.press(CTRL)
+    world.press(ALT)
+    assert world.fired == [1, 1], "read-aloud went dead after lost key-ups"
+
+
+def test_reconciliation_never_checks_the_current_events_own_key():
+    """A low-level hook runs BEFORE the event reaches the rest of the system,
+    so Windows' accepted state can still read "up" for the key being
+    delivered. Checking it would drop that key and break every chord."""
+    seen = []
+
+    def probe(codes):
+        seen.append(set(codes))
+        return set(codes)        # claim everything is released
+
+    hook = ReadHotkey("ctrl+alt", lambda: None, Keys, released_probe=probe)
+    hook(event("down", CTRL))
+    # Nothing else was held, so after exempting Ctrl there is nothing to
+    # check and the probe is skipped outright -- the fast path.
+    assert seen == [], "the current key must be exempt from reconciliation"
+
+    hook(event("down", ALT))
+    assert seen == [{CTRL}], "only the OTHER held key may be probed"
+    # Ctrl was claimed released, so the chord must not have fired.
+    assert hook._held == {ALT}
+
+
+def test_reconciliation_keeps_a_consumed_down_up_pair_matched():
+    """Dropping a modifier mid-hold must not leak an unmatched key-up into the
+    target window: pairing is driven by `_blocked`, which stays untouched."""
+    world = World("ctrl+m")
+    world.press(CTRL)
+    assert world.press(M) is False
+    world.release(CTRL, deliver=False)       # reconciled away before the M up
+    assert world.release(M) is False, "consumed M leaked an unmatched key-up"
+
+
+def test_probe_failure_falls_back_to_cached_state_without_breaking_the_hook():
+    """A probe error must never propagate: an exception mid-handler would
+    leak a down event whose key-up is consumed."""
+    def boom(codes):
+        raise OSError("GetAsyncKeyState unavailable")
+
+    fired = []
+    hook = ReadHotkey("ctrl+alt", lambda: fired.append(1), Keys,
+                      released_probe=boom)
+    assert hook(event("down", CTRL)) is True
+    assert hook(event("down", ALT)) is True
+    assert fired == [1], "must still work on cached state"
+    assert "GetAsyncKeyState unavailable" in hook.last_error
+
+
+def test_matcher_without_a_probe_keeps_its_previous_behaviour():
+    """The probe is optional, so the matcher stays hermetically testable."""
+    fired = []
+    hook = ReadHotkey("ctrl+alt", lambda: fired.append(1), Keys)
+    assert hook(event("down", CTRL)) is True
+    assert hook(event("down", ALT)) is True
+    assert fired == [1]
+
+
+def test_released_probe_reports_modifiers_only(monkeypatch):
+    """winapi's probe must ignore non-modifiers, because a key this app
+    consumed never reaches Windows' accepted state. It must also reject codes
+    whose MapVirtualKeyW result is not a real modifier VK -- measured, ctrl's
+    57629 maps to VK_PAUSE, the Windows key's 91/92 to 0xF1/0xEA."""
+    vk_for = {CTRL: 0xA2, ALT: 0xA4, M: 0x4D, 57629: 0x13, 91: 0xF1}
+    monkeypatch.setattr(winapi.user32, "MapVirtualKeyW",
+                        lambda code, kind: vk_for.get(code, 0))
+    monkeypatch.setattr(winapi.user32, "GetAsyncKeyState", lambda vk: 0)
+
+    released = winapi.released_modifier_scan_codes({CTRL, ALT, M, 57629, 91})
+    assert released == {CTRL, ALT}, released
+
+
+def test_released_probe_fails_open_on_error(monkeypatch):
+    def boom(code, kind):
+        raise OSError("no user32")
+
+    monkeypatch.setattr(winapi.user32, "MapVirtualKeyW", boom)
+    assert winapi.released_modifier_scan_codes({CTRL}) == set()

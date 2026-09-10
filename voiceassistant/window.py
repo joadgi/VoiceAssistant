@@ -506,7 +506,13 @@ class MainWindow(QMainWindow):
         # matched non-modifier trigger, with a paired release. Modifier-only
         # read chords remain supported and pass through unchanged.
         try:
-            self._read_hotkey = ReadHotkey(hk_read, self._sig_hotkey_read.emit, kb)
+            # released_probe gives the matcher independent evidence of what is
+            # physically held. Without it a single dropped Ctrl key-up made
+            # every later Alt press fire read-aloud (measured with the shipped
+            # ctrl+alt chord) and could swallow a keystroke on a normal chord.
+            self._read_hotkey = ReadHotkey(
+                hk_read, self._sig_hotkey_read.emit, kb,
+                released_probe=winapi.released_modifier_scan_codes)
             kb.hook(self._read_hotkey, suppress=True)
         except Exception as e:
             errors.append(f"Read aloud hotkey ({hk_read}): {e}")
