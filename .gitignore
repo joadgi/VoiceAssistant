@@ -14,6 +14,10 @@ __pycache__/
 settings.json
 debug.log
 *.log
+# applog uses RotatingFileHandler(backupCount=2), which appends a numeric
+# suffix: debug.log.1 / debug.log.2. Those match neither pattern above,
+# so rotated logs showed up as untracked files.
+*.log.[0-9]
 
 # Models (downloaded at runtime, large)
 models/
