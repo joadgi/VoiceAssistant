@@ -419,10 +419,24 @@ selection never changes into SAPI; `pyttsx3` runs only when explicitly selected.
   text pasted into the focused window is the worst failure this app has; it is not worth
   any latency win. The Settings dropdown therefore does not offer distil models.
 - The Whisper model downloads on first run (one-time, cached outside the repo). The
-  default OCR backend is Windows-native — no model download, no PyTorch. **PyTorch is
-  no longer a dependency** (it only ever served EasyOCR); Whisper-GPU gets its CUDA
-  runtime from the `nvidia-cublas-cu12`/`nvidia-cudnn-cu12` wheels (see
-  `Transcriber._add_nvidia_dll_dirs`).
+  default OCR backend is Windows-native — no model download, no PyTorch. PyTorch is
+  **no longer declared** (it only ever served EasyOCR); `requirements.txt` asks for the
+  slim `nvidia-cublas-cu12`/`nvidia-cudnn-cu12` wheels instead, which
+  `Transcriber._add_nvidia_dll_dirs` registers.
+  **But do NOT assume an existing venv matches that.** Measured 2026-09-10 on this
+  machine: the nvidia wheels are **not installed at all**, `torch 2.5.1+cu121` is
+  (**4.58 GB**), and GPU dictation is genuinely running on torch's CUDA DLLs —
+  `--check` correctly reports `provided by torch`, and `_add_nvidia_dll_dirs` is a
+  no-op here. So on this venv **torch is load-bearing for GPU transcription**;
+  uninstalling it would drop dictation to CPU int8 (10–20x slower). The self-check's
+  wording is the truth, not drift — believe it over this file.
+  Reclaiming that 4.58 GB is a real but SEPARATE task, not a cleanup to fold into
+  something else: install the two wheels, confirm `--check` reports
+  `nvidia wheels: cublas, cudnn`, re-run
+  `RUN_CORPUS=1 CORPUS_MODEL=large-v3 pytest tests/test_corpus_gate.py` and confirm
+  `--report` still says `on cuda`, and only then remove torch. Both runtimes ship
+  cuBLAS/cuDNN, so installing the wheels alongside torch risks a DLL version clash —
+  do it deliberately, with the corpus gate as the arbiter, never as a drive-by.
 - **TTS dependency decision (2026-08-27):** Kokoro ONNX is the default read-aloud
   backend because edge-tts could not produce audio as fast as the user's high-speed playback.
   `setup.bat` downloads the official 164 MB FP16 model plus 28 MB voice pack. Inference
