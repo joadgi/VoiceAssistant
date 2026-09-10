@@ -407,3 +407,42 @@ def test_released_probe_fails_open_on_error(monkeypatch):
 
     monkeypatch.setattr(winapi.user32, "MapVirtualKeyW", boom)
     assert winapi.released_modifier_scan_codes({CTRL}) == set()
+
+
+# --------------------------------------------------------------------------- #
+# The shipped configuration: dictation on SUPPRESSED `caps lock`, read-aloud on
+# `ctrl+alt`. ReadHotkey is a GLOBAL blocking hook, so it sees Caps Lock too.
+# --------------------------------------------------------------------------- #
+CAPS = 58
+
+
+def test_reconciliation_never_judges_a_suppressed_key(monkeypatch):
+    """Caps Lock is suppressed, so it never reaches Windows' accepted state.
+    Reconciling it would call a physically-held key released. The boundary
+    holds because VK_CAPITAL is not a modifier VK -- assert that, so a future
+    widening of _MODIFIER_VKS cannot silently break it."""
+    vk = winapi.user32.MapVirtualKeyW(CAPS, 3)
+    assert vk == 0x14, vk                     # VK_CAPITAL
+    assert vk not in winapi._MODIFIER_VKS
+    monkeypatch.setattr(winapi.user32, "GetAsyncKeyState", lambda v: 0)
+    assert winapi.released_modifier_scan_codes({CAPS}) == set()
+
+
+def test_caps_lock_dictation_passes_through_the_read_hook():
+    """A dictation hold must not fire read-aloud, and the read hook must never
+    consume the Caps Lock event -- the dictation hook owns that key."""
+    world = World("ctrl+alt")
+    for direction in ("down", "down", "down", "up"):   # hold with autorepeat
+        assert world._edge(direction, CAPS, True) is True
+    assert world.fired == []
+
+
+def test_read_chord_still_works_while_caps_lock_is_held():
+    """Dictating and reading are independent; holding one must not block the
+    other."""
+    world = World("ctrl+alt")
+    world.press(CAPS)
+    world.press(CTRL)
+    world.press(ALT)
+    assert world.fired == [1]
+    assert world.release(CAPS) is True
