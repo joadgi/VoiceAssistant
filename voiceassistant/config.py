@@ -159,11 +159,23 @@ def sanitize_settings(data):
     When a duplicate/invalid hotkey is reset, the replacement must itself be
     unique — resetting to a default that IS the colliding value used to leave
     two actions bound to one combo. A reserve pool guarantees a free combo.
+
+    Keys no longer in DEFAULTS are dropped. `load()` does
+    `_data.update(saved)` and `save()` writes `_data` back, so an obsolete key
+    is otherwise carried forward forever: `tts_rate` was removed from the code
+    in f4c5043 and `hotkey_stop` in the July cleanup, yet both were still in
+    the live settings.json months later. Removing a setting from the code has
+    to remove it from the file too, or the cleanup silently does not happen.
     """
     fallback_pool = [DEFAULTS[k] for k in HOTKEY_KEYS] + [
         "ctrl+shift+f9", "ctrl+shift+f10", "ctrl+shift+f11",
     ]
-    cleaned = dict(data)
+    obsolete = [k for k in data if k not in DEFAULTS]
+    if obsolete:
+        # Name them: a setting vanishing from the user's file must be
+        # explicable afterwards, not silent.
+        applog.info("dropped obsolete settings: %s" % ", ".join(sorted(obsolete)))
+    cleaned = {k: v for k, v in data.items() if k in DEFAULTS}
     seen = set()
     for key in HOTKEY_KEYS:
         value = normalize_hotkey(cleaned.get(key, DEFAULTS[key]))

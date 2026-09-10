@@ -276,6 +276,30 @@ class TestHotkeys:
         vals = [cleaned[k] for k in ("hotkey_record", "hotkey_screen_read", "hotkey_read_aloud")]
         assert len(set(vals)) == 3, f"hotkeys not unique after sanitize: {vals}"
 
+    def test_sanitize_settings_drops_keys_no_longer_in_defaults(self):
+        """load() does _data.update(saved) and save() writes _data back, so an
+        obsolete key is carried forward forever. tts_rate was removed from the
+        code in f4c5043 and hotkey_stop in the July cleanup, yet both were
+        still in the live settings.json months later."""
+        data = dict(DEFAULTS)
+        data["tts_rate"] = 175
+        data["hotkey_stop"] = "escape"
+        cleaned = sanitize_settings(data)
+        assert "tts_rate" not in cleaned
+        assert "hotkey_stop" not in cleaned
+
+    def test_sanitize_settings_keeps_every_real_preference(self):
+        """Losing a genuine setting is far worse than keeping a dead key, so
+        pruning must touch nothing else."""
+        data = dict(DEFAULTS)
+        data.update({"whisper_model": "large-v3", "tts_speed": 1.98,
+                     "hotkey_record": "caps lock", "obsolete_key": "junk"})
+        cleaned = sanitize_settings(data)
+        assert set(cleaned) == set(DEFAULTS)
+        assert cleaned["whisper_model"] == "large-v3"
+        assert cleaned["tts_speed"] == 1.98
+        assert cleaned["hotkey_record"] == "caps lock"
+
 
 # ---------------------------------------------------------------------------
 # Config persistence — corrupt/missing/partial settings.json
