@@ -238,3 +238,92 @@ class TestWindowAppName:
         monkeypatch.setattr(winapi.user32, "GetWindowThreadProcessId", boom)
         monkeypatch.setattr(winapi, "get_window_class", lambda hwnd: "")
         assert winapi.get_window_app(1234) == ""
+
+
+class TestMutedMicrophoneIsNamed:
+    """"No sound detected" is the same message for "you spoke quietly" and
+    "Windows has your mic muted", and it sends you to the gain knob either way.
+    That cost three hours on 2026-09-12. Sample data cannot tell those apart;
+    the endpoint's mute flag can."""
+
+    def test_mute_state_returns_a_pair_and_never_raises(self):
+        muted, level = winapi.capture_device_mute_state()
+        assert muted in (True, False, None)
+        assert level is None or 0.0 <= level <= 1.0
+
+    def test_an_unreadable_state_is_unknown_not_false(self, monkeypatch):
+        """An unknown must never be reported to the user as "not muted"."""
+        # No interpreter to run the probe with.
+        monkeypatch.setattr(winapi, "_probe_interpreter", lambda: "")
+        assert winapi.capture_device_mute_state() == (None, None)
+
+    def test_a_probe_that_says_nothing_is_unknown(self, monkeypatch):
+        """A probe that crashes or prints junk must not be read as a state."""
+        import subprocess
+
+        class _Result:
+            stdout = ""
+            stderr = "Traceback: the audio service is not running"
+
+        monkeypatch.setattr(subprocess, "run", lambda *a, **k: _Result())
+        assert winapi.capture_device_mute_state() == (None, None)
+
+    def test_the_probe_runs_out_of_process(self):
+        """COM is apartment-threaded; running this in-process segfaulted the
+        suite right after the UI Automation tests. Keep it isolated."""
+        import inspect
+
+        src = inspect.getsource(winapi.capture_device_mute_state)
+        assert "subprocess" in src, (
+            "the mute probe is back in-process -- that segfaulted the suite")
+        assert "timeout" in src, "an isolated probe must still be bounded"
+
+    def test_a_muted_mic_is_named_on_the_pill_and_in_the_status(self, mw, monkeypatch):
+        import numpy as np
+
+        from voiceassistant import metrics
+
+        w, win_mod = mw
+        monkeypatch.setattr(win_mod.winapi, "capture_device_mute_state",
+                            lambda: (True, 0.6))
+        w._pending_target_hwnd = 4242
+        silence = np.zeros(16000, dtype=np.float32)
+        w._on_recording_stopped(silence)
+        assert "MUTED" in w.indicator._label.text()
+        assert "muted" in w.status_bar.currentMessage().lower()
+        row = metrics.load()[-1]
+        assert row["outcome"] == metrics.OUTCOME_DROPPED_QUIET
+        assert row["mic_muted"] is True
+
+    def test_a_zeroed_input_level_is_named_too(self, mw, monkeypatch):
+        import numpy as np
+
+        w, win_mod = mw
+        monkeypatch.setattr(win_mod.winapi, "capture_device_mute_state",
+                            lambda: (False, 0.0))
+        w._pending_target_hwnd = 4242
+        w._on_recording_stopped(np.zeros(16000, dtype=np.float32))
+        assert "zero" in w.indicator._label.text().lower()
+        assert "level" in w.status_bar.currentMessage().lower()
+
+    def test_an_unmuted_quiet_mic_keeps_the_old_message(self, mw, monkeypatch):
+        """Don't cry mute when the user simply spoke too softly."""
+        import numpy as np
+
+        w, win_mod = mw
+        monkeypatch.setattr(win_mod.winapi, "capture_device_mute_state",
+                            lambda: (False, 0.75))
+        w._pending_target_hwnd = 4242
+        w._on_recording_stopped(np.zeros(16000, dtype=np.float32))
+        assert "no sound" in w.indicator._label.text().lower()
+        assert "muted" not in w.status_bar.currentMessage().lower().replace("unmuted", "")
+
+    def test_an_unknown_state_keeps_the_old_message(self, mw, monkeypatch):
+        import numpy as np
+
+        w, win_mod = mw
+        monkeypatch.setattr(win_mod.winapi, "capture_device_mute_state",
+                            lambda: (None, None))
+        w._pending_target_hwnd = 4242
+        w._on_recording_stopped(np.zeros(16000, dtype=np.float32))
+        assert "no sound" in w.indicator._label.text().lower()

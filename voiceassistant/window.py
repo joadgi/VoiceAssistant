@@ -819,9 +819,12 @@ class MainWindow(QMainWindow):
         moment later, which reads as flickering in the user's document.
         """
         if self._inline_target is None:
+            applog.dbg("inline draft ignored: no inline session for this recording")
             return
-        self.paster.type_to(self._inline_target, self._inline_session,
-                            stream_target(stable))
+        target = stream_target(stable)
+        applog.dbg("inline draft: stable=%d tail=%d -> type %d chars"
+                   % (len(stable or ""), len(tail or ""), len(target)))
+        self.paster.type_to(self._inline_target, self._inline_session, target)
 
     def _inline_discard(self, session=None, erase=True):
         """End an inline session, taking back the draft this app typed.
@@ -973,11 +976,34 @@ class MainWindow(QMainWindow):
             return
         if max_amp < min_peak:
             applog.dbg(f"  ignored - too quiet (peak {max_amp:.4f} < {min_peak})")
-            self._update_status(
-                f"Ignored — no sound detected (peak {max_amp:.3f}). "
-                "Check the mic is unmuted and selected in Settings."
-            )
-            self.indicator.show_error("No sound — check mic")
+            # NAME THE CAUSE. "No sound detected" is the same message whether
+            # you spoke too quietly or Windows has the microphone muted, and it
+            # sends you to the gain knob either way. On 2026-09-12 that cost
+            # three hours: the device opened, delivered frames, and every
+            # sample was zero because the endpoint was muted. Sample data
+            # cannot tell those apart; the mute flag can.
+            muted, level = winapi.capture_device_mute_state()
+            if muted:
+                base["mic_muted"] = True
+                self.indicator.show_error("Microphone is MUTED in Windows")
+                self._update_status(
+                    "Your microphone is muted in Windows — nothing was recorded. "
+                    "Unmute it (the mic's own mute button, Windows Sound settings, "
+                    "or whatever app is managing it) and try again."
+                )
+            elif level is not None and level < 0.02:
+                base["mic_muted"] = True
+                self.indicator.show_error("Mic input level is at zero")
+                self._update_status(
+                    f"Your microphone's Windows input level is {level * 100:.0f}% — "
+                    "nothing was recorded. Raise it in Windows Sound settings."
+                )
+            else:
+                self._update_status(
+                    f"Ignored — no sound detected (peak {max_amp:.3f}). "
+                    "Check the mic is unmuted and selected in Settings."
+                )
+                self.indicator.show_error("No sound — check mic")
             self._inline_discard()
             metrics.record(metrics.OUTCOME_DROPPED_QUIET, **base)
             return

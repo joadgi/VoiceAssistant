@@ -224,6 +224,16 @@ def _check_microphone():
 
         from .config import Config
 
+        from . import winapi
+
+        muted, level = winapi.capture_device_mute_state()
+        if muted:
+            return False, ("the default microphone is MUTED in Windows — "
+                           "dictation will record silence until it is unmuted")
+        if level is not None and level < 0.02:
+            return False, (f"the default microphone's Windows input level is "
+                           f"{level * 100:.0f}% — dictation will record silence")
+
         chosen = Config().get("audio_device", -1)
         if chosen is None or chosen < 0:
             return True, f"{len(ins)} input device(s), using the system default"

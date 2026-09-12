@@ -90,6 +90,113 @@ def get_window_class(hwnd):
     return ""
 
 
+# ---------------------------------------------------------------------------
+# Capture-device mute state (Core Audio, run OUT OF PROCESS)
+# ---------------------------------------------------------------------------
+# WHY THIS EXISTS: on 2026-09-12 dictation "stopped working" for three hours.
+# The microphone opened fine and delivered frames, so every health check the
+# app had said it was healthy -- but Windows had the endpoint MUTED, so every
+# sample was zero. The app faithfully reported "no sound detected, check the
+# mic is unmuted" on each attempt, which is correct and useless: it is the
+# same message you get for speaking too quietly, and it sends you to the gain
+# knob when the answer is a mute flag. Sample data cannot tell those apart.
+# The mute flag can, and reading it turns a three-hour hunt into one sentence.
+#
+# WHY A SUBPROCESS: Core Audio is COM, and COM is apartment-threaded. Doing
+# this in-process segfaulted the test suite the moment it ran after the UI
+# Automation tests, which initialize COM on the same thread for their own
+# purposes (`uia.py` documents the same hazard, and crash.log already carries
+# first-chance COM exceptions from that path). A diagnostic that can kill the
+# app it is diagnosing is not worth having. This runs at most once per dropped
+# dictation and once per --check, so ~100 ms of isolation is free.
+#
+# Returns (muted, volume_scalar), or (None, None) when the state cannot be
+# read -- an unknown must NEVER be reported to the user as "not muted".
+_MUTE_PROBE = r"""
+import ctypes as c
+import comtypes
+from comtypes import COMMETHOD, GUID, IUnknown
+
+class V(IUnknown):
+    _iid_ = GUID("{5CDF2C82-841E-4546-9722-0CF74078229A}")
+    _methods_ = [
+        COMMETHOD([], c.HRESULT, "a", (["in"], c.c_void_p, "x")),
+        COMMETHOD([], c.HRESULT, "b", (["in"], c.c_void_p, "x")),
+        COMMETHOD([], c.HRESULT, "cc", (["out"], c.POINTER(c.c_uint), "x")),
+        COMMETHOD([], c.HRESULT, "d", (["in"], c.c_float, "x"), (["in"], c.POINTER(GUID), "y")),
+        COMMETHOD([], c.HRESULT, "e", (["in"], c.c_float, "x"), (["in"], c.POINTER(GUID), "y")),
+        COMMETHOD([], c.HRESULT, "f", (["out"], c.POINTER(c.c_float), "x")),
+        COMMETHOD([], c.HRESULT, "GetMasterVolumeLevelScalar", (["out"], c.POINTER(c.c_float), "x")),
+        COMMETHOD([], c.HRESULT, "h", (["in"], c.c_uint, "n"), (["in"], c.c_float, "x"), (["in"], c.POINTER(GUID), "y")),
+        COMMETHOD([], c.HRESULT, "i", (["in"], c.c_uint, "n"), (["in"], c.c_float, "x"), (["in"], c.POINTER(GUID), "y")),
+        COMMETHOD([], c.HRESULT, "j", (["in"], c.c_uint, "n"), (["out"], c.POINTER(c.c_float), "x")),
+        COMMETHOD([], c.HRESULT, "k", (["in"], c.c_uint, "n"), (["out"], c.POINTER(c.c_float), "x")),
+        COMMETHOD([], c.HRESULT, "l", (["in"], c.c_int, "x"), (["in"], c.POINTER(GUID), "y")),
+        COMMETHOD([], c.HRESULT, "GetMute", (["out"], c.POINTER(c.c_int), "x")),
+    ]
+
+class D(IUnknown):
+    _iid_ = GUID("{D666063F-1587-4E43-81F1-B948E807363F}")
+    _methods_ = [
+        COMMETHOD([], c.HRESULT, "Activate", (["in"], c.POINTER(GUID), "iid"),
+                  (["in"], c.c_ulong, "ctx"), (["in"], c.c_void_p, "p"),
+                  (["out"], c.POINTER(c.POINTER(IUnknown)), "o")),
+        COMMETHOD([], c.HRESULT, "OpenPropertyStore", (["in"], c.c_ulong, "a"),
+                  (["out"], c.POINTER(c.POINTER(IUnknown)), "o")),
+        COMMETHOD([], c.HRESULT, "GetId", (["out"], c.POINTER(c.c_wchar_p), "o")),
+        COMMETHOD([], c.HRESULT, "GetState", (["out"], c.POINTER(c.c_ulong), "o")),
+    ]
+
+class E(IUnknown):
+    _iid_ = GUID("{A95664D2-9614-4F35-A746-DE8DB63617E6}")
+    _methods_ = [
+        COMMETHOD([], c.HRESULT, "EnumAudioEndpoints", (["in"], c.c_int, "f"),
+                  (["in"], c.c_ulong, "m"), (["out"], c.POINTER(c.POINTER(IUnknown)), "o")),
+        COMMETHOD([], c.HRESULT, "GetDefaultAudioEndpoint", (["in"], c.c_int, "f"),
+                  (["in"], c.c_int, "r"), (["out"], c.POINTER(c.POINTER(D)), "o")),
+    ]
+
+comtypes.CoInitialize()
+en = comtypes.CoCreateInstance(GUID("{BCDE0395-E52F-467C-8E3D-C4579291692E}"), E, comtypes.CLSCTX_ALL)
+dev = en.GetDefaultAudioEndpoint(1, 0)
+vol = c.cast(dev.Activate(V._iid_, comtypes.CLSCTX_ALL, None), c.POINTER(V))
+print("%d %.4f" % (int(vol.GetMute()), float(vol.GetMasterVolumeLevelScalar())))
+"""
+
+
+def _probe_interpreter():
+    """A console python for the probe; pythonw works but python.exe is tidier."""
+    exe = sys.executable or ""
+    if exe.lower().endswith("pythonw.exe"):
+        candidate = exe[: -len("pythonw.exe")] + "python.exe"
+        if os.path.isfile(candidate):
+            return candidate
+    return exe
+
+
+def capture_device_mute_state():
+    """(muted, volume_scalar) for the DEFAULT capture device; (None, None) on error."""
+    exe = _probe_interpreter()
+    if not exe:
+        return None, None
+    try:
+        import subprocess
+
+        result = subprocess.run(
+            [exe, "-c", _MUTE_PROBE],
+            capture_output=True, text=True, timeout=6,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        parts = (result.stdout or "").strip().split()
+        if len(parts) != 2:
+            applog.dbg(f"mute probe returned nothing usable: {result.stderr[:120]!r}")
+            return None, None
+        return bool(int(parts[0])), float(parts[1])
+    except Exception as exc:
+        applog.dbg(f"could not read capture mute state: {exc}")
+        return None, None
+
+
 def get_window_app(hwnd):
     """Best-effort executable name for a window, e.g. "chrome.exe".
 

@@ -142,10 +142,16 @@ class Paster:
         # A job queued for a dictation that has since ended or moved on must
         # never touch the window.
         if state is None or state.hwnd != hwnd or state.session != session:
+            applog.dbg("inline type skipped: stale job (session=%s)" % session)
             return
         if state.broken or not state.certain:
+            applog.dbg("inline type skipped: broken=%s certain=%s"
+                       % (state.broken, state.certain))
             return
         plan = plan_edit(state.text, desired, MAX_STREAM_BACKSPACES)
+        applog.dbg("inline type: have=%d want=%d plan=%s"
+                   % (len(state.text), len(desired),
+                      "refused" if plan is None else "back=%d type=%d" % (plan[0], len(plan[1]))))
         if plan is None:
             # The draft revised more than a correction should chase mid-flight.
             # Stop typing and let the final reconciliation do it properly.
@@ -215,6 +221,12 @@ class Paster:
             if state is None or state.hwnd != hwnd or state.session != session:
                 # Not our session: the normal paste path is both correct and
                 # better tested, so use it.
+                applog.dbg(
+                    "inline finalize: not our session (state=%s want hwnd=%s "
+                    "session=%s)" % (
+                        "none" if state is None
+                        else "hwnd=%s session=%s" % (state.hwnd, state.session),
+                        hwnd, session))
                 outcome = INLINE_NONE
             elif not state.certain:
                 # ORDER MATTERS: this is checked BEFORE "did we type anything",
@@ -226,6 +238,8 @@ class Paster:
                 outcome = INLINE_PARTIAL
             elif not state.text:
                 # Nothing of ours is in the window, and we know that for sure.
+                applog.dbg("inline finalize: nothing had been typed "
+                           "(broken=%s) -> falling back to paste" % state.broken)
                 outcome = INLINE_NONE
             elif not self._refocus_target(state):
                 outcome = INLINE_PARTIAL
