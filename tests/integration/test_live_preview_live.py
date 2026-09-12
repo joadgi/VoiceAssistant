@@ -187,7 +187,7 @@ def test_draft_matches_what_the_final_pass_will_paste(transcriber):
 
 @pytest.mark.skipif(os.environ.get("RUN_INLINE") != "1",
                     reason="also set RUN_INLINE=1 (injects real keystrokes)")
-def test_the_whole_chain_types_the_speech_into_a_real_window(transcriber, qapp):
+def test_the_whole_chain_types_the_speech_into_a_real_window(qapp, request):
     """Speech in, words in a real text box, corrected to the final transcription.
 
     This is the feature as the user experiences it, with every seam real: the
@@ -219,6 +219,16 @@ def test_the_whole_chain_types_the_speech_into_a_real_window(transcriber, qapp):
     if winapi.get_foreground_window() != hwnd:
         edit.close()
         pytest.skip("could not take the foreground — refusing to type blind")
+
+    # The model is loaded ONLY NOW, after the window is already focused.
+    # Resolving the transcriber fixture first burns ~12 s of model load, and
+    # Windows hands foreground rights to whichever process saw the last user
+    # input — so by the time the window appeared, it could no longer take the
+    # foreground and this test skipped itself every run.
+    transcriber = request.getfixturevalue("transcriber")
+    if winapi.get_foreground_window() != hwnd:
+        edit.close()
+        pytest.skip("focus moved during model load — refusing to type blind")
 
     existing = "EXISTING USER TEXT. "
     edit.setPlainText(existing)

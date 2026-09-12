@@ -114,7 +114,7 @@ class Paster:
             applog.info("inline draft left in place: injection count was unknown")
         elif erase and state.text and not state.broken:
             plan = plan_edit(state.text, "", MAX_FINAL_BACKSPACES)
-            if plan is not None:
+            if plan is not None and self._refocus_target(state):
                 self._apply_plan(state, plan)
         self._typed = None
 
@@ -134,6 +134,27 @@ class Paster:
             state.broken = True
             return
         self._apply_plan(state, plan)
+
+    def _refocus_target(self, state):
+        """Bring the dictation target back to the front for the FINAL edit.
+
+        Streaming deliberately does NOT do this: if the user looks away
+        mid-sentence, stealing focus back would fight them, so typing simply
+        stops. The final edit is different — it is the dictation landing, and
+        the normal paste path has always refocused for exactly that reason.
+        Without it, alt-tabbing away before releasing the key left a truncated
+        draft in the document and the real text only on the clipboard.
+        """
+        if winapi.get_foreground_window() == state.hwnd:
+            return True
+        if not winapi.wait_for_modifiers_released(2.0):
+            applog.info("inline finalize deferred: modifiers still held")
+            return False
+        if not winapi.set_foreground_window(state.hwnd):
+            applog.info("inline finalize deferred: target window refused focus")
+            return False
+        time.sleep(0.12)
+        return winapi.get_foreground_window() == state.hwnd
 
     def _apply_plan(self, state, plan):
         """Run (backspaces, to_type) against the window, keeping the record exact.
@@ -187,6 +208,8 @@ class Paster:
             elif not state.text:
                 # Nothing of ours is in the window, and we know that for sure.
                 outcome = INLINE_NONE
+            elif not self._refocus_target(state):
+                outcome = INLINE_PARTIAL
             else:
                 plan = plan_edit(state.text, sanitize_for_paste(final_text),
                                  MAX_FINAL_BACKSPACES)

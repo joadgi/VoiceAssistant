@@ -439,6 +439,14 @@ selection never changes into SAPI; `pyttsx3` runs only when explicitly selected.
   we type anything" BEFORE "is the record certain", so a partial batch that
   never reached the record reported "nothing typed" and the app pasted a second
   copy underneath the orphaned characters. Order those checks the other way.
+- **Streaming never steals focus back; the FINAL edit does** (`_refocus_target`).
+  If the user looks away mid-sentence, dragging their window to the front to
+  keep typing would fight them, so streaming just stops. The final edit is the
+  dictation landing, and the normal paste path has always refocused for exactly
+  that reason — without it, alt-tabbing away before releasing the key left a
+  truncated draft in the document with the real text only on the clipboard.
+  Found by the live chain test: another process took the foreground mid-run,
+  the app correctly refused to type, and the dictation then ended as `partial`.
 - **Inline typing is refused outright for a modifier-holding hotkey, a console,
   or our own window** (`block_reason`, decided ONCE at record start). With
   `ctrl+shift+r` held, Ctrl is physically down for the whole utterance, so every

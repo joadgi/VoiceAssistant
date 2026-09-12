@@ -170,6 +170,9 @@ class _FakeInput:
     def __init__(self, window):
         self.window = window
         self.refuse = False
+        # Which window Windows reports as focused. Defaults to the dictation
+        # target, so a test only has to say so when it cares about focus.
+        self.foreground = TestWorkerState.HWND
         self.fail_text_after = None       # chars to deliver, then report unknown
         self.fail_backspace_after = None
         self.typed_calls = []
@@ -202,11 +205,22 @@ class _FakeInput:
 
 @pytest.fixture
 def worker(monkeypatch):
-    """A real Paster with its Win32 injection faked, driven synchronously."""
+    """A real Paster with its Win32 injection faked, driven synchronously.
+
+    Focus is modelled too: the final edit refocuses the target (see
+    `_refocus_target`), so without this every test would be fighting the real
+    foreground window of whatever is on screen.
+    """
     window = _FakeWindow()
     fake = _FakeInput(window)
     monkeypatch.setattr(paste_mod.winapi, "send_text", fake.send_text)
     monkeypatch.setattr(paste_mod.winapi, "send_backspaces", fake.send_backspaces)
+    monkeypatch.setattr(paste_mod.winapi, "get_foreground_window",
+                        lambda: fake.foreground)
+    monkeypatch.setattr(paste_mod.winapi, "wait_for_modifiers_released",
+                        lambda timeout=2.0: True)
+    monkeypatch.setattr(paste_mod.winapi, "set_foreground_window",
+                        lambda hwnd: True)
     p = Paster()
     yield p, fake, window
     p.shutdown()
@@ -365,6 +379,90 @@ class TestWorkerState:
         self._type(p, "draft")
         p._cancel_inline_job(1, erase=True)
         assert fake.backspace_calls == [], "erased against an unknown count"
+
+    def test_streaming_never_steals_focus_back(self, worker, monkeypatch):
+        """If the user looks away mid-sentence, typing stops — it does NOT drag
+        the window back in front of them. Only the final edit may refocus."""
+        p, fake, win = worker
+        calls = []
+        monkeypatch.setattr(paste_mod.winapi, "set_foreground_window",
+                            lambda hwnd: calls.append(hwnd) or True)
+        monkeypatch.setattr(paste_mod.winapi, "get_foreground_window", lambda: 999)
+        p._begin_inline_job(self.HWND, 1)
+        self._type(p, "Hello")
+        assert calls == [], "streaming pulled the target window to the front"
+
+    def test_finalize_refocuses_the_target_before_correcting(self, worker, monkeypatch):
+        """Alt-tabbing away before releasing the key must still land the text.
+
+        Without this the dictation ended as a truncated draft in the document
+        with the real text only on the clipboard — the paste path has always
+        refocused for exactly this reason.
+        """
+        p, fake, win = worker
+        p._begin_inline_job(self.HWND, 1)
+        self._type(p, "Hello")
+        fg = [self.HWND]
+        monkeypatch.setattr(paste_mod.winapi, "get_foreground_window", lambda: fg[0])
+        monkeypatch.setattr(paste_mod.winapi, "wait_for_modifiers_released",
+                            lambda timeout=2.0: True)
+
+        def refocus(hwnd):
+            fg[0] = hwnd
+            return True
+
+        monkeypatch.setattr(paste_mod.winapi, "set_foreground_window", refocus)
+        monkeypatch.setattr(paste_mod.time, "sleep", lambda s: None)
+        fg[0] = 999  # the user looked away
+        done = []
+        p._finalize_inline_job(self.HWND, 1, "Hello world.", self._collector(done))
+        assert done == [INLINE_TYPED]
+        assert win.content == "Hello world."
+
+    def test_finalize_gives_up_when_the_window_refuses_focus(self, worker, monkeypatch):
+        p, fake, win = worker
+        p._begin_inline_job(self.HWND, 1)
+        self._type(p, "Hello")
+        monkeypatch.setattr(paste_mod.winapi, "get_foreground_window", lambda: 999)
+        monkeypatch.setattr(paste_mod.winapi, "wait_for_modifiers_released",
+                            lambda timeout=2.0: True)
+        monkeypatch.setattr(paste_mod.winapi, "set_foreground_window", lambda hwnd: False)
+        done = []
+        p._finalize_inline_job(self.HWND, 1, "Hello world.", self._collector(done))
+        assert done == [INLINE_PARTIAL]
+        assert win.content == "Hello", "the window was edited without focus"
+
+    def test_finalize_does_not_fight_a_held_modifier(self, worker, monkeypatch):
+        p, fake, win = worker
+        p._begin_inline_job(self.HWND, 1)
+        self._type(p, "Hello")
+        monkeypatch.setattr(paste_mod.winapi, "get_foreground_window", lambda: 999)
+        monkeypatch.setattr(paste_mod.winapi, "wait_for_modifiers_released",
+                            lambda timeout=2.0: False)
+        focus_calls = []
+        monkeypatch.setattr(paste_mod.winapi, "set_foreground_window",
+                            lambda hwnd: focus_calls.append(hwnd) or True)
+        done = []
+        p._finalize_inline_job(self.HWND, 1, "Hello world.", self._collector(done))
+        assert done == [INLINE_PARTIAL]
+        assert focus_calls == []
+
+    def test_typing_resumes_at_finalize_after_a_mid_sentence_refusal(self, worker, monkeypatch):
+        """A refusal during streaming truncates the draft but must not lose the
+        rest of the dictation: the final edit appends what was missed."""
+        p, fake, win = worker
+        p._begin_inline_job(self.HWND, 1)
+        self._type(p, "Here is the first point.")
+        fake.refuse = True
+        self._type(p, "Here is the first point. Finally,")
+        assert win.content == "Here is the first point."
+        fake.refuse = False
+        done = []
+        p._finalize_inline_job(
+            self.HWND, 1, "Here is the first point. Finally, the third.",
+            self._collector(done))
+        assert done == [INLINE_TYPED]
+        assert win.content == "Here is the first point. Finally, the third."
 
     def test_a_stale_job_cannot_touch_the_next_dictation(self, worker):
         """Back-to-back dictations usually share an HWND, so the session id is
