@@ -80,9 +80,11 @@ class Paster:
     def finalize_inline(self, hwnd, session, final_text, done_cb):
         """Reconcile what was typed with the final transcription.
 
-        done_cb(outcome, text) runs on the worker thread — pass a signal's
-        emit. Outcome is INLINE_TYPED / INLINE_PARTIAL / INLINE_NONE; the
-        window falls back to a normal paste on INLINE_NONE.
+        done_cb(outcome, hwnd, text) runs on the worker thread — pass a
+        signal's emit. Outcome is INLINE_TYPED / INLINE_PARTIAL / INLINE_NONE;
+        the window falls back to a normal paste on INLINE_NONE, which is why
+        the HWND travels back with the answer rather than being remembered on
+        the GUI side, where an overlapping dictation could overwrite it.
         """
         self._worker.submit(self._finalize_inline_job, hwnd, session,
                             final_text, done_cb)
@@ -208,7 +210,7 @@ class Paster:
             applog.exception("inline finalize failed")
             outcome = INLINE_PARTIAL
         try:
-            done_cb(outcome, final_text)
+            done_cb(outcome, hwnd, final_text)
         except Exception:
             applog.exception("inline finalize done_cb failed")
 

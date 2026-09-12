@@ -50,7 +50,7 @@ class MainWindow(QMainWindow):
     # Worker → GUI marshalling
     _sig_read_text_ready = Signal(int, str, str)  # (request generation, text, source tier)
     _sig_paste_done = Signal(bool, str)
-    _sig_inline_done = Signal(str, str)  # (outcome, final text)
+    _sig_inline_done = Signal(str, int, str)  # (outcome, target hwnd, final text)
     _sig_crash_notice = Signal(str)
 
     def __init__(self, entry_script):
@@ -818,11 +818,20 @@ class MainWindow(QMainWindow):
         self.paster.cancel_inline(self._inline_session, erase=erase)
         self._inline_target = None
 
-    @Slot(str, str)
-    def _on_inline_done(self, outcome, text):
-        """The final reconciliation finished (or declined)."""
+    @Slot(str, int, str)
+    def _on_inline_done(self, outcome, hwnd, text):
+        """The final reconciliation finished, declined, or could not complete."""
         m = (self._metrics_awaiting_paste.popleft()
              if self._metrics_awaiting_paste else {})
+        if outcome == INLINE_NONE:
+            # Nothing of ours is in the window — a hold too short to produce a
+            # draft is the ordinary case. Paste it the way we always have.
+            # (Treating this as a failure silently LOST short dictations.)
+            self._metrics_awaiting_paste.append(m)
+            self.indicator.show_pasting()
+            self._update_status("Pasting...")
+            self.paster.submit(hwnd, text, self._sig_paste_done.emit)
+            return
         if outcome == INLINE_TYPED:
             self.indicator.show_done()
             self._update_status("Transcribed as you spoke")

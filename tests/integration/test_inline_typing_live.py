@@ -114,7 +114,7 @@ def test_final_reconciliation_leaves_the_accurate_text(box, paster):
     _run(paster, paster._type_to_job, hwnd, 1, "Here is the frist point")
     done = []
     _run(paster, paster._finalize_inline_job, hwnd, 1, "Here is the first point.",
-         lambda outcome, text: done.append(outcome))
+         lambda outcome, hwnd_, text: done.append(outcome))
     assert done == [INLINE_TYPED]
     assert edit.toPlainText() == "Here is the first point."
     print(f"\n  finalized -> {edit.toPlainText()!r}")
@@ -195,6 +195,6 @@ def test_uncertain_state_never_erases(box, paster, monkeypatch):
     monkeypatch.setattr(winapi, "send_text", real_send)
     done = []
     _run(paster, paster._finalize_inline_job, hwnd, 2, "Final text.",
-         lambda outcome, text: done.append(outcome))
+         lambda outcome, hwnd_, text: done.append(outcome))
     assert done == [INLINE_PARTIAL]
     print(f"\n  uncertain left in place -> {edit.toPlainText()!r}")

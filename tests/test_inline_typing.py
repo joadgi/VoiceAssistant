@@ -226,8 +226,8 @@ class TestWorkerState:
 
     @staticmethod
     def _collector(done):
-        # done_cb is called as (outcome, text) from the worker thread.
-        return lambda outcome, text: done.append(outcome)
+        # done_cb is called as (outcome, hwnd, text) from the worker thread.
+        return lambda outcome, hwnd, text: done.append(outcome)
 
     def test_streaming_types_only_the_delta(self, worker):
         p, fake, win = worker
@@ -645,15 +645,40 @@ class TestWindowWiring:
         from voiceassistant import metrics
         self._start(mw)
         mw._metrics_awaiting_paste.append({"chars": 5})
-        mw._on_inline_done(INLINE_TYPED, "Hello.")
+        mw._on_inline_done(INLINE_TYPED, self.HWND, "Hello.")
         rows = metrics.load()
         assert rows and rows[-1]["outcome"] == metrics.OUTCOME_INLINE_TYPED
         mw._metrics_awaiting_paste.append({"chars": 5})
-        mw._on_inline_done(INLINE_PARTIAL, "Hello.")
+        mw._on_inline_done(INLINE_PARTIAL, self.HWND, "Hello.")
         rows = metrics.load()
         assert rows[-1]["outcome"] == metrics.OUTCOME_INLINE_PARTIAL
         # A partial run must tell the user where the accurate text went.
         assert "clipboard" in mw.status_bar.currentMessage().lower()
+
+    def test_the_worker_callback_matches_the_signal_it_is_given(self, mw):
+        """The worker calls done_cb(outcome, hwnd, text) and the window hands it
+        a Qt signal's emit. An arity or type mismatch there only ever shows up
+        at runtime, on the real path, after the dictation is already spoken —
+        so emit the REAL signal with the REAL argument shape here.
+        """
+        received = []
+        mw._sig_inline_done.connect(lambda o, h, t: received.append((o, h, t)))
+        mw._metrics_awaiting_paste.append({"chars": 4})
+        mw._sig_inline_done.emit(INLINE_NONE, self.HWND, "Yes.")
+        assert received == [(INLINE_NONE, self.HWND, "Yes.")]
+        assert ("paste", self.HWND, "Yes.") in mw._inline_calls
+
+    def test_nothing_typed_still_pastes_the_dictation(self, mw):
+        """A hold too short to produce a draft must still land its text.
+
+        Regression: INLINE_NONE was treated as a failure, so short dictations
+        were silently lost — caught on the first live dictation after release.
+        """
+        self._start(mw)
+        mw._metrics_awaiting_paste.append({"chars": 4})
+        mw._on_inline_done(INLINE_NONE, self.HWND, "Yes.")
+        assert ("paste", self.HWND, "Yes.") in mw._inline_calls
+        assert len(mw._metrics_awaiting_paste) == 1, "the metrics row was dropped"
 
     def test_partial_outcome_is_counted_as_a_bad_dictation(self):
         from voiceassistant import metrics

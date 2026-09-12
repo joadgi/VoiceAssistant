@@ -263,7 +263,7 @@ def test_the_whole_chain_types_the_speech_into_a_real_window(transcriber, qapp):
                                      light=True)
             done = []
             paster.finalize_inline(hwnd, 1, final,
-                                   lambda outcome, text: done.append(outcome))
+                                   lambda outcome, hwnd_, text: done.append(outcome))
             for _ in range(300):
                 QCoreApplication.processEvents()
                 time.sleep(0.01)
