@@ -466,6 +466,14 @@ class MainWindow(QMainWindow):
             pass
 
         hk_record = self._clean_hotkey("hotkey_record")
+        # Clear a stuck Caps Lock BEFORE the hooks go back on. Binding Caps
+        # Lock means the app swallows it, so the user can no longer press it
+        # to turn caps off — if it was left on (app not running when it was
+        # pressed, a crash, or a restart between the key's down and up) they
+        # are stuck in capitals with no way out but quitting the app. This
+        # runs here, unhooked, so we cannot swallow our own fix.
+        if should_suppress_hotkey(hk_record) and "caps lock" in hk_record:
+            winapi.clear_caps_lock()
         hk_screen = self._clean_hotkey("hotkey_screen_read")
         hk_read = self._clean_hotkey("hotkey_read_aloud")
         errors = []
@@ -715,6 +723,9 @@ class MainWindow(QMainWindow):
         act_pause.setChecked(not self._dictation_active)
         act_pause.toggled.connect(lambda paused: self.btn_dictation.setChecked(not paused))
         menu.addAction(act_pause)
+        act_caps = QAction("Turn Caps Lock off", self)
+        act_caps.triggered.connect(self._on_clear_caps)
+        menu.addAction(act_caps)
         act_settings = QAction("Settings…", self)
         act_settings.triggered.connect(self._on_settings)
         menu.addAction(act_settings)
@@ -817,6 +828,29 @@ class MainWindow(QMainWindow):
             return
         self.paster.cancel_inline(self._inline_session, erase=erase)
         self._inline_target = None
+
+    @Slot()
+    def _on_clear_caps(self):
+        """Escape hatch: turn Caps Lock off while the app is running.
+
+        When Caps Lock is the dictate key the app SWALLOWS it, so the user
+        cannot press it to turn caps off — without this, being stuck in
+        capitals means quitting the app. `keyboard.send` marks its own
+        injected events as replayed, so our suppressing hook passes them
+        through instead of eating our own fix (a raw SendInput tap here would
+        be swallowed).
+        """
+        if not winapi.lock_key_is_on(winapi.VK_CAPITAL):
+            self._update_status("Caps Lock is already off")
+            return
+        try:
+            kb.send("caps lock")
+        except Exception:
+            applog.exception("could not clear caps lock")
+            self._update_status("Could not turn Caps Lock off")
+            return
+        applog.info("caps lock cleared from the menu")
+        self._update_status("Caps Lock turned off")
 
     @Slot(str, int, str)
     def _on_inline_done(self, outcome, hwnd, text):
@@ -1512,6 +1546,9 @@ class MainWindow(QMainWindow):
         pause_action.setChecked(not self._dictation_active)
         pause_action.toggled.connect(lambda paused: self.btn_dictation.setChecked(not paused))
         menu.addAction(pause_action)
+        caps_action = QAction("Turn Caps Lock off", self)
+        caps_action.triggered.connect(self._on_clear_caps)
+        menu.addAction(caps_action)
         stop_action = QAction("Stop Reading", self)
         stop_action.triggered.connect(self.tts.stop)
         menu.addAction(stop_action)
@@ -1566,6 +1603,13 @@ class MainWindow(QMainWindow):
         # Full teardown — hooks, timers, workers, players, temp files.
         try:
             kb.unhook_all()
+        except Exception:
+            pass
+        # Hooks are gone, so a raw tap reaches Windows: never leave the user in
+        # capitals because the app happened to be the thing holding the key.
+        try:
+            if should_suppress_hotkey(self.config.get("hotkey_record", "")):
+                winapi.clear_caps_lock()
         except Exception:
             pass
         for timer in (self._show_request_timer, self._ptt_watchdog):

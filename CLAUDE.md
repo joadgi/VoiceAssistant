@@ -194,6 +194,21 @@ selection never changes into SAPI; `pyttsx3` runs only when explicitly selected.
   single dedicated key (caps lock / scroll lock / insert / menu / num lock) is hooked with
   `suppress=True` and the app swallows it. Modifiers must never be suppressed —
   swallowing `ctrl` would break Ctrl system-wide.
+  - **A swallowed lock key must never be left stuck, because the user cannot
+    unstick it** (`winapi.clear_caps_lock`, `MainWindow._on_clear_caps`). Caps
+    Lock bound as push-to-talk is SUPPRESSED, so Windows never sees it — which
+    also means pressing it no longer turns caps off. If caps is on for any
+    reason the app did not cause (pressed while the app was down, a crash, or a
+    restart landing between the key's down and up), the user is stuck in
+    capitals with no way out but quitting. Hit live on 2026-09-12 after several
+    development restarts. Three fixes, and the ORDER of the first one is
+    load-bearing: `_setup_hotkeys` clears caps BEFORE re-registering the hooks
+    (clearing afterwards means the app swallows its own fix); both menus carry
+    a "Turn Caps Lock off" action that uses `kb.send`, because `keyboard` marks
+    its own injected events as replayed and so passes them through our
+    suppressing hook where a raw SendInput tap would be eaten; and `closeEvent`
+    clears it after unhooking. Num Lock and Scroll Lock are deliberately NOT
+    cleared — Num Lock off breaks the numeric keypad and Scroll Lock is harmless.
   - **The suppressing callbacks MUST return falsy.** `keyboard` blocks a suppressed event
     only when the handler returns a falsy value, and in **PySide6 `Signal.emit()` returns
     `True`** — so the obvious `lambda e: sig.emit()` silently stops suppressing and Caps

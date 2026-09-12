@@ -429,6 +429,51 @@ def send_backspaces(count, expected_hwnd=None):
         return True, sent
 
 
+# ---------------------------------------------------------------------------
+# Lock-key state (Caps Lock etc.)
+# ---------------------------------------------------------------------------
+# The lock keys this app can bind AND swallow. Only Caps Lock is ever cleared
+# automatically: Num Lock off breaks the numeric keypad and Scroll Lock is
+# harmless, so neither is touched.
+VK_CAPITAL = 0x14
+_CAPS_SCAN = 0x3A
+
+
+def lock_key_is_on(vk=VK_CAPITAL):
+    """True when the lock key's toggle state is currently ON."""
+    try:
+        return bool(user32.GetKeyState(vk) & 1)
+    except Exception:
+        return False
+
+
+def clear_caps_lock():
+    """Turn Caps Lock OFF if it is on. Returns True if it changed.
+
+    WHY THIS EXISTS: binding Caps Lock as push-to-talk means the app SWALLOWS
+    the key, so Windows never sees it — which also means the user can no longer
+    press it to turn caps off. If caps is ever left on (the app was not running
+    when it was pressed, or it crashed, or it was restarted between the key's
+    down and up), the user is stuck in capitals with no way out that does not
+    involve quitting the app. Measured on this machine after several restarts
+    during development: exactly that happened.
+
+    A tap is sent, not a state poke, because the toggle lives in the keyboard
+    driver. The caller must only do this while our own hook is NOT suppressing
+    the key, or we swallow our own fix.
+    """
+    if not lock_key_is_on(VK_CAPITAL):
+        return False
+    try:
+        user32.keybd_event(VK_CAPITAL, _CAPS_SCAN, 0, 0)
+        user32.keybd_event(VK_CAPITAL, _CAPS_SCAN, KEYEVENTF_KEYUP, 0)
+    except Exception:
+        applog.exception("could not clear caps lock")
+        return False
+    applog.info("caps lock was on and has been cleared")
+    return True
+
+
 def send_escape():
     """Tap Escape (used ONLY to dismiss the Start menu after a Windows-key
     hotkey — never inject Escape into an ordinary target window)."""
