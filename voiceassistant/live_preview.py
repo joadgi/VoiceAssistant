@@ -233,6 +233,14 @@ class LivePreview(QObject):
         if n_commit:
             frozen = " ".join(s[2] for s in segments[:n_commit]).strip()
             if frozen:
+                # Frozen text gets the SAME cleanup as the live half. Without
+                # this, everything before a commit seam kept its fillers while
+                # the final transcription strips them, so the final
+                # reconciliation had to rewrite the sentence from the seam
+                # onward — on a long dictation that exceeds the correction
+                # limit and the draft is abandoned in the user's document.
+                if self.light_cleanup:
+                    frozen = strip_fillers(frozen).strip()
                 self._committed_text = (self._committed_text + " " + frozen).strip()
             self._committed_frames = result.offset_frames + int(
                 segments[n_commit - 1][1] * SAMPLE_RATE
@@ -246,6 +254,23 @@ class LivePreview(QObject):
         live = " ".join(s[2] for s in segments).strip()
         if self.light_cleanup:
             live = strip_fillers(live)
-        stable_live, tail = self._stabilizer.update(live)
-        stable = " ".join(p for p in (self._committed_text, stable_live) if p)
+        # Stabilize the WHOLE draft, not just the live window. Comparing only
+        # the live half means that on the tick where a commit happens, the
+        # previous hypothesis still starts with the words that were just
+        # frozen, the prefix comparison misaligns, and the reported stable
+        # text SHRINKS for one tick. On the pill that is a flicker; with
+        # inline typing it is a delete-and-retype burst in the user's
+        # document, and if the live tail is longer than the streaming
+        # correction limit, typing stops silently for the rest of the
+        # dictation. Committed words are stable by definition, so keeping
+        # them in the comparison basis makes the seam invisible.
+        full = " ".join(p for p in (self._committed_text, live) if p)
+        stable, tail = self._stabilizer.update(full)
+        # Committed text is settled BY DEFINITION — it is frozen and will never
+        # be decoded again — so it can never be part of the moving tail, even
+        # on the very first hypothesis after a commit when the stabilizer has
+        # no previous run to agree with.
+        if len(stable) < len(self._committed_text):
+            stable = self._committed_text
+            tail = full[len(stable):].strip()
         self.preview_text.emit(stable, tail)

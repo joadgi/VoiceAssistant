@@ -618,3 +618,139 @@ class TestWiring:
         assert s["preview_dictations"] == 2
         assert s["preview_ms_p50"] in (300.0, 500.0)
         assert "live preview" in metrics.format_report(rows)
+
+
+# --------------------------------------------------------------------------- #
+# 7. Commit-seam regressions (found by the 2026-09-12 audit)
+# --------------------------------------------------------------------------- #
+class TestCommitSeam:
+    """On the tick where the preview freezes its oldest segments, the reported
+    stable text must NOT shrink.
+
+    It used to: the stabilizer compared only the live half against a previous
+    hypothesis that still began with the just-frozen words, so the prefix
+    comparison misaligned and stable collapsed for one tick. On the pill that
+    is a flicker; with inline typing it is a delete-and-retype burst in the
+    user's document, and past the streaming correction limit typing stops
+    silently for the rest of the dictation.
+    """
+
+    @staticmethod
+    def _segments(duration_s):
+        return [(0.0, 5.0, "First sentence."), (5.0, 11.0, "Second sentence."),
+                (11.0, 17.0, "Third one."), (17.0, duration_s, "still going")]
+
+    def test_stable_text_never_shrinks_across_a_commit(self, ctl):
+        c, rec, tr, emitted = ctl
+        c.begin()
+        # Two ticks below the commit threshold so the stabilizer has settled.
+        for frames, segs in ((12 * SR, [(0.0, 5.0, "First sentence."),
+                                        (5.0, 11.0, "Second sentence.")]),
+                             (12 * SR, [(0.0, 5.0, "First sentence."),
+                                        (5.0, 11.0, "Second sentence.")])):
+            rec.frames += 2 * SR
+            c._on_tick()
+            tr.preview_ready.emit(_result(c, segs, frames))
+        settled = emitted[-1][0]
+        assert settled.startswith("First sentence."), settled
+
+        # Now a tick that commits.
+        rec.frames = 24 * SR
+        c._on_tick()
+        tr.preview_ready.emit(_result(c, self._segments(24.0), 24 * SR))
+        after = emitted[-1][0]
+        assert c._committed_text, "nothing was committed; test no longer covers the seam"
+        assert after.startswith(settled), (
+            "stable text shrank across the commit seam: %r -> %r" % (settled, after))
+
+    def test_committed_text_gets_the_same_cleanup_as_the_live_half(self, ctl):
+        """Frozen fillers survived into the typed draft while the final pass
+        stripped them, pushing the reconciliation past its correction limit."""
+        c, rec, tr, emitted = ctl
+        c.begin()
+        rec.frames = 24 * SR
+        c._on_tick()
+        segs = [(0.0, 5.0, "So um the first point."),
+                (5.0, 11.0, "And uh the second."),
+                (11.0, 17.0, "Third one."), (17.0, 24.0, "still going")]
+        tr.preview_ready.emit(_result(c, segs, 24 * SR))
+        assert c._committed_text, "nothing committed"
+        words = c._committed_text.lower().split()
+        assert "um" not in words and "uh" not in words, c._committed_text
+
+
+class TestDecodeFailureIsLoud:
+    """A decode that RAISES must not lose the dictation silently.
+
+    Found by the 2026-09-12 audit: the failure reached only the generic error
+    slot, which sets a status line and idles the pill — indistinguishable from
+    "nothing happened" on a tray-first app. No metric was recorded (so
+    `--report`, the documented arbiter of "is dictation OK", could not see its
+    own worst outcome), and any inline-typed draft was orphaned in the user's
+    document with nothing left to correct it.
+    """
+
+    def test_a_raising_decode_reports_the_job_it_lost(self, qapp):
+        from voiceassistant.transcriber import Transcriber
+
+        t = Transcriber(model_size="tiny", language="en")
+        try:
+            class _Boom:
+                def transcribe(self, *a, **k):
+                    raise RuntimeError("CUDA out of memory")
+
+            t._model = _Boom()
+            failures, readies = [], []
+            t.transcription_failed.connect(
+                lambda job_id, ctx, msg: failures.append((job_id, ctx, msg)))
+            t.transcription_ready.connect(readies.append)
+            t._transcribe_job(np.zeros(SR, dtype=np.float32), 4242, 7)
+            assert readies == []
+            assert len(failures) == 1
+            job_id, ctx, msg = failures[0]
+            assert job_id == 7, "the failure did not name its job"
+            assert ctx == 4242, "the failure did not carry the target window"
+            assert "CUDA out of memory" in msg
+        finally:
+            t.shutdown()
+
+    def test_the_window_records_it_erases_the_draft_and_says_so(self, mw):
+        from voiceassistant import metrics
+
+        mw._inline_jobs[9] = 3
+        mw._metrics_pending[9] = {"hold_s": 2.0}
+        discarded = []
+        mw._inline_discard = lambda session=None, erase=True: discarded.append(session)
+        mw._on_transcription_failed(9, 1234, "Transcription error: CUDA out of memory")
+        assert discarded == [3], "the orphaned draft was not reclaimed"
+        rows = metrics.load()
+        assert rows[-1]["outcome"] == metrics.OUTCOME_DECODE_FAILED
+        assert rows[-1]["hold_s"] == 2.0, "the dictation's metrics were dropped"
+        assert 9 not in mw._metrics_pending and 9 not in mw._inline_jobs
+        # The pill is the only surface a tray-first user sees.
+        assert "failed" in mw.indicator._label.text().lower()
+        assert "lost" in mw.status_bar.currentMessage().lower()
+
+    def test_decode_failure_counts_as_a_bad_dictation_in_the_report(self):
+        from voiceassistant import metrics
+
+        s = metrics.summarize([{"outcome": metrics.OUTCOME_DECODE_FAILED},
+                               {"outcome": metrics.OUTCOME_PASTED}])
+        assert s["success_rate"] == 0.5
+        text = metrics.format_report([{"outcome": metrics.OUTCOME_DECODE_FAILED}])
+        assert "Decode failures" in text
+        assert text.isascii()
+
+
+class TestMicDeathCleansUp:
+    def test_a_mic_stall_ends_the_preview_and_reclaims_the_draft(self, mw):
+        """A stall never emits recording_stopped, so none of the normal
+        end-of-dictation cleanup runs unless this path does it."""
+        mw.recorder.recording_started.emit()
+        assert mw.live_preview.active
+        discarded = []
+        mw._inline_discard = lambda session=None, erase=True: discarded.append(True)
+        mw._on_mic_error("Microphone dropped out mid-recording")
+        assert not mw.live_preview.active, "the preview kept ticking after the mic died"
+        assert not mw.live_preview._timer.isActive()
+        assert discarded, "the typed draft was left in the user's document"

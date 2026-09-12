@@ -435,6 +435,7 @@ class MainWindow(QMainWindow):
         self.transcriber.model_loading.connect(self._on_model_loading)
         self.transcriber.model_ready.connect(self._on_model_ready)
         self.transcriber.transcription_ready.connect(self._on_transcription_ready)
+        self.transcriber.transcription_failed.connect(self._on_transcription_failed)
         self.transcriber.transcription_progress.connect(self._update_status)
         self.transcriber.error.connect(self._on_error)
         self.transcriber.degraded.connect(self._on_degraded)
@@ -822,12 +823,23 @@ class MainWindow(QMainWindow):
         self.paster.type_to(self._inline_target, self._inline_session,
                             stream_target(stable))
 
-    def _inline_discard(self, erase=True):
-        """End the session, taking back the draft this app typed."""
-        if self._inline_target is None:
-            return
-        self.paster.cancel_inline(self._inline_session, erase=erase)
-        self._inline_target = None
+    def _inline_discard(self, session=None, erase=True):
+        """End an inline session, taking back the draft this app typed.
+
+        `session` must be the session that OWNS the draft. Passing the
+        newest one unconditionally was wrong: a result arriving late (a
+        slow decode, or a second hold started before the first finished)
+        would cancel -- and with `erase`, delete -- the draft belonging to
+        the recording currently in progress.
+        """
+        if session is None:
+            if self._inline_target is None:
+                return
+            session = self._inline_session
+            self._inline_target = None
+        elif session == self._inline_session:
+            self._inline_target = None
+        self.paster.cancel_inline(session, erase=erase)
 
     @Slot()
     def _on_clear_caps(self):
@@ -861,7 +873,11 @@ class MainWindow(QMainWindow):
             # Nothing of ours is in the window — a hold too short to produce a
             # draft is the ordinary case. Paste it the way we always have.
             # (Treating this as a failure silently LOST short dictations.)
-            self._metrics_awaiting_paste.append(m)
+            # appendleft, not append: this row is the OLDEST outstanding
+            # one and the deque is consumed from the left. Re-adding it at
+            # the back swapped two dictations' metrics whenever a second
+            # was already in flight.
+            self._metrics_awaiting_paste.appendleft(m)
             self.indicator.show_pasting()
             self._update_status("Pasting...")
             self.paster.submit(hwnd, text, self._sig_paste_done.emit)
@@ -931,6 +947,11 @@ class MainWindow(QMainWindow):
             "overflows": int(getattr(self.recorder, "_overflow_count", 0) or 0),
             "model": self.transcriber.model_size,
             "device": self.transcriber.device,
+            # Which app the text was destined for. "paste failed 3 times" is
+            # not actionable; "paste failed 3 times in chrome.exe" is. An
+            # executable name is not content — window TITLES are never
+            # recorded, because those carry document names and URLs.
+            "app": winapi.get_window_app(target_hwnd) or None,
         }
         if preview_stats.get("preview_decodes"):
             base.update(preview_stats)
@@ -1029,6 +1050,31 @@ class MainWindow(QMainWindow):
     def _on_ocr_ready(self):
         self._update_status(f"Ready  |  OCR engine loaded ({self.ocr.describe()})")
 
+    @Slot(int, object, str)
+    def _on_transcription_failed(self, job_id, context, msg):
+        """A decode RAISED: the words are gone. Say so, and clean up.
+
+        This used to reach only the generic error slot, which sets a
+        status line and idles the pill -- indistinguishable from "nothing
+        happened" on a tray-first app. Worse, none of the dictation's
+        cleanup ran: no metric (so `--report`, the documented arbiter of
+        "is dictation OK", could not see its own worst outcome) and any
+        inline-typed draft was left orphaned in the user's document with
+        nothing left to correct it.
+        """
+        applog.error(f"decode failed for job {job_id}: {msg}")
+        session = self._inline_jobs.pop(job_id, None)
+        if session is not None:
+            self._inline_discard(session)
+        m = self._metrics_pending.pop(job_id, {})
+        metrics.record(metrics.OUTCOME_DECODE_FAILED, **m)
+        self.indicator.show_error("Transcription failed - words lost")
+        self._update_status(
+            f"{msg} - that dictation was lost. See debug.log; if it repeats, "
+            "try a smaller Whisper model in Settings."
+        )
+        self._append_output(msg, prefix="[Error]")
+
     @Slot(object)
     def _on_transcription_ready(self, result):
         """Handle a completed transcription job (TranscriptionResult)."""
@@ -1054,7 +1100,7 @@ class MainWindow(QMainWindow):
         if result.no_speech:
             # The draft typed something the final pass then judged to be
             # nothing. Take our own characters back rather than leaving them.
-            self._inline_discard()
+            self._inline_discard(inline_session)
             self.indicator.show_idle()
             self._update_status("No speech detected")
             metrics.record(metrics.OUTCOME_NO_SPEECH, **m)
@@ -1068,7 +1114,7 @@ class MainWindow(QMainWindow):
         # off the CLEANED text, not just the raw no_speech flag — otherwise a
         # blank "[Voice]" marker gets appended to the panel.
         if not text.strip():
-            self._inline_discard()
+            self._inline_discard(inline_session)
             self.indicator.show_idle()
             self._update_status("No speech detected")
             metrics.record(metrics.OUTCOME_NO_SPEECH, **m)
@@ -1078,7 +1124,7 @@ class MainWindow(QMainWindow):
         # filters: sub-1.2s clip, VAD found nothing, text is a known artifact.
         if is_probable_hallucination(result, text):
             applog.dbg("  suppressed probable hallucination (retry artifact)")
-            self._inline_discard()
+            self._inline_discard(inline_session)
             self.indicator.show_idle()
             self._update_status("Ignored noise (no clear speech)")
             metrics.record(metrics.OUTCOME_HALLUCINATION, **m)
@@ -1104,12 +1150,12 @@ class MainWindow(QMainWindow):
                                             self._sig_inline_done.emit)
             else:
                 # Paste runs on the paste worker — the GUI thread never blocks.
-                self._inline_discard()
+                self._inline_discard(inline_session)
                 self.indicator.show_pasting()
                 self._update_status("Pasting...")
                 self.paster.submit(target_hwnd, text, self._sig_paste_done.emit)
         else:
-            self._inline_discard()
+            self._inline_discard(inline_session)
             self.indicator.show_idle()
             self._update_status("Transcription complete")
             self._append_output(text, prefix="[Voice]")
@@ -1486,10 +1532,18 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _on_mic_error(self, msg):
-        """Recorder failure: clear dictation hand-off state, then report."""
+        """Recorder failure: clear dictation hand-off state, then report.
+
+        A stall mid-recording never emits `recording_stopped`, so none of
+        the normal end-of-dictation cleanup runs: the preview keeps
+        ticking and any inline-typed draft is left in the user's
+        document. Do both here.
+        """
         self._pending_target_hwnd = None
         self._ptt_active = False
         self._stop_ptt_watchdog()
+        self.live_preview.end()
+        self._inline_discard()
         metrics.record(metrics.OUTCOME_MIC_ERROR)
         self._on_error(msg)
 
@@ -1624,6 +1678,14 @@ class MainWindow(QMainWindow):
         # Closes the always-on capture stream (and its tick timer).
         try:
             self.recorder.close_stream()
+        except Exception:
+            pass
+        # Drop any queued inline typing BEFORE draining the paste worker:
+        # shutdown() enqueues its stop at the TAIL, so a queued finalize
+        # would otherwise steal foreground and inject text after the app
+        # has closed.
+        try:
+            self.paster.cancel_inline(erase=False)
         except Exception:
             pass
         # Stop every owned worker so no daemon thread outlives the window.

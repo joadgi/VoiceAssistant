@@ -94,3 +94,50 @@ def test_report_names_the_actual_problem(store):
 
 def test_empty_report_is_not_an_error(store):
     assert "No dictation metrics" in metrics.format_report(metrics.load())
+
+
+def test_report_names_the_app_where_trouble_happens(store):
+    """"Inline typing failed 3 times" is not actionable; naming the app is.
+
+    The user's question was "which app fights the injected keystrokes" — the
+    report can only answer it if the app is recorded at the time, so this
+    pins both the field and the grouping.
+    """
+    for _ in range(3):
+        metrics.record(metrics.OUTCOME_INLINE_PARTIAL, app="chrome.exe", chars=40)
+    metrics.record(metrics.OUTCOME_PASTE_FAILED, app="mmc.exe")
+    metrics.record(metrics.OUTCOME_INLINE_TYPED, app="notepad.exe", chars=40)
+
+    s = metrics.summarize(metrics.load())
+    assert s["trouble_by_app"][("chrome.exe", metrics.OUTCOME_INLINE_PARTIAL)] == 3
+    assert s["trouble_by_app"][("mmc.exe", metrics.OUTCOME_PASTE_FAILED)] == 1
+    # Successes are deliberately NOT grouped by app: a per-app census of
+    # everything the user dictates into would be a usage profile.
+    assert not any(app == "notepad.exe" for app, _ in s["trouble_by_app"])
+
+    text = metrics.format_report(metrics.load())
+    assert "where the trouble happens" in text
+    assert "chrome.exe" in text
+    assert text.isascii(), "report must be cp1252-safe for a Windows console"
+
+
+def test_rows_without_an_app_still_summarize(store):
+    """Existing metrics files predate the `app` field; they must not break."""
+    metrics.record(metrics.OUTCOME_PASTE_FAILED)
+    s = metrics.summarize(metrics.load())
+    assert s["trouble_by_app"] == {}
+    assert "where the trouble happens" not in metrics.format_report(metrics.load())
+
+
+def test_metrics_never_record_window_titles_or_text(store):
+    """PRIVACY: an executable name is fine; a window title is not — titles
+    carry document names, subject lines and URLs."""
+    import json
+
+    metrics.record(metrics.OUTCOME_INLINE_TYPED, app="chrome.exe", chars=120)
+    with open(metrics.METRICS_PATH, encoding="utf-8") as f:
+        row = json.loads(f.readlines()[-1])
+    assert row["app"] == "chrome.exe"
+    assert row["chars"] == 120
+    assert not any(isinstance(v, str) and len(v) > 40 for v in row.values()), (
+        "a long string in a metrics row is almost certainly a payload")

@@ -90,6 +90,46 @@ def get_window_class(hwnd):
     return ""
 
 
+def get_window_app(hwnd):
+    """Best-effort executable name for a window, e.g. "chrome.exe".
+
+    WHY: "inline typing failed 3 times" is not actionable; "inline typing
+    failed 3 times in chrome.exe" is. Apps with aggressive autocomplete fight
+    injected keystrokes, and the only way to answer "which app" later is to
+    record it at the time.
+
+    PRIVACY: an executable name is not content. Never put window TITLES here —
+    titles routinely contain document names, subject lines and URLs, which is
+    exactly the payload class this app refuses to log.
+
+    Falls back to the window class, then "" — never raises.
+    """
+    if not hwnd:
+        return ""
+    try:
+        pid = wintypes.DWORD(0)
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if pid.value:
+            # PROCESS_QUERY_LIMITED_INFORMATION: works for most processes
+            # without elevation (plain QUERY_INFORMATION does not).
+            handle = kernel32.OpenProcess(0x1000, False, pid.value)
+            if handle:
+                try:
+                    size = wintypes.DWORD(260)
+                    buf = ctypes.create_unicode_buffer(size.value)
+                    if kernel32.QueryFullProcessImageNameW(
+                            handle, 0, buf, ctypes.byref(size)):
+                        return os.path.basename(buf.value)
+                finally:
+                    kernel32.CloseHandle(handle)
+    except Exception:
+        pass
+    try:
+        return get_window_class(hwnd) or ""
+    except Exception:
+        return ""
+
+
 def is_console_window(hwnd):
     """True when sending Ctrl+C to this window would interrupt a program."""
     cls = get_window_class(hwnd).lower()

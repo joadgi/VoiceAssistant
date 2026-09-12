@@ -99,6 +99,20 @@ class Paster:
         self._worker.submit(self._cancel_inline_job, session, erase)
 
     def _begin_inline_job(self, hwnd, session):
+        # A previous session that still has characters in a window never got
+        # finalized: the decode raised, the mic died, or the user started a
+        # new hold before the last result arrived. Nothing will ever correct
+        # those characters now, and the old state is about to be overwritten,
+        # so this is the last moment we still know what they were. Take them
+        # back before starting fresh.
+        #
+        # Without this, chaining two dictations into the same box produced
+        # "Hello therHello there." — the first draft orphaned, then its final
+        # text pasted underneath it.
+        previous = self._typed
+        if previous is not None and previous.text:
+            applog.info("inline typing: reclaiming a draft from an unfinished dictation")
+            self._cancel_inline_job(previous.session, erase=True)
         self._typed = _TypedState(hwnd, session)
 
     def _cancel_inline_job(self, session=None, erase=False):
@@ -112,7 +126,12 @@ class Paster:
             # there is no count we are allowed to delete. Say so: an orphaned
             # draft with no explanation is worse than one with a log line.
             applog.info("inline draft left in place: injection count was unknown")
-        elif erase and state.text and not state.broken:
+        elif erase and state.text:
+            # `broken` is deliberately NOT a reason to skip: it means typing
+            # STOPPED, not that the record is wrong. The record is still exact
+            # (that is what `certain` tracks), so those characters are still
+            # ours to take back. Skipping them here left a half-sentence in the
+            # document with no log line and no message.
             plan = plan_edit(state.text, "", MAX_FINAL_BACKSPACES)
             if plan is not None and self._refocus_target(state):
                 self._apply_plan(state, plan)

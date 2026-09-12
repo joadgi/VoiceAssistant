@@ -206,3 +206,35 @@ class TestStartupClear:
             w.config.set("hotkey_record", combo)
             MainWindow._setup_hotkeys(w)
         assert calls == [], "cleared caps lock for a binding that never swallows it"
+
+
+class TestWindowAppName:
+    """`get_window_app` feeds the metrics' "which app" attribution."""
+
+    def test_invalid_handles_return_empty_never_raise(self):
+        assert winapi.get_window_app(0) == ""
+        assert winapi.get_window_app(None) == ""
+        assert winapi.get_window_app(999999999) == ""
+
+    def test_a_real_window_resolves_to_an_executable_name(self):
+        hwnd = winapi.get_foreground_window()
+        if not hwnd:
+            pytest.skip("no foreground window in this session")
+        name = winapi.get_window_app(hwnd)
+        assert isinstance(name, str)
+        # Either an exe or the window-class fallback; never a window TITLE,
+        # which would carry document names and URLs into the metrics file.
+        assert "\n" not in name and len(name) < 80
+
+    def test_falls_back_to_the_window_class_when_the_process_is_opaque(self, monkeypatch):
+        monkeypatch.setattr(winapi.kernel32, "OpenProcess", lambda *a: 0)
+        monkeypatch.setattr(winapi, "get_window_class", lambda hwnd: "ConsoleWindowClass")
+        assert winapi.get_window_app(1234) == "ConsoleWindowClass"
+
+    def test_survives_a_failing_win32_call(self, monkeypatch):
+        def boom(*a):
+            raise OSError("nope")
+
+        monkeypatch.setattr(winapi.user32, "GetWindowThreadProcessId", boom)
+        monkeypatch.setattr(winapi, "get_window_class", lambda hwnd: "")
+        assert winapi.get_window_app(1234) == ""

@@ -34,9 +34,11 @@ OUTCOME_HALLUCINATION = "hallucination"
 OUTCOME_DROPPED_SHORT = "dropped_short"
 OUTCOME_DROPPED_QUIET = "dropped_quiet"
 OUTCOME_MIC_ERROR = "mic_error"
+OUTCOME_DECODE_FAILED = "decode_failed"  # the decode raised; the words are gone
 
 _BAD = (OUTCOME_PASTE_FAILED, OUTCOME_NO_SPEECH, OUTCOME_DROPPED_SHORT,
-        OUTCOME_DROPPED_QUIET, OUTCOME_MIC_ERROR, OUTCOME_INLINE_PARTIAL)
+        OUTCOME_DROPPED_QUIET, OUTCOME_MIC_ERROR, OUTCOME_INLINE_PARTIAL,
+        OUTCOME_DECODE_FAILED)
 
 
 def _roll_if_needed():
@@ -109,6 +111,15 @@ def summarize(rows):
     retried = sum(1 for r in rows if r.get("retried"))
     rescued = sum(1 for r in rows if r.get("keyup_lost"))
     bad = sum(counts.get(k, 0) for k in _BAD)
+    # Which apps the trouble happens in. Counting failures is not actionable;
+    # naming the app is. Only BAD outcomes are grouped — a per-app census of
+    # everything the user dictates into would be a usage profile, which is not
+    # what this file is for.
+    trouble = {}
+    for r in rows:
+        if r.get("outcome") in _BAD and r.get("app"):
+            key = (r["app"], r["outcome"])
+            trouble[key] = trouble.get(key, 0) + 1
     preview_rows = [r for r in rows if r.get("preview_decodes")]
     preview_ms = [r["preview_ms"] for r in preview_rows
                   if isinstance(r.get("preview_ms"), (int, float))]
@@ -118,6 +129,7 @@ def summarize(rows):
         "preview_ms_p50": _pct(preview_ms, 0.50),
         "preview_ms_p95": _pct(preview_ms, 0.95),
         "preview_decodes_p50": _pct(preview_counts, 0.50),
+        "trouble_by_app": trouble,
         "total": total,
         "counts": counts,
         "success_rate": (total - bad) / total if total else 0.0,
@@ -165,6 +177,12 @@ def format_report(rows):
                    f"{s['preview_ms_p50']:.0f} ms median draft latency "
                    f"({s['preview_ms_p95']:.0f} ms p95), "
                    f"{s['preview_decodes_p50']:.0f} drafts per dictation")
+    if s["trouble_by_app"]:
+        out.append("")
+        out.append("  where the trouble happens:")
+        for (app, outcome), n in sorted(s["trouble_by_app"].items(),
+                                        key=lambda kv: -kv[1])[:8]:
+            out.append(f"    {app:<22} {outcome:<16} {n:>4}")
     if s["counts"].get(OUTCOME_DROPPED_QUIET):
         out.append("\n  Dropped-quiet clips mean the mic level is too low - check the")
         out.append("  Yeti's gain knob and that the right device is set in Settings.")
@@ -174,6 +192,12 @@ def format_report(rows):
         out.append("  place with the accurate text on the clipboard. Repeated cases mean")
         out.append("  the target app fights injected keystrokes - turn inline typing off")
         out.append("  for that app, or off entirely in Settings.")
+    if s["counts"].get(OUTCOME_DECODE_FAILED):
+        out.append("")
+        out.append("  Decode failures mean Whisper raised mid-transcription and those")
+        out.append("  words were lost. On a shared GPU the usual cause is running out")
+        out.append("  of video memory - close something large, or switch to a smaller")
+        out.append("  model in Settings.")
     if s["counts"].get(OUTCOME_PASTE_FAILED):
         out.append("\n  Paste failures leave the text on the clipboard; usually a window")
         out.append("  that refused focus (elevated/admin apps do this).")

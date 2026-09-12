@@ -285,6 +285,12 @@ selection never changes into SAPI; `pyttsx3` runs only when explicitly selected.
   10–20x slower; as a log line plus a label behind a tray icon it is experienced as
   "dictation got slow" with no cause. It now raises a tray balloon and marks the model
   label DEGRADED until restart.
+- **Metrics name the APP the trouble happened in** (`winapi.get_window_app`).
+  "Inline typing failed 3 times" is not actionable; "3 times in chrome.exe" is.
+  Only BAD outcomes are grouped by app — a per-app census of everything the
+  user dictates into would be a usage profile, which is not what this file is
+  for. An executable name is not content; window TITLES are never recorded,
+  because those carry document names, subject lines and URLs.
 - **The app measures its own reliability** (`metrics.py`). Six capture bugs survived a
   month because the USER was the monitoring system and "feels unreliable" is not
   actionable. Every dictation now records hold/audio duration, peak, overflow count,
@@ -323,6 +329,18 @@ selection never changes into SAPI; `pyttsx3` runs only when explicitly selected.
   of audio**, so any finite streaming lead eventually ran dry. Kokoro CPU inference on
   this machine runs materially faster than its 2.6x output and has no network jitter.
   It feeds one raw PCM VLC callback stream from Kokoro's native prepared batches.
+- **The live preview stabilizes the WHOLE draft, not just the live window.**
+  Comparing only the uncommitted half meant that on the tick where a commit
+  happened, the previous hypothesis still began with the just-frozen words, the
+  prefix comparison misaligned, and the reported stable text SHRANK for one
+  tick. On the pill that is a flicker; with inline typing it is a
+  delete-and-retype burst in the user's document, and if the live tail exceeds
+  `MAX_STREAM_BACKSPACES` the correction is refused and typing stops silently
+  for the rest of the dictation. Committed text is also `strip_fillers`-cleaned
+  like the live half — otherwise every filler before a seam survived into the
+  typed draft while the final pass stripped it, pushing the reconciliation past
+  its correction limit on long dictations. Committed text is stable by
+  definition and is never reported as part of the moving tail.
 - **Prepare local text ONCE and freeze one speed per utterance.** An extra 180-character
   splitter looked continuous at the VLC layer but erased Kokoro's punctuation pause at
   every artificial boundary. A live 5,553-character read became **39 independently
@@ -454,6 +472,21 @@ selection never changes into SAPI; `pyttsx3` runs only when explicitly selected.
   we type anything" BEFORE "is the record certain", so a partial batch that
   never reached the record reported "nothing typed" and the app pasted a second
   copy underneath the orphaned characters. Order those checks the other way.
+- **A dictation must never end silently with a draft in the user's document.**
+  Found by the 2026-09-12 audit, four separate ways it could: a decode that
+  RAISED reached only the generic error slot (no metric, pill just idled, draft
+  orphaned); a mic stall mid-hold never emits `recording_stopped` so no cleanup
+  ran at all; a second hold started before the first result arrived overwrote
+  the typed state, orphaning the first draft and then pasting its text
+  underneath it (`"Hello therHello there."`); and `_inline_discard` always
+  cancelled the NEWEST session, so a late result could erase the draft of the
+  recording currently in progress. Fixes, in order: `transcription_failed`
+  carries the job id and target so the window can record `decode_failed` and
+  reclaim exactly that draft; `_on_mic_error` ends the preview and discards;
+  `_begin_inline_job` reclaims any previous session's characters before
+  replacing the state (the last moment we still know what they were); and
+  `_inline_discard` takes the OWNING session. `broken` is not a reason to skip
+  an erase — it means typing stopped, not that the record is wrong.
 - **Streaming never steals focus back; the FINAL edit does** (`_refocus_target`).
   If the user looks away mid-sentence, dragging their window to the front to
   keep typing would fight them, so streaming just stops. The final edit is the

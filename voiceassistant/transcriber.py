@@ -84,6 +84,11 @@ class Transcriber(QObject):
     # surfaced LOUDLY (tray balloon + persistent label), not just logged.
     degraded = Signal(str)
     transcription_ready = Signal(object)  # emits TranscriptionResult
+    # A decode that RAISED. Carries the job id and the job's context (the
+    # target HWND) so the window can clean up exactly that dictation — the
+    # plain `error` signal carries neither, so the dictation used to end with
+    # no metric, no pill state, and any inline-typed draft orphaned.
+    transcription_failed = Signal(int, object, str)  # (job_id, context, message)
     transcription_progress = Signal(str)  # partial results
     error = Signal(str)
 
@@ -302,7 +307,7 @@ class Transcriber(QObject):
                 )
             )
         except Exception as e:
-            self.error.emit(f"Transcription error: {e}")
+            self.transcription_failed.emit(job_id, context, f"Transcription error: {e}")
 
     # ------------------------------------------------------------------ #
     # Live preview (see live_preview.py for the policy; this is only the decode)

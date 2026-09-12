@@ -785,3 +785,52 @@ class TestWindowWiring:
         assert s["success_rate"] == 0.5
         assert "Inline-typed drafts" in metrics.format_report(
             [{"outcome": metrics.OUTCOME_INLINE_PARTIAL}])
+
+
+# --------------------------------------------------------------------------- #
+# 7. Audit regressions (2026-09-12) — every one of these was a real defect
+# --------------------------------------------------------------------------- #
+class TestAuditRegressions:
+    """Each test here names a defect found by the full audit and the damage it
+    did to the user's document. None of these are hypothetical."""
+
+    HWND = TestWorkerState.HWND
+
+    def test_a_new_dictation_reclaims_an_unfinished_drafts_characters(self, worker):
+        """Chaining two dictations used to leave the first draft orphaned and
+        then paste its text underneath: "Hello therHello there."
+
+        Nothing can correct a draft whose session is being replaced, so the
+        last moment we still know what those characters were is right here.
+        """
+        p, fake, win = worker
+        win.content = "user note. "
+        win.user_text_len = len(win.content)
+        p._begin_inline_job(self.HWND, 1)
+        p._type_to_job(self.HWND, 1, "Hello ther")
+        assert win.content == "user note. Hello ther"
+        # The user releases and immediately holds again; the first decode has
+        # not come back yet.
+        p._begin_inline_job(self.HWND, 2)
+        assert win.content == "user note. ", "the orphaned draft was left behind"
+        assert win.user_text_intact
+        assert p._typed.session == 2 and p._typed.text == ""
+
+    def test_reclaim_never_deletes_an_uncertain_draft(self, worker):
+        p, fake, win = worker
+        p._begin_inline_job(self.HWND, 1)
+        fake.fail_text_after = 3
+        p._type_to_job(self.HWND, 1, "Hello")
+        before = win.content
+        p._begin_inline_job(self.HWND, 2)
+        assert win.content == before, "erased against an unknown count"
+
+    def test_a_broken_session_still_gives_its_characters_back(self, worker):
+        """`broken` means typing STOPPED, not that the record is wrong. Skipping
+        the erase left a half-sentence in the document with no explanation."""
+        p, fake, win = worker
+        p._begin_inline_job(self.HWND, 1)
+        p._type_to_job(self.HWND, 1, "A draft")
+        p._typed.broken = True
+        p._cancel_inline_job(1, erase=True)
+        assert win.content == "", "a broken session kept its characters"
