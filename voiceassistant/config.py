@@ -106,6 +106,24 @@ def should_suppress_hotkey(combo):
     parts = [p for p in normalize_hotkey(combo).split("+") if p]
     return len(parts) == 1 and parts[0] in DEDICATED_SOLO_KEYS
 
+# Keys whose scan codes OVERLAP a modifier's, so binding them fires on the
+# ordinary left-hand modifier. Measured here with keyboard.key_to_scan_codes:
+#
+#   ctrl        -> (29, 57629, 57373)
+#   pause       -> (69, 57629)          shares 57629 with ctrl
+#   right ctrl  -> (57629, 29, 57373)   the SAME SET as generic ctrl
+#   right alt   -> (56, 57400)          shares 56 with alt
+#
+# `keyboard.hook_key` registers under EVERY code a key resolves to, so a
+# dictation bound to any of these starts on every Ctrl+C, Ctrl+V, Alt+Tab the
+# user presses — a spurious recording that then tries to paste into whatever
+# they were doing. CLAUDE.md records the measurement for `right ctrl`/`right
+# alt`; `pause` was reachable from the capture pill (Qt maps Key_Pause) and
+# nothing rejected it, so the rule is enforced here rather than merely
+# documented. Rejected anywhere in a combo, not just alone: `shift+pause`
+# would fire on Shift+Ctrl.
+MODIFIER_ALIASED_KEYS = {"pause", "right ctrl", "right alt"}
+
 # Bare keys we refuse to bind alone — you type these constantly, so a single-key
 # hotkey on one of them would fire during normal typing.
 TYPING_KEYS = set("abcdefghijklmnopqrstuvwxyz0123456789") | {
@@ -137,6 +155,10 @@ def validate_hotkey(value):
         return False
     parts = [p for p in combo.split("+") if p]
     if not parts:
+        return False
+    # A key that resolves to a modifier's scan codes fires on that modifier,
+    # wherever it appears in the combo (see MODIFIER_ALIASED_KEYS).
+    if any(part in MODIFIER_ALIASED_KEYS for part in parts):
         return False
     if len(parts) == 1:
         key = parts[0]
@@ -186,11 +208,20 @@ def sanitize_settings(data):
     cleaned = {k: v for k, v in data.items() if k in DEFAULTS}
     seen = set()
     for key in HOTKEY_KEYS:
-        value = normalize_hotkey(cleaned.get(key, DEFAULTS[key]))
+        original = cleaned.get(key, DEFAULTS[key])
+        value = normalize_hotkey(original)
         if not validate_hotkey(value) or value in seen:
             value = DEFAULTS[key]
             if value in seen:
                 value = next(v for v in fallback_pool if v not in seen)
+            # Say so. The obsolete-key branch above already follows this rule,
+            # and losing a BINDING is more surprising than losing a stale
+            # setting: the user presses their key, nothing happens, and
+            # nothing anywhere explains why. `load_error` stays None here
+            # because the file parsed fine, so this log line is the only trace.
+            applog.info(
+                "hotkey %s was %r (invalid or duplicate); reset to %r"
+                % (key, original, value))
         cleaned[key] = value
         seen.add(value)
     return cleaned

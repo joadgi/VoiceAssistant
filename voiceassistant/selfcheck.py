@@ -205,12 +205,37 @@ def _check_selected_neural_tts():
 
 
 def _check_microphone():
+    """Is there a mic, AND is the one the user actually configured still there?
+
+    Counting input devices answers the wrong question. The user picks a
+    specific device in Settings, and that index is what the recorder opens —
+    so an unplugged or renumbered Yeti would leave this reporting a clean PASS
+    while dictation records from whatever Windows happens to default to. A
+    self-check that passes when the thing it checks is broken is worse than no
+    self-check.
+    """
     try:
         import sounddevice as sd
-        ins = [d for d in sd.query_devices() if d["max_input_channels"] > 0]
+
+        devices = sd.query_devices()
+        ins = [d for d in devices if d["max_input_channels"] > 0]
         if not ins:
             return False, "no input devices found"
-        return True, f"{len(ins)} input device(s)"
+
+        from .config import Config
+
+        chosen = Config().get("audio_device", -1)
+        if chosen is None or chosen < 0:
+            return True, f"{len(ins)} input device(s), using the system default"
+        try:
+            device = devices[chosen]
+        except (IndexError, TypeError):
+            return False, (f"the microphone set in Settings (device {chosen}) is "
+                           f"no longer present — dictation will use the default")
+        if device["max_input_channels"] <= 0:
+            return False, (f"the device set in Settings ({device['name']}) has no "
+                           "input channels — pick another in Settings")
+        return True, f"{device['name']} (selected), {len(ins)} input device(s)"
     except Exception as e:
         return False, f"audio system error ({e.__class__.__name__})"
 

@@ -180,6 +180,7 @@ def main_window(qapp, monkeypatch, tmp_path):
     """
     import voiceassistant.config as cfg
     import voiceassistant.ocr as ocr
+    import voiceassistant.tts as tts
     import voiceassistant.recorder as rec_mod
     import voiceassistant.transcriber as tr
     import voiceassistant.winapi as winapi
@@ -191,6 +192,10 @@ def main_window(qapp, monkeypatch, tmp_path):
     monkeypatch.setattr(cfg, "CONFIG_FILE", str(cfg_dir / "settings.json"))
     monkeypatch.setattr(tr.Transcriber, "load_model", lambda self: None)
     monkeypatch.setattr(ocr.OCREngine, "load_model", lambda self: None)
+    # MainWindow's default voice is kokoro, so without this every
+    # constructed window queues a real 164 MB ONNX load and pays for it
+    # synchronously in tts.shutdown() at teardown (~2s per window).
+    monkeypatch.setattr(tts.TTSEngine, "_load_kokoro", lambda self: None)
     monkeypatch.setattr(winapi, "set_start_with_windows", lambda *a, **k: True)
     monkeypatch.setattr(MainWindow, "_setup_hotkeys", lambda self: None)
     monkeypatch.setattr(MainWindow, "_setup_tray", lambda self: None)

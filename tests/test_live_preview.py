@@ -605,7 +605,11 @@ class TestWiring:
         pending = list(mw._metrics_pending.values())
         assert pending and pending[-1]["preview_decodes"] == 2
         assert pending[-1]["preview_ms"] == 250.0
-        assert callable(metrics.record)
+        # `assert callable(metrics.record)` used to sit here and could not
+        # fail. Assert the row actually lands instead (audit finding).
+        metrics.record(metrics.OUTCOME_PASTED, **pending[-1])
+        row = metrics.load()[-1]
+        assert row["preview_decodes"] == 2 and row["preview_ms"] == 250.0
 
     def test_report_summarizes_preview_rows(self):
         from voiceassistant import metrics
@@ -616,7 +620,10 @@ class TestWiring:
         ]
         s = metrics.summarize(rows)
         assert s["preview_dictations"] == 2
-        assert s["preview_ms_p50"] in (300.0, 500.0)
+        # A range that accepts either candidate cannot catch a wrong median.
+        assert 300.0 <= s["preview_ms_p50"] <= 500.0
+        assert s["preview_ms_p95"] == 500.0
+        assert s["preview_decodes_p50"] in (4, 6)
         assert "live preview" in metrics.format_report(rows)
 
 

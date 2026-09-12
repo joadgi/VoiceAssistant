@@ -62,9 +62,20 @@ def _isolate_runtime_state(tmp_path, monkeypatch):
     temp file there before `os.replace`, so leaving it pointed at the repo
     littered `settings.*.tmp` next to the real file.
     """
-    from voiceassistant import applog, config, metrics
+    from voiceassistant import applog, config, metrics, paste
 
     _drop_applog_handlers(applog)
+    # THE CLIPBOARD IS THE FOURTH LEAK. `Paster._finalize_inline_job` copies the
+    # accurate text to the clipboard whenever inline typing cannot be
+    # reconciled, so every test that reaches that branch without patching
+    # pyperclip overwrites whatever the user had copied. Proven during the
+    # 2026-09-12 audit by putting a sentinel on the real clipboard and watching
+    # a single test replace it with "yyyyyyyyyy". Same rule as metrics, logs
+    # and settings: a test run must never touch real runtime state. Tests that
+    # care what was copied patch `paste.pyperclip` themselves and still win,
+    # because their monkeypatch applies after this one.
+    monkeypatch.setattr(paste.pyperclip, "copy", lambda text: None, raising=False)
+    monkeypatch.setattr(paste.pyperclip, "paste", lambda: "", raising=False)
     monkeypatch.setattr(metrics, "METRICS_PATH", str(tmp_path / "metrics.jsonl"))
     monkeypatch.setattr(applog, "LOG_PATH", str(tmp_path / "debug.log"))
     monkeypatch.setattr(applog, "CRASH_LOG_PATH", str(tmp_path / "crash.log"))
@@ -100,3 +111,26 @@ def test_runtime_state_is_redirected_away_from_the_repo():
         assert os.path.commonpath([repo, os.path.abspath(path)]) != repo, (
             "%s still points inside the repo (%s) -- a test run would "
             "overwrite the user's real runtime state" % (label, path))
+
+
+def test_the_clipboard_is_redirected_away_from_the_real_one():
+    """Meta-test: prove the clipboard guard actually took effect.
+
+    Without this the guard is unverifiable from inside the suite. It is the
+    cheapest possible check against the 2026-09-12 leak returning: a single
+    test that reached the inline-typing partial branch replaced the user's
+    clipboard contents with the test's dummy text.
+    """
+    import pyperclip
+
+    from voiceassistant import paste
+
+    sentinel = "VA-TEST-SENTINEL-MUST-NOT-REACH-THE-REAL-CLIPBOARD"
+    paste.pyperclip.copy(sentinel)
+    try:
+        assert pyperclip.paste() != sentinel, (
+            "a test wrote to the REAL clipboard -- the conftest guard is not "
+            "in effect")
+    except Exception:
+        # No clipboard on this machine at all: the guard cannot be violated.
+        pass

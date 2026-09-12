@@ -130,6 +130,7 @@ def main_window(qapp, monkeypatch, tmp_path):
     from tests/test_ui_smoke.py). Crucially, _setup_hotkeys and _setup_tray are
     patched to no-ops so *constructing* the window registers NO global hooks."""
     import voiceassistant.ocr as ocr
+    import voiceassistant.tts as tts
     import voiceassistant.transcriber as tr
     import voiceassistant.winapi as winapi
     from voiceassistant.window import MainWindow
@@ -138,6 +139,10 @@ def main_window(qapp, monkeypatch, tmp_path):
     monkeypatch.setattr(vcfg, "CONFIG_FILE", str(tmp_path / "settings.json"))
     monkeypatch.setattr(tr.Transcriber, "load_model", lambda self: None)
     monkeypatch.setattr(ocr.OCREngine, "load_model", lambda self: None)
+    # MainWindow's default voice is kokoro, so without this every
+    # constructed window queues a real 164 MB ONNX load and pays for it
+    # synchronously in tts.shutdown() at teardown (~2s per window).
+    monkeypatch.setattr(tts.TTSEngine, "_load_kokoro", lambda self: None)
     monkeypatch.setattr(winapi, "set_start_with_windows", lambda *a, **k: True)
     monkeypatch.setattr(MainWindow, "_setup_hotkeys", lambda self: None)
     monkeypatch.setattr(MainWindow, "_setup_tray", lambda self: None)
@@ -292,6 +297,8 @@ class _FakeKb:
         self.release = {}     # key -> callback
         self.suppressed = {}  # key -> whether it was hooked with suppress=True
         self.hotkeys = []
+        self.hooks = []       # (callback, suppress) for every kb.hook call
+        self.read_hook = None
         self.held = set(held)
 
     # --- the API surface _setup_hotkeys uses ---
@@ -311,6 +318,7 @@ class _FakeKb:
 
     def hook(self, callback, suppress=False):
         self.read_hook = callback
+        self.hooks.append((callback, suppress))
         return callback
 
     def key_to_scan_codes(self, key):
@@ -520,3 +528,79 @@ def test_real_registration_of_user_combo(combo):
             kb.unhook_all()
         except Exception:
             pass
+
+
+# --------------------------------------------------------------------------- #
+# Audit findings, 2026-09-12: the INSTALLATION of the secondary hotkeys, and
+# the watchdog branch the user actually runs, had no coverage at all.
+# --------------------------------------------------------------------------- #
+def test_read_and_ocr_hotkeys_are_actually_installed(main_window, fake_kb):
+    """`ChordHotkey` is well tested in isolation; its INSTALLATION was not.
+
+    Proven by mutation during the audit: replacing `window.ChordHotkey` with a
+    function that raises left 121 tests passing — delete the registration block
+    and read-aloud plus OCR die silently, green. Both features route through
+    `kb.hook` (never `add_hotkey`, which does not suppress), so assert the
+    matchers exist, are hooked, and cover the configured combos.
+    """
+    w = main_window
+    w.config.set("hotkey_record", "caps lock")
+    w.config.set("hotkey_read_aloud", "scroll lock")
+    w.config.set("hotkey_screen_read", "ctrl+shift+s")
+    fake_kb.hooks = []
+    _REAL_SETUP_HOTKEYS(w)
+
+    assert getattr(w, "_read_hotkey", None) is not None, "read-aloud hotkey not installed"
+    assert getattr(w, "_screen_hotkey", None) is not None, "OCR hotkey not installed"
+    assert fake_kb.read_hook is not None, "nothing was hooked for the chord matchers"
+    assert not fake_kb.hotkeys, "a non-suppressing add_hotkey came back"
+
+
+def test_ptt_watchdog_uses_hook_state_for_a_suppressed_solo_key(
+        main_window, fake_kb, monkeypatch):
+    """Josh runs `caps lock`, and this branch had NO test.
+
+    A suppressed key never reaches Windows' accepted state, so polling native
+    state would report "not held" on the very first tick and cut every
+    dictation short. Collapsing the ternary to always call
+    `winapi.hotkey_is_down` is a plausible "simplification" that the suite
+    could not previously catch.
+    """
+    import voiceassistant.window as win_mod
+
+    w = main_window
+    w.config.set("hotkey_record", "caps lock")
+    _REAL_SETUP_HOTKEYS(w)
+
+    class _Rec:
+        is_recording = True
+
+        def __init__(self):
+            self.stopped = False
+
+        def stop(self):
+            self.stopped = True
+
+    w.recorder = _Rec()
+    w._ptt_active = True
+
+    # Native state says "up" — which is ALWAYS true for a suppressed key.
+    native_calls = []
+
+    def _never_use_this(combo):
+        native_calls.append(combo)
+        return False
+
+    monkeypatch.setattr(win_mod.winapi, "hotkey_is_down", _never_use_this)
+    if True:
+        fake_kb.held = {"caps lock"}          # the hook knows it is held
+        w._on_ptt_watchdog()
+        assert not w.recorder.stopped, (
+            "the watchdog cut a Caps Lock dictation short — it polled native "
+            "state for a key Windows never sees")
+        assert native_calls == [], (
+            "native key state was consulted for a SUPPRESSED binding")
+
+        fake_kb.held.clear()                  # a genuine release
+        w._on_ptt_watchdog()
+        assert w.recorder.stopped, "a real release was not noticed"

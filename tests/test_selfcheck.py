@@ -43,3 +43,55 @@ def test_no_probe_raises():
         ok, detail = fn()
         assert isinstance(ok, bool), label
         assert isinstance(detail, str), label
+
+
+class TestConfiguredMicrophoneIsChecked:
+    """`--check` must validate the mic the user CHOSE, not just that some mic
+    exists. A self-check that passes when the thing it checks is broken is
+    worse than no self-check. (Audit finding, 2026-09-12.)"""
+
+    @staticmethod
+    def _devices():
+        return [
+            {"name": "Speakers", "max_input_channels": 0},
+            {"name": "Yeti", "max_input_channels": 2},
+        ]
+
+    def _run(self, monkeypatch, chosen, devices=None):
+        import sounddevice as sd
+
+        from voiceassistant import config as cfg
+        from voiceassistant import selfcheck
+
+        monkeypatch.setattr(sd, "query_devices",
+                            lambda: self._devices() if devices is None else devices)
+
+        class _Cfg:
+            def get(self, key, default=None):
+                return chosen
+
+        monkeypatch.setattr(cfg, "Config", _Cfg)
+        return selfcheck._check_microphone()
+
+    def test_system_default_passes(self, monkeypatch):
+        ok, msg = self._run(monkeypatch, -1)
+        assert ok and "system default" in msg
+
+    def test_a_present_selected_device_passes_and_is_named(self, monkeypatch):
+        ok, msg = self._run(monkeypatch, 1)
+        assert ok and "Yeti" in msg
+
+    def test_a_missing_selected_device_FAILS(self, monkeypatch):
+        ok, msg = self._run(monkeypatch, 7)
+        assert not ok, "reported PASS for a microphone that is gone"
+        assert "no longer present" in msg
+
+    def test_a_selected_output_only_device_FAILS(self, monkeypatch):
+        ok, msg = self._run(monkeypatch, 0)
+        assert not ok, "reported PASS for a device with no input channels"
+        assert "input channels" in msg
+
+    def test_no_input_devices_at_all_fails(self, monkeypatch):
+        ok, msg = self._run(monkeypatch, -1,
+                            devices=[{"name": "Speakers", "max_input_channels": 0}])
+        assert not ok and "no input devices" in msg

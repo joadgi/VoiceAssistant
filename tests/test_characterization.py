@@ -343,3 +343,38 @@ class TestConfig:
             tmp_path, monkeypatch, contents=json.dumps({"hotkey_record": "q"})
         )
         assert cfg["hotkey_record"] == DEFAULTS["hotkey_record"]
+
+
+def test_a_reset_hotkey_is_explained_in_the_log(monkeypatch):
+    """Losing a BINDING is more surprising than losing a stale setting: the
+    user presses their key, nothing happens, and nothing explains why.
+    `load_error` stays None because the file parsed fine, so the log line is
+    the only trace. (Audit finding, 2026-09-12.)"""
+    from voiceassistant import applog, config
+
+    lines = []
+    monkeypatch.setattr(applog, "info", lambda msg, *a: lines.append(msg % a if a else msg))
+
+    cleaned = config.sanitize_settings({
+        "hotkey_record": "not a real key",          # invalid -> reset
+        "hotkey_screen_read": "ctrl+shift+s",
+        "hotkey_read_aloud": "ctrl+shift+s",        # duplicate -> reset
+    })
+    assert cleaned["hotkey_record"] == config.DEFAULTS["hotkey_record"]
+    assert cleaned["hotkey_read_aloud"] != cleaned["hotkey_screen_read"]
+    explained = " ".join(lines)
+    assert "hotkey_record" in explained, "an invalid hotkey was reset silently"
+    assert "hotkey_read_aloud" in explained, "a duplicate hotkey was reset silently"
+
+
+def test_a_valid_hotkey_is_not_logged_as_reset(monkeypatch):
+    from voiceassistant import applog, config
+
+    lines = []
+    monkeypatch.setattr(applog, "info", lambda msg, *a: lines.append(msg % a if a else msg))
+    config.sanitize_settings({
+        "hotkey_record": "caps lock",
+        "hotkey_screen_read": "ctrl+shift+s",
+        "hotkey_read_aloud": "scroll lock",
+    })
+    assert not any("reset to" in line for line in lines), lines

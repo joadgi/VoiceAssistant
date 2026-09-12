@@ -214,6 +214,17 @@ selection never changes into SAPI; `pyttsx3` runs only when explicitly selected.
     `True`** — so the obvious `lambda e: sig.emit()` silently stops suppressing and Caps
     Lock starts toggling caps again. `_setup_hotkeys` uses explicit `def`s that emit as a
     statement; a test pins the falsy return.
+  - **A key that ALIASES a modifier's scan codes is rejected outright**
+    (`MODIFIER_ALIASED_KEYS`, enforced in `validate_hotkey`). Measured:
+    `pause` -> `(69, 57629)` shares `57629` with `ctrl`; `right ctrl`
+    resolves to the SAME set as generic `ctrl`; `right alt` shares `56`
+    with `alt`. Binding any of them starts a dictation on every Ctrl+C
+    and Alt+Tab, then tries to paste into whatever the user was doing.
+    The right-hand modifiers were documented here but never actually
+    BLOCKED, and `pause` was reachable straight from the capture pill
+    (Qt maps `Key_Pause`), so the rule is now enforced in code and
+    rejected anywhere in a combo (`shift+pause` fires on Shift+Ctrl).
+    A test re-measures the overlap so the list stays honest.
   - **Right-hand modifiers are NOT usable as solo keys:** `keyboard.key_to_scan_codes`
     maps `right ctrl` → `(57629, 29, 57373)` — the *same set* as generic `ctrl` — and
     `hook_key` registers under every one, so `right ctrl` fires on LEFT Ctrl (every
@@ -692,9 +703,22 @@ All are editable inline — click a hotkey pill and press your combo (single key
   are not user-visible. They come from input-synchronous UIA calls; the read path
   only READS (verified: 8/8 captures, zero dumps) — it is `TextRange.Select()`, used
   by `test_uia_selection_live.py` to create a selection, that provokes them.
+- **Tests must never touch the real CLIPBOARD either** (`tests/conftest.py`).
+  The fourth leak of the same family, found 2026-09-12: inline typing
+  copies the accurate text to the clipboard whenever it cannot reconcile
+  a draft, and six tests reached that branch unpatched. Proven by putting
+  a sentinel on the real clipboard and watching one test replace it.
+  `pyperclip` is now stubbed for every test by the autouse fixture, with
+  a meta-test proving the guard took effect - the same shape as the
+  metrics/log/settings guards.
 - **Tests must never open a real capture device.** Every MainWindow harness stubs
   `VoiceRecorder.open_stream`/`close_stream`; a live stream outliving a fixture is what
   segfaulted the suite. Drive the recorder synchronously instead: `_audio_callback(...)`
   to feed audio, `_on_tick()` for cap/health, `_finish_capture()` for the tail timer.
+- **Every MainWindow harness must stub `TTSEngine._load_kokoro`.** The
+  default voice is Kokoro, so a harness without the stub queues a real
+  164 MB ONNX load per constructed window and pays for it synchronously
+  in `tts.shutdown()` at teardown. Three harnesses were missing it;
+  adding them took the fast suite from **90 s to 27 s**.
 - Local pytest runs may need `--basetemp` redirected (the default
   `%TEMP%\pytest-of-*` dir can end up ACL-locked, which shows as ~29 unrelated errors).

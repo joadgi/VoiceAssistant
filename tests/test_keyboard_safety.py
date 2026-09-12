@@ -512,3 +512,68 @@ def test_the_app_registers_no_keyboard_add_hotkey():
         source = fh.read()
     for call in ("kb.add_hotkey(", "keyboard.add_hotkey("):
         assert call not in source, "%s was reintroduced" % call
+
+
+# --------------------------------------------------------------------------- #
+# Keys that masquerade as modifiers (audit finding, 2026-09-12)
+# --------------------------------------------------------------------------- #
+class TestModifierAliasedKeysAreRejected:
+    """`pause`, `right ctrl` and `right alt` resolve to a modifier's scan codes.
+
+    `keyboard.hook_key` registers under EVERY code a key resolves to, so a
+    dictation bound to one of these starts on every Ctrl+C / Alt+Tab the user
+    presses, then tries to paste into whatever they were doing. CLAUDE.md
+    recorded the measurement for the right-hand modifiers; `pause` was still
+    reachable from the capture pill and nothing rejected it.
+    """
+
+    def test_the_denylist_is_honest_about_the_scan_codes(self):
+        """Guard the REASON, not just the list. If a future `keyboard` release
+        stops aliasing one of these, this fails and the entry can go."""
+        import keyboard as kb
+
+        from voiceassistant.config import MODIFIER_ALIASED_KEYS
+
+        modifier_codes = set()
+        for mod in ("ctrl", "alt", "shift"):
+            modifier_codes.update(kb.key_to_scan_codes(mod))
+        for key in MODIFIER_ALIASED_KEYS:
+            codes = set(kb.key_to_scan_codes(key))
+            assert codes & modifier_codes, (
+                "%s no longer overlaps a modifier's scan codes %s -- it can be "
+                "removed from MODIFIER_ALIASED_KEYS" % (key, sorted(codes)))
+
+    def test_they_are_rejected_alone(self):
+        from voiceassistant.config import validate_hotkey
+
+        for key in ("pause", "right ctrl", "right alt"):
+            assert not validate_hotkey(key), (
+                "%s would fire on the ordinary left-hand modifier" % key)
+
+    def test_they_are_rejected_inside_a_combo_too(self):
+        """`shift+pause` would fire on Shift+Ctrl."""
+        from voiceassistant.config import validate_hotkey
+
+        for combo in ("shift+pause", "ctrl+right alt", "ctrl+shift+pause"):
+            assert not validate_hotkey(combo), combo
+
+    def test_ordinary_solo_keys_still_work(self):
+        from voiceassistant.config import validate_hotkey
+
+        for key in ("caps lock", "scroll lock", "f9", "insert", "num lock",
+                    "ctrl+shift+r", "ctrl+alt"):
+            assert validate_hotkey(key), key
+
+    def test_a_saved_aliased_hotkey_is_replaced_on_load(self):
+        """A hand-edited settings.json must not be able to install one."""
+        from voiceassistant.config import sanitize_settings
+
+        cleaned = sanitize_settings({
+            "hotkey_record": "pause",
+            "hotkey_screen_read": "right ctrl",
+            "hotkey_read_aloud": "scroll lock",
+        })
+        assert cleaned["hotkey_record"] not in ("pause", "right ctrl", "right alt")
+        assert cleaned["hotkey_screen_read"] not in ("pause", "right ctrl", "right alt")
+        assert cleaned["hotkey_read_aloud"] == "scroll lock"
+        assert len(set(cleaned.values())) == 3, "two actions ended up on one binding"
