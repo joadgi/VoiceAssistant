@@ -821,7 +821,7 @@ class MainWindow(QMainWindow):
         if self._inline_target is None:
             applog.dbg("inline draft ignored: no inline session for this recording")
             return
-        target = stream_target(stable)
+        target = stream_target(stable, tail)
         applog.dbg("inline draft: stable=%d tail=%d -> type %d chars"
                    % (len(stable or ""), len(tail or ""), len(target)))
         self.paster.type_to(self._inline_target, self._inline_session, target)
@@ -1511,6 +1511,10 @@ class MainWindow(QMainWindow):
 
             self.config.set("whisper_language", vals["whisper_language"])
             self.transcriber.language = vals["whisper_language"]
+
+            # Vocabulary bias. Applies to the NEXT dictation; no reload needed.
+            self.config.set("whisper_prompt", vals["whisper_prompt"])
+            self.transcriber.initial_prompt = vals["whisper_prompt"]
 
             self.config.set("font_size", vals["font_size"])
             self.text_output.setFont(QFont("Cascadia Code", vals["font_size"]))

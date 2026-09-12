@@ -225,6 +225,17 @@ selection never changes into SAPI; `pyttsx3` runs only when explicitly selected.
     (Qt maps `Key_Pause`), so the rule is now enforced in code and
     rejected anywhere in a combo (`shift+pause` fires on Shift+Ctrl).
     A test re-measures the overlap so the list stays honest.
+  - **A key that ALIASES a modifier's scan codes is rejected outright**
+    (`MODIFIER_ALIASED_KEYS`, enforced in `validate_hotkey`). Measured:
+    `pause` -> `(69, 57629)` shares `57629` with `ctrl`; `right ctrl`
+    resolves to the SAME set as generic `ctrl`; `right alt` shares `56`
+    with `alt`. Binding any of them starts a dictation on every Ctrl+C
+    and Alt+Tab, then tries to paste into whatever the user was doing.
+    The right-hand modifiers were documented here but never actually
+    BLOCKED, and `pause` was reachable straight from the capture pill
+    (Qt maps `Key_Pause`), so the rule is now enforced in code and
+    rejected anywhere in a combo (`shift+pause` fires on Shift+Ctrl).
+    A test re-measures the overlap so the list stays honest.
   - **Right-hand modifiers are NOT usable as solo keys:** `keyboard.key_to_scan_codes`
     maps `right ctrl` → `(57629, 29, 57373)` — the *same set* as generic `ctrl` — and
     `hook_key` registers under every one, so `right ctrl` fires on LEFT Ctrl (every
@@ -433,6 +444,20 @@ selection never changes into SAPI; `pyttsx3` runs only when explicitly selected.
   to `0.0` **disabled the fallback retry**, so a decode that tripped the
   compression/logprob thresholds just shipped its bad text. Measured cost of the
   upgrade: **+54 ms per dictation** on a 3070. Don't trade it back for latency.
+- **A vocabulary prompt makes Whisper INVENT on silence; it ships only behind a
+  control pass** (`transcriber._control_pass_rejects`, setting
+  `whisper_prompt`). Measured 2026-09-12 on large-v3 across four silence/noise
+  fixtures: an empty prompt invented nothing 4/4, a THREE-WORD vocabulary
+  invented "Thank you." 2/4, and eight or more terms invented on all four --
+  while real-speech transcripts were byte-identical either way. The benefit is
+  equally real: on Kokoro-spoken jargon, recognition went from **8/13 terms to
+  13/13** ("SIN7"->"Cin7", "TA CoS"->"TACoS", "assin"->"ASIN"). So the feature
+  is worth having and could not ship raw. The guard: when a vocabulary is set
+  AND the result is at most `PROMPT_CONTROL_MAX_CHARS`, re-decode the same
+  audio with NO prompt; the empty prompt is a reliable control, so if it hears
+  nothing the text only existed because the vocabulary suggested it. It costs
+  one extra decode on exactly the short clips that were about to paste junk,
+  and it fails OPEN -- a broken control decode never eats real dictation.
 - **Post-process repeat collapse** (`collapse_repeated_phrases` in `text.py`): catches
   word/phrase/sentence repeats as a safety net. Prefer this over aggressive transcribe-time
   filters.
@@ -511,7 +536,15 @@ selection never changes into SAPI; `pyttsx3` runs only when explicitly selected.
   `ctrl+shift+r` held, Ctrl is physically down for the whole utterance, so every
   injected character arrives as a SHORTCUT — the binding must be a plain key.
   The console rule is the same boundary read-aloud already observes for Ctrl+C.
-- **Only the STABLE half of a draft is typed.** Typing a word that is still
+- **Inline typing types the tail too, minus its last word.** The stabilizer
+  needs two agreeing decodes, so the FIRST draft of every dictation is entirely
+  tail and used to type nothing -- which on a short dictation meant the user
+  saw nothing at all before releasing. Measured on real speech across
+  1.6/2.4/4.0/6.5 s holds: first visible word moved from **~1.4 s to ~0.98 s**,
+  a 1.6 s dictation went from 3 typed characters to 13, and corrections stayed
+  at **zero** in every case. The last word is withheld because it is the one
+  still being spoken, so it is the one that actually changes.
+- **Only the STABLE half of a draft reaches the PILL.** Typing a word that is still
   being revised means deleting it again a moment later, which reads as
   flickering in the user's document. Measured on the live chain test: typing
   only settled words produced **zero** corrections on a full paragraph, because
@@ -711,10 +744,23 @@ All are editable inline — click a hotkey pill and press your combo (single key
   `pyperclip` is now stubbed for every test by the autouse fixture, with
   a meta-test proving the guard took effect - the same shape as the
   metrics/log/settings guards.
+- **Tests must never touch the real CLIPBOARD either** (`tests/conftest.py`).
+  The fourth leak of the same family, found 2026-09-12: inline typing
+  copies the accurate text to the clipboard whenever it cannot reconcile
+  a draft, and six tests reached that branch unpatched. Proven by putting
+  a sentinel on the real clipboard and watching one test replace it.
+  `pyperclip` is now stubbed for every test by the autouse fixture, with
+  a meta-test proving the guard took effect - the same shape as the
+  metrics/log/settings guards.
 - **Tests must never open a real capture device.** Every MainWindow harness stubs
   `VoiceRecorder.open_stream`/`close_stream`; a live stream outliving a fixture is what
   segfaulted the suite. Drive the recorder synchronously instead: `_audio_callback(...)`
   to feed audio, `_on_tick()` for cap/health, `_finish_capture()` for the tail timer.
+- **Every MainWindow harness must stub `TTSEngine._load_kokoro`.** The
+  default voice is Kokoro, so a harness without the stub queues a real
+  164 MB ONNX load per constructed window and pays for it synchronously
+  in `tts.shutdown()` at teardown. Three harnesses were missing it;
+  adding them took the fast suite from **90 s to 27 s**.
 - **Every MainWindow harness must stub `TTSEngine._load_kokoro`.** The
   default voice is Kokoro, so a harness without the stub queues a real
   164 MB ONNX load per constructed window and pays for it synchronously

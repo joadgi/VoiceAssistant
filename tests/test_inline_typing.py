@@ -129,6 +129,26 @@ class TestPolicy:
     def test_missing_target_is_refused(self):
         assert block_reason(**{**self.OK, "hwnd": 0})
 
+    def test_the_tail_is_typed_except_its_last_word(self):
+        """The stabilizer needs two agreeing decodes, so the FIRST draft is all
+        tail and would type nothing. Typing the tail minus its last word puts
+        words on screen a whole draft earlier (measured 1.4s -> 1.0s) while the
+        word still being spoken -- the one that actually changes -- is held
+        back. Measured across four hold lengths: zero corrections."""
+        assert stream_target("", "the quarterly report is") == "The quarterly report"
+        assert stream_target("The quarterly", "report is ready") == (
+            "The quarterly report is")
+
+    def test_a_one_word_tail_is_held_back_entirely(self):
+        """With a single tail word there is nothing to type but the volatile
+        one, so nothing is typed."""
+        assert stream_target("", "the") == ""
+        assert stream_target("Hello there", "friend") == "Hello there"
+
+    def test_the_tail_is_optional(self):
+        assert stream_target("Hello there") == "Hello there"
+        assert stream_target("", None) == ""
+
     def test_stream_target_matches_the_final_texts_capitalisation(self):
         # finish_transcript capitalizes; matching it keeps the reconciliation
         # a zero-backspace append instead of a full retype.

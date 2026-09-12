@@ -7,7 +7,7 @@ this dialog covers audio, transcription, and display preferences.
 import sounddevice as sd
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QLabel,
-    QSpinBox, QTabWidget, QVBoxLayout, QWidget,
+    QPlainTextEdit, QSpinBox, QTabWidget, QVBoxLayout, QWidget,
 )
 
 
@@ -93,6 +93,20 @@ class SettingsDialog(QDialog):
         self.cleanup_check.setChecked(self.config.get("light_cleanup", True))
         tlay.addRow(self.cleanup_check)
 
+        self.vocab_edit = QPlainTextEdit()
+        self.vocab_edit.setPlainText(self.config.get("whisper_prompt", ""))
+        self.vocab_edit.setPlaceholderText(
+            "ASIN, SKU, Cin7, TACoS, Seller Central, Helium 10, Power BI")
+        self.vocab_edit.setFixedHeight(66)
+        tlay.addRow("Your vocabulary:", self.vocab_edit)
+        tlay.addRow(self._hint(
+            "Words Whisper should expect — product names, acronyms, people, "
+            "systems. This fixes the terms it mishears most and locks in their "
+            "casing. Keep it to a couple of lines: it is fed to the model as "
+            "context, and an over-long or strange list can leak INTO your "
+            "transcript. Leave empty to disable."
+        ))
+
         self.preview_check = QCheckBox("Live preview while recording (words appear as you speak)")
         self.preview_check.setChecked(self.config.get("live_preview", True))
         tlay.addRow(self.preview_check)
@@ -164,6 +178,7 @@ class SettingsDialog(QDialog):
             "start_with_windows": self.startup_check.isChecked(),
             "start_minimized": self.start_minimized_check.isChecked(),
             "light_cleanup": self.cleanup_check.isChecked(),
+            "whisper_prompt": self.vocab_edit.toPlainText().strip(),
             "live_preview": self.preview_check.isChecked(),
             "inline_typing": self.inline_check.isChecked(),
             "debug_logging": self.debug_check.isChecked(),

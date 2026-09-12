@@ -17,6 +17,20 @@ from .workers import SerialWorker
 # (the recorder is pinned to it); every sample-count → seconds calc uses this.
 SAMPLE_RATE = 16000
 
+# Sentinel: "use whatever vocabulary the user configured". Distinct from "" ,
+# which explicitly means NO bias (see _control_pass_rejects).
+_USE_CONFIGURED = object()
+
+# A vocabulary prompt makes Whisper invent on silence. MEASURED 2026-09-12 on
+# large-v3 over four silence/noise fixtures: an empty prompt invented nothing
+# 4/4 times, a THREE-WORD vocabulary invented "Thank you." 2/4, and eight or
+# more terms invented on all 4 — while the transcripts of real speech were
+# byte-identical with and without it. Hallucinated text pasted into the
+# focused window is the worst failure this app has, so a vocabulary may only
+# ship with the control pass below. Only SHORT results are re-checked: a long
+# transcript is not an invented artifact, and the extra decode is not free.
+PROMPT_CONTROL_MAX_CHARS = 60
+
 
 def _is_cache_miss(exc):
     """True when a local_files_only load failed only because nothing is cached.
@@ -227,7 +241,7 @@ class Transcriber(QObject):
         self._worker.submit(self._transcribe_job, audio_data, context, self._job_seq)
         return self._job_seq  # so callers can correlate metrics to the job
 
-    def _run_transcribe(self, audio_data, use_vad):
+    def _run_transcribe(self, audio_data, use_vad, prompt=_USE_CONFIGURED):
         """Run one transcription pass.
 
         With VAD on, silence is trimmed (kills repeat/junk hallucinations);
@@ -260,8 +274,9 @@ class Transcriber(QObject):
         )
         # Optional vocabulary/style bias (proper nouns, jargon, casing). Off by
         # default: a prompt can leak into the output, so it is opt-in per user.
-        if self.initial_prompt:
-            kwargs["initial_prompt"] = self.initial_prompt
+        bias = self.initial_prompt if prompt is _USE_CONFIGURED else prompt
+        if bias:
+            kwargs["initial_prompt"] = bias
         if use_vad:
             kwargs.update(
                 vad_filter=True,
@@ -276,6 +291,35 @@ class Transcriber(QObject):
             if seg_text:
                 text_parts.append(seg_text)
         return " ".join(text_parts).strip()
+
+    def _control_pass_rejects(self, audio_data, text):
+        """True when this text only exists because of the vocabulary bias.
+
+        The empty prompt is a RELIABLE control: measured over the silence and
+        noise fixtures it invented nothing, while every non-empty vocabulary
+        invented "Thank you." That makes a prompt-free re-decode a direct test
+        of "did the model hear this, or did my vocabulary suggest it?" — run
+        only when a vocabulary is actually set and the result is short enough
+        to be an artifact, so the cost is one extra decode on exactly the
+        clips that are about to paste junk into the user's window.
+        """
+        from . import applog
+
+        if not self.initial_prompt or not text:
+            return False
+        if len(text) > PROMPT_CONTROL_MAX_CHARS:
+            return False
+        try:
+            control = self._run_transcribe(audio_data, use_vad=False, prompt="")
+        except Exception:
+            applog.exception("vocabulary control pass failed; keeping the text")
+            return False
+        if control.strip():
+            return False
+        applog.info(
+            "dropped %d chars that only appeared with the vocabulary bias "
+            "(a prompt-free decode of the same audio heard nothing)" % len(text))
+        return True
 
     def _transcribe_job(self, audio_data, context, job_id):
         try:
@@ -294,6 +338,9 @@ class Transcriber(QObject):
                 # working") — with the shared segment guards still active.
                 retried = True
                 full_text = self._run_transcribe(audio_data, use_vad=False)
+
+            if self._control_pass_rejects(audio_data, full_text):
+                full_text = ""
 
             self.transcription_ready.emit(
                 TranscriptionResult(

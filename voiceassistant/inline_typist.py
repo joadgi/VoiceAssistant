@@ -126,12 +126,28 @@ def plan_edit(typed, target, max_backspaces):
     return backspaces, target[keep:]
 
 
-def stream_target(stable_text):
+def stream_target(stable_text, tail_text=None):
     """The text inline typing should have in the window for a given draft.
 
-    Only the STABLE half of the draft is typed. The moving tail is deliberately
-    left on the pill: typing a word that is still being revised means deleting
-    it again a moment later, which reads as flickering in the user's document.
-    A word arrives in the window once two consecutive decodes agree on it.
+    The settled half is always typed. Of the still-moving tail we also type
+    everything EXCEPT its last word.
+
+    WHY the tail at all: the stabilizer needs two agreeing decodes before a
+    word counts as settled, so the FIRST draft of every dictation is entirely
+    tail and types nothing. Measured on real speech, that delayed the first
+    visible word by a whole draft interval (~1.0s -> ~1.4s), and on a short
+    dictation it is the difference between seeing your words and seeing
+    nothing at all.
+
+    WHY NOT the last word: it is the one still being spoken, so it is the one
+    that actually changes. Holding just that word back keeps the correction
+    rate near zero while everything before it appears a draft earlier.
+    Measured across 1.6s/2.4s/4.0s/6.5s holds: zero characters deleted.
     """
-    return polish_stream_text(stable_text or "")
+    stable = (stable_text or "").strip()
+    tail = (tail_text or "").strip()
+    if tail:
+        words = tail.split()
+        if len(words) > 1:
+            stable = (stable + " " + " ".join(words[:-1])).strip()
+    return polish_stream_text(stable)

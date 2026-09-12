@@ -301,6 +301,8 @@ class TestSettingsApply:
             "audio_device": 3,
             "whisper_model": "small",        # changed -> must call change_model
             "whisper_language": "es",
+            "whisper_prompt": "ASIN, SKU, Cin7, TACoS",   # vocabulary bias
+
             "font_size": 18,
             "always_on_top": True,
             "start_with_windows": True,      # changed -> registry call
@@ -344,6 +346,9 @@ class TestSettingsApply:
         # --- persisted config (in memory) ---
         assert mw.config["whisper_model"] == "small"
         assert mw.config["whisper_language"] == "es"
+        assert mw.config["whisper_prompt"] == "ASIN, SKU, Cin7, TACoS"
+        assert mw.transcriber.initial_prompt == "ASIN, SKU, Cin7, TACoS", (
+            "the vocabulary was saved but never reached the transcriber")
         assert mw.config["font_size"] == 18
         assert mw.config["always_on_top"] is True
         assert mw.config["start_with_windows"] is True

@@ -761,3 +761,97 @@ class TestMicDeathCleansUp:
         assert not mw.live_preview.active, "the preview kept ticking after the mic died"
         assert not mw.live_preview._timer.isActive()
         assert discarded, "the typed draft was left in the user's document"
+
+
+class TestVocabularyControlPass:
+    """A vocabulary prompt makes Whisper invent on silence.
+
+    MEASURED 2026-09-12 on large-v3 across four silence/noise fixtures: an
+    empty prompt invented nothing 4/4, a THREE-WORD vocabulary invented
+    "Thank you." 2/4, and eight or more terms invented on all four — while
+    real-speech transcripts were byte-identical either way. Hallucinated text
+    pasted into the focused window is the worst failure this app has, so a
+    vocabulary may only ship behind this control pass: re-decode the same
+    audio with NO prompt, and if the model hears nothing, the text only
+    existed because the vocabulary suggested it.
+
+    The benefit is real and also measured: jargon recognition went from 8/13
+    terms to 13/13 with the vocabulary on ("SIN7" -> "Cin7", "TA CoS" -> "TACoS",
+    "assin" -> "ASIN"), which is why the feature exists at all.
+    """
+
+    @staticmethod
+    def _transcriber(prompt, control_text):
+        t = Transcriber(model_size="tiny", language="en", initial_prompt=prompt)
+        calls = []
+
+        def fake(audio, use_vad, prompt=None):
+            calls.append(prompt)
+            # The control pass is the one that passes an explicit "".
+            return control_text if prompt == "" else "Thank you."
+
+        t._run_transcribe = fake
+        t._model = object()
+        return t, calls
+
+    def test_text_the_control_pass_cannot_hear_is_dropped(self):
+        t, calls = self._transcriber("ASIN, SKU, Cin7.", control_text="")
+        try:
+            assert t._control_pass_rejects(np.zeros(SR, dtype=np.float32),
+                                           "Thank you.") is True
+            assert "" in calls, "the control decode never ran"
+        finally:
+            t.shutdown()
+
+    def test_text_the_control_pass_confirms_is_kept(self):
+        t, _ = self._transcriber("ASIN, SKU, Cin7.", control_text="Yes.")
+        try:
+            assert t._control_pass_rejects(np.zeros(SR, dtype=np.float32),
+                                           "Yes.") is False
+        finally:
+            t.shutdown()
+
+    def test_no_vocabulary_means_no_extra_decode(self):
+        """The control pass must cost nothing for the shipped default."""
+        t, calls = self._transcriber("", control_text="")
+        try:
+            assert t._control_pass_rejects(np.zeros(SR, dtype=np.float32),
+                                           "Thank you.") is False
+            assert calls == [], "ran a control decode with no vocabulary set"
+        finally:
+            t.shutdown()
+
+    def test_long_transcripts_are_not_re_decoded(self):
+        """A long transcript is not an invented artifact, and the extra decode
+        is not free."""
+        from voiceassistant.transcriber import PROMPT_CONTROL_MAX_CHARS
+
+        t, calls = self._transcriber("ASIN, SKU.", control_text="")
+        try:
+            long_text = "x" * (PROMPT_CONTROL_MAX_CHARS + 1)
+            assert t._control_pass_rejects(np.zeros(SR, dtype=np.float32),
+                                           long_text) is False
+            assert calls == []
+        finally:
+            t.shutdown()
+
+    def test_a_failing_control_pass_keeps_the_text(self):
+        """Fail OPEN: a broken control decode must never eat real dictation."""
+        t = Transcriber(model_size="tiny", language="en", initial_prompt="ASIN.")
+        try:
+            def boom(audio, use_vad, prompt=None):
+                raise RuntimeError("decode exploded")
+
+            t._run_transcribe = boom
+            assert t._control_pass_rejects(np.zeros(SR, dtype=np.float32),
+                                           "Yes.") is False
+        finally:
+            t.shutdown()
+
+    def test_empty_text_needs_no_control_pass(self):
+        t, calls = self._transcriber("ASIN.", control_text="")
+        try:
+            assert t._control_pass_rejects(np.zeros(SR, dtype=np.float32), "") is False
+            assert calls == []
+        finally:
+            t.shutdown()
