@@ -69,6 +69,9 @@ DEFAULTS = {
     "preroll_ms": 300,
 
     "light_cleanup": True,
+    # Show a rolling draft of the recording on the pill while the key is held
+    # (see live_preview.py). Uses the loaded Whisper model; no extra download.
+    "live_preview": True,
     "debug_logging": False,
 }
 

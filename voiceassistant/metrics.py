@@ -107,7 +107,15 @@ def summarize(rows):
     retried = sum(1 for r in rows if r.get("retried"))
     rescued = sum(1 for r in rows if r.get("keyup_lost"))
     bad = sum(counts.get(k, 0) for k in _BAD)
+    preview_rows = [r for r in rows if r.get("preview_decodes")]
+    preview_ms = [r["preview_ms"] for r in preview_rows
+                  if isinstance(r.get("preview_ms"), (int, float))]
+    preview_counts = [r["preview_decodes"] for r in preview_rows]
     return {
+        "preview_dictations": len(preview_rows),
+        "preview_ms_p50": _pct(preview_ms, 0.50),
+        "preview_ms_p95": _pct(preview_ms, 0.95),
+        "preview_decodes_p50": _pct(preview_counts, 0.50),
         "total": total,
         "counts": counts,
         "success_rate": (total - bad) / total if total else 0.0,
@@ -149,6 +157,12 @@ def format_report(rows):
     out.append(f"  gappy audio (overflow) : {s['overflow_dictations']}")
     out.append(f"  VAD no-speech retries  : {s['vad_retries']}")
     out.append(f"  lost keyups rescued    : {s['lost_keyups_rescued']}")
+    if s["preview_dictations"]:
+        out.append("")
+        out.append(f"  live preview           : {s['preview_dictations']} dictations, "
+                   f"{s['preview_ms_p50']:.0f} ms median draft latency "
+                   f"({s['preview_ms_p95']:.0f} ms p95), "
+                   f"{s['preview_decodes_p50']:.0f} drafts per dictation")
     if s["counts"].get(OUTCOME_DROPPED_QUIET):
         out.append("\n  Dropped-quiet clips mean the mic level is too low - check the")
         out.append("  Yeti's gain knob and that the right device is set in Settings.")

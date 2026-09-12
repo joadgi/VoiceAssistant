@@ -55,10 +55,28 @@ class TranscriptionResult:
     no_speech: bool = False  # True if both passes found nothing
 
 
+@dataclass
+class PreviewResult:
+    """One live-preview decode of the uncommitted window (see live_preview.py).
+
+    `segments` is a list of (start_s, end_s, text) relative to the window
+    start; `offset_frames`/`n_frames` echo the window so the controller can
+    commit against the audio it actually decoded, not what has arrived since.
+    `error` is set (and `segments` empty) when the decode failed.
+    """
+    gen: int
+    segments: list
+    offset_frames: int
+    n_frames: int
+    latency_ms: float = 0.0
+    error: str = ""
+
+
 class Transcriber(QObject):
     """Loads faster-whisper and transcribes audio arrays."""
 
     model_loading = Signal(str)  # status message
+    preview_ready = Signal(object)  # emits PreviewResult (live preview drafts)
     model_ready = Signal()
     # Loaded, but in a materially worse mode than requested (CPU instead of
     # CUDA is 10-20x slower). A degraded session that only writes a log line
@@ -79,6 +97,10 @@ class Transcriber(QObject):
         self.initial_prompt = initial_prompt or ""
         self._model = None
         self._job_seq = 0  # monotonic job ids (replaces the id(audio) guard)
+        # Live-preview cancellation: a queued preview job whose generation is
+        # older than this is skipped without decoding, so the FINAL decode is
+        # never held behind drafts for a recording that already ended.
+        self._preview_gen = 0
         self._worker = SerialWorker("transcriber")
 
     @property
@@ -281,6 +303,69 @@ class Transcriber(QObject):
             )
         except Exception as e:
             self.error.emit(f"Transcription error: {e}")
+
+    # ------------------------------------------------------------------ #
+    # Live preview (see live_preview.py for the policy; this is only the decode)
+    # ------------------------------------------------------------------ #
+    def preview(self, audio_data, prompt, gen, offset_frames):
+        """Queue one greedy draft decode of `audio_data` on the shared worker.
+
+        Always answers with a `preview_ready` PreviewResult for `gen` — success,
+        error, or cancelled-empty — so the controller's in-flight flag can
+        never stick.
+        """
+        self._preview_gen = gen
+        self._worker.submit(self._preview_job, audio_data, prompt, gen, offset_frames)
+
+    def cancel_previews(self):
+        """Skip every preview job still queued (the one running finishes)."""
+        self._preview_gen = -1
+
+    def _preview_job(self, audio_data, prompt, gen, offset_frames):
+        n = len(audio_data)
+        if gen != self._preview_gen or self._model is None:
+            self.preview_ready.emit(PreviewResult(gen, [], offset_frames, n))
+            return
+        t0 = time.perf_counter()
+        try:
+            kwargs = dict(
+                language=self.language,
+                # Draft settings: greedy, single pass, no VAD. Fast beats
+                # perfect here — the whole window is re-decoded a few hundred
+                # milliseconds later and the FINAL pass keeps beam search.
+                beam_size=1,
+                best_of=1,
+                temperature=0.0,
+                condition_on_previous_text=False,
+                word_timestamps=False,
+                vad_filter=False,
+                no_speech_threshold=0.6,
+                compression_ratio_threshold=2.4,
+                log_prob_threshold=-1.0,
+            )
+            full_prompt = " ".join(p for p in (self.initial_prompt, prompt) if p)
+            if full_prompt:
+                kwargs["initial_prompt"] = full_prompt
+            segments_iter, _info = self._model.transcribe(audio_data, **kwargs)
+            segments = []
+            for segment in segments_iter:
+                if gen != self._preview_gen:
+                    break  # recording ended mid-decode; stop spending GPU time
+                if getattr(segment, "no_speech_prob", 0.0) > 0.6:
+                    continue
+                seg_text = segment.text.strip()
+                if seg_text:
+                    segments.append((float(segment.start), float(segment.end), seg_text))
+            self.preview_ready.emit(PreviewResult(
+                gen, segments, offset_frames, n,
+                latency_ms=(time.perf_counter() - t0) * 1000.0,
+            ))
+        except Exception as e:
+            self.preview_ready.emit(PreviewResult(
+                gen, [], offset_frames, n,
+                latency_ms=(time.perf_counter() - t0) * 1000.0,
+                error=f"{type(e).__name__}: {e}",
+            ))
 
     def change_model(self, model_size, device=None, compute_type=None):
         """Switch to a different model size."""

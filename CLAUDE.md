@@ -43,10 +43,11 @@ run.bat/shortcuts/startup-registry compatibility.
 |---|---|
 | `voiceassistant/app.py` | Bootstrap: crash handlers FIRST, single-instance mutex, QApplication. |
 | `voiceassistant/window.py` | `MainWindow` — all orchestration and signal wiring. Renders state + dispatches jobs; never blocks. |
-| `voiceassistant/widgets.py` | `RecordingIndicator` pill + the single `HotkeyCaptureWidget`. |
+| `voiceassistant/widgets.py` | `RecordingIndicator` pill (compact state pill that expands into the live-preview caption card) + the single `HotkeyCaptureWidget`. |
+| `voiceassistant/live_preview.py` | `LivePreview` — rolling draft of the active recording shown on the pill while the key is held. GUI-thread tick owns the policy (when to decode, commit, stop); pure `PreviewStabilizer` + `choose_commit` helpers. Shares the transcriber's model and worker; never touches the target window. |
 | `voiceassistant/settings_dialog.py` / `theme.py` | Settings UI, dark stylesheet. |
 | `voiceassistant/recorder.py` | `VoiceRecorder` — **always-open** mic stream + pre-roll ring buffer; GUI-thread tick owns metering/duration-cap/mic-health. |
-| `voiceassistant/transcriber.py` | `Transcriber` + `TranscriptionResult` (faster-whisper, both-pass guards, job-bound context). |
+| `voiceassistant/transcriber.py` | `Transcriber` + `TranscriptionResult` (faster-whisper, both-pass guards, job-bound context) + `PreviewResult`/`_preview_job` (the greedy live-preview decode on the same worker, generation-cancellable). |
 | `voiceassistant/tts.py` | `TTSEngine` — local Kokoro blocks or one online edge-tts generator → one VLC stream, per-utterance generations, explicit pyttsx3 option, bounded waits. Carries the STOP CONTRACT and VOICE CONTRACT (in-file). |
 | `voiceassistant/ocr.py` | `ScreenCapture` (mss) + `OCREngine` (Windows-native OCR default, EasyOCR fallback) + `RegionSelector`. |
 | `voiceassistant/chord_hotkey.py` | `ChordHotkey` — the global chord matcher shared by read-aloud AND OCR; modifiers always pass through, only matched non-modifier down/up pairs can be consumed, cached key state reconciled against Windows. The app contains no `keyboard.add_hotkey`. |
@@ -74,6 +75,17 @@ buffer. `hold hotkey` → capture foreground window HWND → mark the ring offse
 and sends Win32 `Ctrl+V` into the captured window (off the GUI thread; the prior clipboard
 is restored afterward). The floating pill mirrors each state (Ready → Recording →
 Transcribing → Pasted), **and names the reason when a clip is dropped**.
+
+**Live preview (while the key is held):** `LivePreview` ticks on the GUI thread every
+100 ms; when ≥0.6 s of audio exists and ≥0.25 s is new since the last draft, it
+`peek()`s the ring (capture so far, recording untouched) and submits ONE greedy,
+VAD-free decode of the uncommitted window to the transcriber worker. Never more than
+one draft is outstanding. The result is split into words the last two drafts agree on
+(bright) and the still-moving tail (dim) and rendered on the pill's caption card. Past
+20 s the oldest segments are frozen (and fed back as `initial_prompt`) so the window
+stays bounded. On release, `end()` cancels queued drafts BEFORE the final decode is
+submitted; the caption stays visible through Transcribing/Pasting and collapses on
+Pasted/idle/error. The final paste path is unchanged. Setting: `live_preview`.
 
 **Read-aloud:** hotkey → **3-tier selection grab** → `TTSEngine.speak()`.
 1. **UIA** (`uia.get_selection`) reads the highlight directly — no clipboard, no
@@ -395,6 +407,21 @@ selection never changes into SAPI; `pyttsx3` runs only when explicitly selected.
 - **Push-to-talk** = `on_press_key(trigger)` that only fires when *all* combo keys are held,
   plus `on_release_key(trigger)` to stop. The release handler no-ops (and stays silent)
   unless PTT is active.
+- **The live preview shares the loaded model; it does NOT load a second one**
+  (`live_preview.py`). Measured 2026-09-12 with the app resident: the GPU sat at
+  **7.5 of 8 GB** (WDDM shares it with every open browser and Office window), so
+  a second Whisper instance would gamble on CUDA out-of-memory in the middle of
+  a dictation. Reusing large-v3 costs zero VRAM and the draft has the same
+  accuracy as the final pass. The draft runs greedy (`beam_size=1`, no VAD, no
+  temperature ladder) because it is thrown away a few hundred milliseconds later;
+  the final decode keeps beam search and the no-VAD retry untouched. Contract:
+  **at most one draft is ever outstanding** (the controller waits for each
+  result), and `end()` cancels queued drafts BEFORE the final job is submitted,
+  so the paste path waits behind at most one in-flight draft. A draft failure
+  (OOM, driver hiccup) disables the preview for that recording only and logs a
+  count — never text. Stage 2 (typing the draft into the target) is deliberately
+  NOT built: it needs backspaces into an arbitrary focused window, the bug class
+  the September keyboard work removed.
 - **Floating pill doesn't steal focus** (`WA_ShowWithoutActivating` +
   `WindowDoesNotAcceptFocus`), so clicking it to start/stop dictation leaves the target
   window focused for paste.

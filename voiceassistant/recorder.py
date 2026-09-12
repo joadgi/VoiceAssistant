@@ -299,6 +299,28 @@ class VoiceRecorder(QObject):
         self._is_recording = True
         self.recording_started.emit()
 
+    @property
+    def stopping(self):
+        """True between stop() and the tail drain completing."""
+        return self._pending_stop
+
+    def capture_frames(self):
+        """Frames captured so far in the active recording (0 when idle)."""
+        if not self._is_recording:
+            return 0
+        return max(0, self._frames_written - self._capture_start)
+
+    def peek(self):
+        """Copy of the active recording so far, WITHOUT ending it.
+
+        The live preview reads this from the GUI tick. Same ring read as
+        `_finish_capture`; the writer stays ahead by the ring's headroom, so a
+        snapshot of [capture_start, frames_written) is always intact.
+        """
+        if not self._is_recording:
+            return None
+        return self._read_ring(self._capture_start, self._frames_written)
+
     def stop(self):
         """End the capture, after a short drain so the last syllable survives.
 

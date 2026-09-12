@@ -1,7 +1,11 @@
 """Reusable Qt widgets: the hotkey-capture pill and the floating indicator."""
 
+import html
+
 from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtWidgets import QApplication, QFrame, QHBoxLayout, QLabel, QWidget
+from PySide6.QtWidgets import (
+    QApplication, QFrame, QHBoxLayout, QLabel, QVBoxLayout, QWidget,
+)
 
 
 class HotkeyCaptureWidget(QFrame):
@@ -224,28 +228,121 @@ class RecordingIndicator(QWidget):
         # Don't steal focus from the window the user is dictating into.
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
         self.setWindowFlag(Qt.WindowType.WindowDoesNotAcceptFocus, True)
-        self.setFixedSize(200, 40)
+        self.setFixedSize(self.COMPACT_W, self.COMPACT_H)
         self.setToolTip("Click to start/stop dictation  •  right-click for menu  •  drag to move")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         # Right-click menu makes the pill a self-sufficient primary surface —
         # the window builds the menu (see MainWindow._on_pill_menu).
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
 
-        lay = QHBoxLayout(self)
-        lay.setContentsMargins(12, 6, 12, 6)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(12, 6, 12, 6)
+        outer.setSpacing(4)
 
+        # Live-preview caption: the rolling draft of what is being said. Hidden
+        # (and the pill compact) until the first draft arrives. Words the last
+        # two decodes agreed on are bright; the still-moving tail is dimmed.
+        self._preview = QLabel()
+        self._preview.setWordWrap(True)
+        self._preview.setTextFormat(Qt.TextFormat.RichText)
+        self._preview.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignBottom)
+        # `border: none` is load-bearing: the pill sets its border on the
+        # widget itself, and Qt style sheets propagate that to children — so
+        # without this the caption gets its own box drawn around it.
+        self._preview.setStyleSheet(
+            "color: #cdd6f4; font-size: 14px; border: none;"
+            "background-color: #181825; border-radius: 6px; padding: 6px;"
+        )
+        self._preview.setFixedWidth(self.CARD_W - 24)
+        self._preview.hide()
+        outer.addWidget(self._preview)
+
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
         self._dot = QLabel()
         self._dot.setFixedSize(14, 14)
-        lay.addWidget(self._dot)
+        row.addWidget(self._dot)
 
         self._label = QLabel("Ready")
         self._label.setStyleSheet("color: #cdd6f4; font-weight: bold; font-size: 13px;")
-        lay.addWidget(self._label)
-        lay.addStretch()
+        row.addWidget(self._label)
+        row.addStretch()
+        outer.addLayout(row)
 
         self._positioned = False  # auto-place once, then respect user drags
         self._drag_offset = None
+        self._preview_text = ""   # plain text of the current draft ("" = none)
         self._set_idle()
+
+    # Compact pill vs. expanded caption card. The card keeps the pill's
+    # bottom-right corner fixed and grows up/left, so a pill parked in the
+    # corner never walks off the screen.
+    COMPACT_W, COMPACT_H = 200, 40
+    CARD_W = 460
+    # Roughly three lines at 14px across CARD_W; older words scroll off the
+    # front so the newest words — the ones still moving — stay visible.
+    PREVIEW_CHARS = 170
+
+    def preview_text(self):
+        """Plain text of the draft currently shown ("" when collapsed)."""
+        return self._preview_text
+
+    def show_preview(self, stable, tail):
+        """Render the live draft: `stable` bright, `tail` dimmed."""
+        stable = (stable or "").strip()
+        tail = (tail or "").strip()
+        full = " ".join(p for p in (stable, tail) if p)
+        if not full:
+            self.clear_preview()
+            return
+        self._preview_text = full
+        # Trim from the FRONT so the newest words stay on screen.
+        overflow = len(full) - self.PREVIEW_CHARS
+        if overflow > 0:
+            cut = overflow + 1
+            if len(stable) >= cut:
+                stable = "…" + stable[cut:].lstrip()
+            else:
+                cut -= len(stable) + 1
+                stable = ""
+                tail = "…" + tail[max(0, cut):].lstrip()
+        parts = []
+        if stable:
+            parts.append(html.escape(stable))
+        if tail:
+            parts.append(f'<span style="color:#7f849c;">{html.escape(tail)}</span>')
+        self._preview.setText(" ".join(parts))
+        if self._preview.isHidden():
+            self._preview.show()
+        # heightForWidth on a styled QLabel does not always include the style
+        # sheet's padding, so take the larger of the two measurements — a card
+        # one pixel short clips the last line of the draft.
+        height = max(self._preview.heightForWidth(self._preview.width()),
+                     self._preview.sizeHint().height())
+        self._resize_anchored(self.CARD_W, self.COMPACT_H + height + 4)
+
+    def clear_preview(self):
+        if not self._preview_text and self._preview.isHidden():
+            return
+        self._preview_text = ""
+        self._preview.clear()
+        self._preview.hide()
+        self._resize_anchored(self.COMPACT_W, self.COMPACT_H)
+
+    def _resize_anchored(self, w, h):
+        """Resize keeping the bottom-right corner where it is, clamped on-screen."""
+        if self.width() == w and self.height() == h:
+            return
+        geo = self.frameGeometry()
+        right, bottom = geo.right(), geo.bottom()
+        self.setFixedSize(w, h)
+        x, y = right - w + 1, bottom - h + 1
+        screen = QApplication.screenAt(geo.center()) or QApplication.primaryScreen()
+        if screen is not None:
+            avail = screen.availableGeometry()
+            x = max(avail.left(), min(x, avail.right() - w + 1))
+            y = max(avail.top(), min(y, avail.bottom() - h + 1))
+        self.move(x, y)
 
     def _position_bottom_right(self):
         if self._positioned:
@@ -298,6 +395,7 @@ class RecordingIndicator(QWidget):
         QTimer.singleShot(1500, self.show_idle)
 
     def show_error(self, text="Paste failed — text in panel"):
+        self.clear_preview()
         self._apply("#fab387", "#fab387", text, "#fab387")
         QTimer.singleShot(2500, self.show_idle)
 
@@ -308,6 +406,7 @@ class RecordingIndicator(QWidget):
         self.raise_()
 
     def _set_idle(self):
+        self.clear_preview()
         self.setStyleSheet("background-color: #1e1e2e; border: 1px solid #45475a; border-radius: 8px;")
         self._dot.setStyleSheet("background-color: #585b70; border-radius: 7px; border: none;")
         self._label.setText("Ready — click to dictate")

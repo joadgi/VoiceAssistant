@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 
 from . import applog, metrics, winapi
 from .chord_hotkey import ChordHotkey
+from .live_preview import LivePreview
 from .config import (
     Config, DEFAULTS, MODIFIER_KEYS, normalize_hotkey, should_suppress_hotkey,
     validate_hotkey,
@@ -87,6 +88,13 @@ class MainWindow(QMainWindow):
         self.indicator = RecordingIndicator()
         self.paster = Paster()
         self._selection_reader = SelectionReader()
+        # Rolling draft of the active recording, shown on the pill. Shares the
+        # transcriber's model + worker; never touches the target window.
+        self.live_preview = LivePreview(
+            self.recorder, self.transcriber,
+            enabled=self.config.get("live_preview", True),
+            light_cleanup=self.config.get("light_cleanup", True),
+        )
 
         # Dictation state.
         # _pending_target_hwnd is only a hand-off between record-START (where
@@ -402,6 +410,11 @@ class MainWindow(QMainWindow):
 
         self.recorder.recording_started.connect(self._on_recording_started)
         self.recorder.recording_stopped.connect(self._on_recording_stopped)
+        # The preview begins with the recording; it is ended explicitly at the
+        # top of _on_recording_stopped so queued drafts are cancelled BEFORE
+        # the final decode is submitted behind them.
+        self.recorder.recording_started.connect(self.live_preview.begin)
+        self.live_preview.preview_text.connect(self.indicator.show_preview)
         self.recorder.level_update.connect(self._on_level_update)
         self.recorder.max_duration_reached.connect(self._on_max_duration)
         self.recorder.error.connect(self._on_mic_error)
@@ -755,6 +768,10 @@ class MainWindow(QMainWindow):
 
     @Slot(np.ndarray)
     def _on_recording_stopped(self, audio):
+        # Cancel queued preview drafts FIRST so the final decode below never
+        # waits behind them; keep the numbers for this dictation's metrics.
+        preview_stats = self.live_preview.stats()
+        self.live_preview.end()
         duration = len(audio) / float(self.recorder.sample_rate) if len(audio) else 0
         max_amp = float(np.max(np.abs(audio))) if len(audio) else 0
         applog.dbg(f"_on_recording_stopped: samples={len(audio)}  duration={duration:.2f}s  peak={max_amp:.4f}")
@@ -786,6 +803,8 @@ class MainWindow(QMainWindow):
             "model": self.transcriber.model_size,
             "device": self.transcriber.device,
         }
+        if preview_stats.get("preview_decodes"):
+            base.update(preview_stats)
         if self._keyup_lost_pending:
             base["keyup_lost"] = True
         self._keyup_lost_pending = False
@@ -1273,6 +1292,9 @@ class MainWindow(QMainWindow):
             self.config.set("start_with_windows", vals["start_with_windows"])
             self.config.set("start_minimized", vals["start_minimized"])
             self.config.set("light_cleanup", vals["light_cleanup"])
+            self.config.set("live_preview", vals["live_preview"])
+            self.live_preview.enabled = vals["live_preview"]
+            self.live_preview.light_cleanup = vals["light_cleanup"]
             self.config.set("debug_logging", vals["debug_logging"])
             applog.set_debug(vals["debug_logging"])
             winapi.set_start_with_windows(vals["start_with_windows"], self._entry_script)
@@ -1429,6 +1451,10 @@ class MainWindow(QMainWindow):
                 timer.stop()
             except Exception:
                 pass
+        try:
+            self.live_preview.shutdown()
+        except Exception:
+            pass
         # Closes the always-on capture stream (and its tick timer).
         try:
             self.recorder.close_stream()

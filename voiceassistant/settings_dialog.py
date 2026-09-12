@@ -92,6 +92,15 @@ class SettingsDialog(QDialog):
         self.cleanup_check = QCheckBox("Light cleanup (fillers, casing, spacing)")
         self.cleanup_check.setChecked(self.config.get("light_cleanup", True))
         tlay.addRow(self.cleanup_check)
+
+        self.preview_check = QCheckBox("Live preview while recording (words appear as you speak)")
+        self.preview_check.setChecked(self.config.get("live_preview", True))
+        tlay.addRow(self.preview_check)
+        tlay.addRow(self._hint(
+            "The preview is a draft shown on the floating pill; the final text is "
+            "still transcribed in full when you release the key. Uses the loaded "
+            "model, so it costs no extra download."
+        ))
         tabs.addTab(trans, "Transcription")
 
         # ---- Tab 2: General (display + startup + diagnostics) ----
@@ -145,5 +154,6 @@ class SettingsDialog(QDialog):
             "start_with_windows": self.startup_check.isChecked(),
             "start_minimized": self.start_minimized_check.isChecked(),
             "light_cleanup": self.cleanup_check.isChecked(),
+            "live_preview": self.preview_check.isChecked(),
             "debug_logging": self.debug_check.isChecked(),
         }
