@@ -25,6 +25,8 @@ MAX_BYTES = 512 * 1024  # then roll once to .1 — bounded disk use, no growth
 # Outcomes, worst-to-best. Anything not "pasted" is a dictation the user had to
 # think about, which is the number that matters.
 OUTCOME_PASTED = "pasted"
+OUTCOME_INLINE_TYPED = "inline_typed"   # typed live and corrected in place
+OUTCOME_INLINE_PARTIAL = "inline_partial"  # draft left behind, text on clipboard
 OUTCOME_PANEL = "panel"           # no paste target (recorded into the window)
 OUTCOME_PASTE_FAILED = "paste_failed"
 OUTCOME_NO_SPEECH = "no_speech"
@@ -34,7 +36,7 @@ OUTCOME_DROPPED_QUIET = "dropped_quiet"
 OUTCOME_MIC_ERROR = "mic_error"
 
 _BAD = (OUTCOME_PASTE_FAILED, OUTCOME_NO_SPEECH, OUTCOME_DROPPED_SHORT,
-        OUTCOME_DROPPED_QUIET, OUTCOME_MIC_ERROR)
+        OUTCOME_DROPPED_QUIET, OUTCOME_MIC_ERROR, OUTCOME_INLINE_PARTIAL)
 
 
 def _roll_if_needed():
@@ -166,6 +168,12 @@ def format_report(rows):
     if s["counts"].get(OUTCOME_DROPPED_QUIET):
         out.append("\n  Dropped-quiet clips mean the mic level is too low - check the")
         out.append("  Yeti's gain knob and that the right device is set in Settings.")
+    if s["counts"].get(OUTCOME_INLINE_PARTIAL):
+        out.append("")
+        out.append("  Inline-typed drafts that could not be corrected leave the draft in")
+        out.append("  place with the accurate text on the clipboard. Repeated cases mean")
+        out.append("  the target app fights injected keystrokes - turn inline typing off")
+        out.append("  for that app, or off entirely in Settings.")
     if s["counts"].get(OUTCOME_PASTE_FAILED):
         out.append("\n  Paste failures leave the text on the clipboard; usually a window")
         out.append("  that refused focus (elevated/admin apps do this).")

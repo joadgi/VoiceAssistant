@@ -72,6 +72,11 @@ DEFAULTS = {
     # Show a rolling draft of the recording on the pill while the key is held
     # (see live_preview.py). Uses the loaded Whisper model; no extra download.
     "live_preview": True,
+    # Type that draft into the window you are dictating into, correcting it in
+    # place when the final transcription arrives (see inline_typist.py). OFF by
+    # default: it injects characters into whatever has focus, so it is opt-in
+    # and refuses to run unless the dictate hotkey is a plain key.
+    "inline_typing": False,
     "debug_logging": False,
 }
 

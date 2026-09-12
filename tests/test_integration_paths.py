@@ -302,6 +302,7 @@ class TestSettingsApply:
             "start_minimized": False,
             "light_cleanup": False,
             "live_preview": False,           # changed -> live_preview.enabled
+            "inline_typing": False,
             "debug_logging": True,           # changed -> applog.set_debug
             # hotkeys are not edited in this dialog; pass current values through
             "hotkey_record": mw.config["hotkey_record"],
@@ -344,6 +345,7 @@ class TestSettingsApply:
         assert mw.config["start_minimized"] is False
         assert mw.config["light_cleanup"] is False
         assert mw.config["live_preview"] is False
+        assert mw.config["inline_typing"] is False
         assert mw.live_preview.enabled is False
         assert mw.live_preview.light_cleanup is False
         assert mw.config["debug_logging"] is True

@@ -40,7 +40,7 @@ Thumbs.db
 .DS_Store
 desktop.ini
 crash.log
-settings.json.corrupt.bak
+settings.json.*.bak
 
 # local dictation metrics (privacy-safe, never uploaded)
 metrics.jsonl

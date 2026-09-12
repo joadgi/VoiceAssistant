@@ -12,8 +12,34 @@ import time
 import pyperclip
 
 from . import applog, winapi
+from .inline_typist import (
+    MAX_FINAL_BACKSPACES, MAX_STREAM_BACKSPACES, plan_edit,
+)
 from .text import sanitize_for_paste
 from .workers import SerialWorker
+
+# Inline-typing outcomes reported back to the window.
+INLINE_TYPED = "typed"        # the window holds the final text; nothing to paste
+INLINE_PARTIAL = "partial"    # text was typed but could not be reconciled
+INLINE_NONE = "none"          # nothing was typed; use the normal paste path
+
+
+class _TypedState:
+    """What inline typing believes it has put in the target window.
+
+    WORKER-CONFINED, exactly like `_pending_snapshot`: it is read and written
+    only by jobs on the one paste worker, so it is always consistent with the
+    injection it describes. Computing it on the GUI thread would race with
+    in-flight typing and produce backspace counts for text that had already
+    changed — the failure mode that deletes the user's own words.
+    """
+
+    def __init__(self, hwnd, session):
+        self.hwnd = hwnd
+        self.session = session
+        self.text = ""        # characters this app has typed into `hwnd`
+        self.certain = True   # False once a batch was accepted only in part
+        self.broken = False   # True once typing stopped for this dictation
 
 
 class Paster:
@@ -22,6 +48,8 @@ class Paster:
         # Original user clipboard awaiting restore. Worker-confined: only
         # paste jobs (serialized on the one worker) read/write it.
         self._pending_snapshot = None
+        # Inline typing state for the dictation in progress (worker-confined).
+        self._typed = None
 
     def submit(self, hwnd, text, done_cb):
         """Queue a paste. done_cb(success: bool, text: str) is called from the
@@ -31,6 +59,158 @@ class Paster:
 
     def shutdown(self):
         self._worker.shutdown()
+
+    # ------------------------------------------------------------------ #
+    # Inline typing (see inline_typist.py for the contract)
+    # ------------------------------------------------------------------ #
+    def begin_inline(self, hwnd, session):
+        """Start a fresh inline-typing session for `hwnd`.
+
+        `session` is a monotonic id from the window. Every later call carries
+        it, so a job queued by one dictation can never act on the state of the
+        next — back-to-back dictations usually share an HWND, which makes the
+        window handle alone useless as an identity.
+        """
+        self._worker.submit(self._begin_inline_job, hwnd, session)
+
+    def type_to(self, hwnd, session, desired):
+        """Make the window hold `desired`, typing or correcting the difference."""
+        self._worker.submit(self._type_to_job, hwnd, session, desired)
+
+    def finalize_inline(self, hwnd, session, final_text, done_cb):
+        """Reconcile what was typed with the final transcription.
+
+        done_cb(outcome, text) runs on the worker thread — pass a signal's
+        emit. Outcome is INLINE_TYPED / INLINE_PARTIAL / INLINE_NONE; the
+        window falls back to a normal paste on INLINE_NONE.
+        """
+        self._worker.submit(self._finalize_inline_job, hwnd, session,
+                            final_text, done_cb)
+
+    def cancel_inline(self, session=None, erase=False):
+        """End the session. With `erase`, remove the draft this app typed.
+
+        Erasing is what keeps a dropped or suppressed clip from leaving an
+        orphaned draft in the user's document: the app typed those characters,
+        so the app takes them back. It only ever runs against a certain record.
+        """
+        self._worker.submit(self._cancel_inline_job, session, erase)
+
+    def _begin_inline_job(self, hwnd, session):
+        self._typed = _TypedState(hwnd, session)
+
+    def _cancel_inline_job(self, session=None, erase=False):
+        state = self._typed
+        if state is None:
+            return
+        if session is not None and state.session != session:
+            return
+        if erase and not state.certain:
+            # Something may be in the window that never reached the record, so
+            # there is no count we are allowed to delete. Say so: an orphaned
+            # draft with no explanation is worse than one with a log line.
+            applog.info("inline draft left in place: injection count was unknown")
+        elif erase and state.text and not state.broken:
+            plan = plan_edit(state.text, "", MAX_FINAL_BACKSPACES)
+            if plan is not None:
+                self._apply_plan(state, plan)
+        self._typed = None
+
+    def _type_to_job(self, hwnd, session, desired):
+        state = self._typed
+        # A job queued for a dictation that has since ended or moved on must
+        # never touch the window.
+        if state is None or state.hwnd != hwnd or state.session != session:
+            return
+        if state.broken or not state.certain:
+            return
+        plan = plan_edit(state.text, desired, MAX_STREAM_BACKSPACES)
+        if plan is None:
+            # The draft revised more than a correction should chase mid-flight.
+            # Stop typing and let the final reconciliation do it properly.
+            applog.info("inline typing paused: draft revision exceeded the correction limit")
+            state.broken = True
+            return
+        self._apply_plan(state, plan)
+
+    def _apply_plan(self, state, plan):
+        """Run (backspaces, to_type) against the window, keeping the record exact.
+
+        The lock spans BOTH halves so a correction is never split by another
+        clipboard/input transaction — a delete that lands without its
+        replacement is a hole in the user's sentence.
+        """
+        backspaces, to_type = plan
+        with winapi.clipboard_input_lock:
+            if backspaces:
+                ok, sent = winapi.send_backspaces(backspaces, expected_hwnd=state.hwnd)
+                if sent is None:
+                    state.certain = False
+                    state.broken = True
+                    return False
+                if sent:
+                    state.text = state.text[:len(state.text) - sent]
+                if not ok:
+                    state.broken = True
+                    return False
+            if to_type:
+                ok, sent = winapi.send_text(to_type, expected_hwnd=state.hwnd)
+                if sent is None:
+                    state.certain = False
+                    state.broken = True
+                    return False
+                if sent:
+                    state.text += to_type[:sent]
+                if not ok:
+                    state.broken = True
+                    return False
+        return True
+
+    def _finalize_inline_job(self, hwnd, session, final_text, done_cb):
+        state = self._typed
+        self._typed = None
+        try:
+            if state is None or state.hwnd != hwnd or state.session != session:
+                # Not our session: the normal paste path is both correct and
+                # better tested, so use it.
+                outcome = INLINE_NONE
+            elif not state.certain:
+                # ORDER MATTERS: this is checked BEFORE "did we type anything",
+                # because a partially-accepted batch can put characters in the
+                # window that never reached the record. Reading the empty
+                # record first would report "nothing typed" and the app would
+                # paste a second copy underneath the orphaned characters.
+                applog.info("inline typing could not be reconciled: injection was partial")
+                outcome = INLINE_PARTIAL
+            elif not state.text:
+                # Nothing of ours is in the window, and we know that for sure.
+                outcome = INLINE_NONE
+            else:
+                plan = plan_edit(state.text, sanitize_for_paste(final_text),
+                                 MAX_FINAL_BACKSPACES)
+                if plan is None:
+                    applog.info(
+                        "inline typing could not be reconciled: the final text "
+                        "differs by more than the correction limit")
+                    outcome = INLINE_PARTIAL
+                elif self._apply_plan(state, plan):
+                    outcome = INLINE_TYPED
+                else:
+                    outcome = INLINE_PARTIAL
+            if outcome == INLINE_PARTIAL:
+                # The user's window holds a draft we cannot finish correcting.
+                # Put the accurate text where they can place it themselves.
+                try:
+                    pyperclip.copy(sanitize_for_paste(final_text))
+                except Exception:
+                    applog.exception("clipboard write failed after partial inline typing")
+        except Exception:
+            applog.exception("inline finalize failed")
+            outcome = INLINE_PARTIAL
+        try:
+            done_cb(outcome, final_text)
+        except Exception:
+            applog.exception("inline finalize done_cb failed")
 
     # ------------------------------------------------------------------ #
     def _job(self, hwnd, text, done_cb):

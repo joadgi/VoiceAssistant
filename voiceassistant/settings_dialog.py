@@ -101,6 +101,16 @@ class SettingsDialog(QDialog):
             "still transcribed in full when you release the key. Uses the loaded "
             "model, so it costs no extra download."
         ))
+        self.inline_check = QCheckBox("Type the preview into the window as I speak")
+        self.inline_check.setChecked(self.config.get("inline_typing", False))
+        tlay.addRow(self.inline_check)
+        tlay.addRow(self._hint(
+            "Words land in the text box while you talk and are corrected in place "
+            "when the accurate transcription arrives. Requires the live preview, and "
+            "requires the dictate hotkey to be a PLAIN key (Caps Lock, Scroll Lock, "
+            "F9) — with a modifier combo the typed characters would arrive as "
+            "shortcuts. It never types into a terminal."
+        ))
         tabs.addTab(trans, "Transcription")
 
         # ---- Tab 2: General (display + startup + diagnostics) ----
@@ -155,5 +165,6 @@ class SettingsDialog(QDialog):
             "start_minimized": self.start_minimized_check.isChecked(),
             "light_cleanup": self.cleanup_check.isChecked(),
             "live_preview": self.preview_check.isChecked(),
+            "inline_typing": self.inline_check.isChecked(),
             "debug_logging": self.debug_check.isChecked(),
         }

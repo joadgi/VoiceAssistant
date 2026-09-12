@@ -22,7 +22,11 @@ import time
 import numpy as np
 import pytest
 
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+# The preview tests need no window, so they run offscreen. The inline-typing
+# chain test needs a REAL window it can focus and type into, and an offscreen
+# widget has no foreground to take — it would skip itself every time.
+if os.environ.get("RUN_INLINE") != "1":
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 pytest.importorskip("PySide6")
@@ -179,6 +183,113 @@ def test_draft_matches_what_the_final_pass_will_paste(transcriber):
     print(f"\n  final : {final}\n  draft : {last}\n  recall: {recall:.1%}")
     assert recall >= MIN_RECALL, (
         f"only {recall:.0%} of the final words appeared in the draft")
+
+
+@pytest.mark.skipif(os.environ.get("RUN_INLINE") != "1",
+                    reason="also set RUN_INLINE=1 (injects real keystrokes)")
+def test_the_whole_chain_types_the_speech_into_a_real_window(transcriber, qapp):
+    """Speech in, words in a real text box, corrected to the final transcription.
+
+    This is the feature as the user experiences it, with every seam real: the
+    model, the preview controller, the stabilizer, the paste worker, Win32
+    injection, and the final reconciliation. It also counts the corrections,
+    which is the number that says whether inline typing is pleasant or twitchy.
+    """
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QTextEdit
+
+    from voiceassistant import winapi
+    from voiceassistant.inline_typist import stream_target
+    from voiceassistant.paste import INLINE_TYPED, Paster
+    from voiceassistant.text import clean_transcript
+
+    edit = QTextEdit()
+    edit.setWindowTitle("inline dictation live gate")
+    edit.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+    edit.resize(700, 220)
+    edit.show()
+    edit.raise_()
+    edit.activateWindow()
+    hwnd = int(edit.winId())
+    winapi.set_foreground_window(hwnd)
+    deadline = time.perf_counter() + 1.0
+    while time.perf_counter() < deadline:
+        QCoreApplication.processEvents()
+        time.sleep(0.01)
+    if winapi.get_foreground_window() != hwnd:
+        edit.close()
+        pytest.skip("could not take the foreground — refusing to type blind")
+
+    existing = "EXISTING USER TEXT. "
+    edit.setPlainText(existing)
+    cursor = edit.textCursor()
+    cursor.movePosition(cursor.MoveOperation.End)
+    edit.setTextCursor(cursor)
+
+    audio = _load("long_paragraph_trailing_silence.wav")
+    rec = _FeedRecorder(audio)
+    ctl = LivePreview(rec, transcriber, enabled=True, light_cleanup=True)
+    paster = Paster()
+    backspaces = []
+    real_backspace = winapi.send_backspaces
+
+    def counting_backspace(count, expected_hwnd=None):
+        backspaces.append(count)
+        return real_backspace(count, expected_hwnd=expected_hwnd)
+
+    first_typed = []
+    try:
+        import unittest.mock as mock
+        with mock.patch.object(winapi, "send_backspaces", counting_backspace):
+            paster._begin_inline_job(hwnd, 1)
+            ctl.preview_text.connect(
+                lambda s, t: (paster.type_to(hwnd, 1, stream_target(s)),
+                              first_typed or first_typed.append(
+                                  time.perf_counter() - rec.t0)))
+            ctl.begin()
+            end_at = rec.t0 + len(audio) / SR + 1.0
+            while time.perf_counter() < end_at:
+                QCoreApplication.processEvents()
+                time.sleep(0.01)
+            ctl.end()
+            rec.is_recording = False
+            # Let the queued type jobs finish, as a real release would.
+            for _ in range(200):
+                QCoreApplication.processEvents()
+                time.sleep(0.01)
+            streamed = edit.toPlainText()
+
+            final = clean_transcript(transcriber._run_transcribe(audio, use_vad=True),
+                                     light=True)
+            done = []
+            paster.finalize_inline(hwnd, 1, final,
+                                   lambda outcome, text: done.append(outcome))
+            for _ in range(300):
+                QCoreApplication.processEvents()
+                time.sleep(0.01)
+                if done:
+                    break
+            result = edit.toPlainText()
+    finally:
+        paster.shutdown()
+        ctl.shutdown()
+        edit.close()
+
+    print(f"\n  first word in the box at {first_typed[0]:.2f}s"
+          if first_typed else "\n  nothing was typed")
+    print(f"  while speaking : {streamed!r}")
+    print(f"  final          : {result!r}")
+    print(f"  corrections    : {len(backspaces)} ({sum(backspaces)} characters)")
+
+    assert first_typed, "no words reached the window while speaking"
+    assert first_typed[0] < 3.0, f"first word took {first_typed[0]:.2f}s"
+    assert streamed.startswith(existing), "the user's own text was disturbed"
+    assert len(streamed) > len(existing) + 20, "barely anything was typed"
+    assert done == [INLINE_TYPED], f"reconciliation did not complete: {done}"
+    assert result == existing + final, "the window does not hold the final text"
+    assert sum(backspaces) < len(final), (
+        "more characters were deleted than the whole utterance — that reads as "
+        "flickering, not correcting")
 
 
 def test_final_decode_is_not_stuck_behind_drafts(transcriber):

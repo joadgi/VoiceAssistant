@@ -32,9 +32,11 @@ user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.c_void_p]
 
 VK_CONTROL = 0x11
 VK_ESCAPE = 0x1B
+VK_BACK = 0x08
 VK_C = 0x43
 VK_V = 0x56
 KEYEVENTF_KEYUP = 0x0002
+KEYEVENTF_UNICODE = 0x0004
 
 
 # ---------------------------------------------------------------------------
@@ -298,6 +300,133 @@ def send_ctrl_v():
 
 def send_ctrl_c():
     return _send_ctrl_shortcut(VK_C)
+
+
+# ---------------------------------------------------------------------------
+# Direct text injection (inline typing — see inline_typist.py)
+# ---------------------------------------------------------------------------
+# Characters per SendInput batch. Each character is a down/up pair, so this is
+# 2x events. Bounded so one rejected batch cannot leave a long half-typed run.
+_TYPE_CHUNK = 96
+# Backspaces per batch, same reasoning.
+_BACKSPACE_CHUNK = 32
+
+
+def _unicode_batch(text):
+    """Send `text` as KEYEVENTF_UNICODE events. Returns events accepted.
+
+    Unicode injection carries the CHARACTER, not a key, so it is immune to the
+    user's keyboard layout and — critically — needs no modifier held. That is
+    why inline typing uses this and not synthesized key presses: a synthesized
+    Shift+key would be a modifier the app holds down in the user's session,
+    which this app does not do.
+    """
+    events = []
+    for ch in text:
+        code = ord(ch)
+        if code > 0xFFFF:  # non-BMP: two surrogate events, each its own pair
+            code -= 0x10000
+            units = (0xD800 + (code >> 10), 0xDC00 + (code & 0x3FF))
+        else:
+            units = (code,)
+        for unit in units:
+            events.append((unit, False))
+            events.append((unit, True))
+    if not events:
+        return 0
+    inputs = (_INPUT * len(events))()
+    for index, (unit, up) in enumerate(events):
+        inputs[index].type = 1  # INPUT_KEYBOARD
+        inputs[index].ki = _KEYBDINPUT(
+            0, unit, KEYEVENTF_UNICODE | (KEYEVENTF_KEYUP if up else 0),
+            0, 0x56414B42)
+    return int(user32.SendInput(len(inputs), inputs, ctypes.sizeof(_INPUT))), len(events)
+
+
+def _guarded(expected_hwnd):
+    """Shared precondition for every injected batch, checked inside the lock.
+
+    Both halves matter. Foreground: text typed into the wrong window is the
+    failure this whole feature has to make impossible, and focus can change
+    between the caller's check and the batch. Modifiers: a character sent
+    while the user holds Ctrl reaches the app as a SHORTCUT, not text.
+    """
+    if expected_hwnd and get_foreground_window() != expected_hwnd:
+        applog.info("text injection skipped: focus left the dictation target")
+        return False
+    if modifiers_down():
+        applog.info("text injection skipped: a modifier is held")
+        return False
+    return True
+
+
+def send_text(text, expected_hwnd=None):
+    """Type `text` into the focused window as characters.
+
+    Returns `(ok, sent)`. `sent` is how many characters definitely reached the
+    window — `None` means UNKNOWN, and an unknown count is the one state the
+    caller must never issue a correcting backspace against, because
+    backspacing past our own text deletes the user's.
+
+    A refusal (wrong window, modifier held) stops before any event, so it
+    reports `(False, 0)`: nothing changed and the accounting still holds. Only
+    a batch that Windows accepted in part is unknown.
+    """
+    if not text:
+        return True, 0
+    with clipboard_input_lock:
+        if not _guarded(expected_hwnd):
+            return False, 0
+        for start in range(0, len(text), _TYPE_CHUNK):
+            chunk = text[start:start + _TYPE_CHUNK]
+            try:
+                inserted, expected = _unicode_batch(chunk)
+            except Exception:
+                applog.exception("text injection failed")
+                return False, None
+            if inserted != expected:
+                applog.error(
+                    f"text injection incomplete: {inserted}/{expected} events "
+                    f"after {start} chars")
+                return False, None
+            done = start + len(chunk)
+            if done < len(text) and not _guarded(expected_hwnd):
+                return False, done  # focus moved between batches: exact count
+        return True, len(text)
+
+
+def send_backspaces(count, expected_hwnd=None):
+    """Send `count` backspaces to the focused window.
+
+    Returns `(ok, sent)` with the same contract as `send_text`: `sent` is
+    None only when a batch was partially accepted. The caller owns the
+    accounting — this deletes exactly what it is told to.
+    """
+    if count <= 0:
+        return True, 0
+    with clipboard_input_lock:
+        if not _guarded(expected_hwnd):
+            return False, 0
+        sent = 0
+        while sent < count:
+            n = min(_BACKSPACE_CHUNK, count - sent)
+            events = []
+            for _ in range(n):
+                events.append((VK_BACK, False))
+                events.append((VK_BACK, True))
+            try:
+                inserted = _input_batch(events)
+            except Exception:
+                applog.exception("backspace injection failed")
+                return False, None
+            if inserted != len(events):
+                applog.error(
+                    f"backspace injection incomplete: {inserted}/{len(events)} events")
+                return False, None
+            sent += n
+            if sent < count and not _guarded(expected_hwnd):
+                return False, sent
+        return True, sent
 
 
 def send_escape():

@@ -45,16 +45,17 @@ run.bat/shortcuts/startup-registry compatibility.
 | `voiceassistant/window.py` | `MainWindow` — all orchestration and signal wiring. Renders state + dispatches jobs; never blocks. |
 | `voiceassistant/widgets.py` | `RecordingIndicator` pill (compact state pill that expands into the live-preview caption card) + the single `HotkeyCaptureWidget`. |
 | `voiceassistant/live_preview.py` | `LivePreview` — rolling draft of the active recording shown on the pill while the key is held. GUI-thread tick owns the policy (when to decode, commit, stop); pure `PreviewStabilizer` + `choose_commit` helpers. Shares the transcriber's model and worker; never touches the target window. |
+| `voiceassistant/inline_typist.py` | The inline-typing SAFETY CONTRACT (in-file), plus the pure arithmetic (`plan_edit`) and policy (`block_reason`) that decide what may be deleted and whether typing may run at all. No Windows calls, no threads. |
 | `voiceassistant/settings_dialog.py` / `theme.py` | Settings UI, dark stylesheet. |
 | `voiceassistant/recorder.py` | `VoiceRecorder` — **always-open** mic stream + pre-roll ring buffer; GUI-thread tick owns metering/duration-cap/mic-health. |
 | `voiceassistant/transcriber.py` | `Transcriber` + `TranscriptionResult` (faster-whisper, both-pass guards, job-bound context) + `PreviewResult`/`_preview_job` (the greedy live-preview decode on the same worker, generation-cancellable). |
 | `voiceassistant/tts.py` | `TTSEngine` — local Kokoro blocks or one online edge-tts generator → one VLC stream, per-utterance generations, explicit pyttsx3 option, bounded waits. Carries the STOP CONTRACT and VOICE CONTRACT (in-file). |
 | `voiceassistant/ocr.py` | `ScreenCapture` (mss) + `OCREngine` (Windows-native OCR default, EasyOCR fallback) + `RegionSelector`. |
 | `voiceassistant/chord_hotkey.py` | `ChordHotkey` — the global chord matcher shared by read-aloud AND OCR; modifiers always pass through, only matched non-modifier down/up pairs can be consumed, cached key state reconciled against Windows. The app contains no `keyboard.add_hotkey`. |
-| `voiceassistant/paste.py` | `Paster` — the paste worker: clipboard snapshot/restore + Win32 Ctrl+V, off the GUI thread. |
+| `voiceassistant/paste.py` | `Paster` — the paste worker: clipboard snapshot/restore + Win32 Ctrl+V, off the GUI thread. Also owns the inline-typing state machine (`_TypedState`, worker-confined) and its finalize/cancel outcomes. |
 | `voiceassistant/selection.py` | `SelectionReader` — read-aloud's 3-tier selection grab (UIA → Ctrl+C sentinel → tell caller to OCR), off the GUI thread (mirrors `Paster`). |
 | `voiceassistant/uia.py` | UI Automation selection reader — highlighted text with **no clipboard, no keystrokes, no focus switch**. |
-| `voiceassistant/winapi.py` | ALL Win32/ctypes calls (foreground window, keystrokes, single-instance, startup registry). |
+| `voiceassistant/winapi.py` | ALL Win32/ctypes calls (foreground window, keystrokes, single-instance, startup registry) + the `send_text`/`send_backspaces` injection pair used by inline typing, which report EXACT delivered counts. |
 | `voiceassistant/text.py` | Pure text logic: repeat collapse, cleanup chain, hallucination denylist, paste sanitizing. 100% unit-tested. |
 | `voiceassistant/config.py` | `Config` (ATOMIC saves, corrupt-file backup) + `DEFAULTS` + hotkey validation. |
 | `voiceassistant/workers.py` | `SerialWorker` — **the threading law**: every subsystem owns exactly one worker+queue; no ad-hoc `threading.Thread` anywhere. |
@@ -419,9 +420,40 @@ selection never changes into SAPI; `pyttsx3` runs only when explicitly selected.
   result), and `end()` cancels queued drafts BEFORE the final job is submitted,
   so the paste path waits behind at most one in-flight draft. A draft failure
   (OOM, driver hiccup) disables the preview for that recording only and logs a
-  count — never text. Stage 2 (typing the draft into the target) is deliberately
-  NOT built: it needs backspaces into an arbitrary focused window, the bug class
-  the September keyboard work removed.
+  count — never text. Stage 2 (typing the draft into the
+  target window) is built on top of this, opt-in — see the inline-typing entries
+  below for the rules that make it survivable.
+- **Inline typing only ever deletes ITS OWN characters, and stops the moment it
+  cannot prove which those are** (`inline_typist.py` SAFETY CONTRACT,
+  `paste.py` `_TypedState`). This is the feature that types into the user's
+  document, so the accounting is the whole design. `winapi.send_text` /
+  `send_backspaces` report an EXACT delivered count, and a batch Windows
+  accepted only in part reports `None` = UNKNOWN. An unknown count disables
+  corrections permanently for that dictation — backspacing past our own text
+  deletes the user's work, which is worse than any draft left on screen. A
+  clean refusal (focus moved, modifier held) sends nothing and keeps the record
+  exact, so it does NOT poison the session. The record is confined to the paste
+  worker for the same reason `_pending_snapshot` is: computing it on the GUI
+  thread races with in-flight typing and produces backspace counts for text
+  that already changed. Found by its own test: the finalize path checked "did
+  we type anything" BEFORE "is the record certain", so a partial batch that
+  never reached the record reported "nothing typed" and the app pasted a second
+  copy underneath the orphaned characters. Order those checks the other way.
+- **Inline typing is refused outright for a modifier-holding hotkey, a console,
+  or our own window** (`block_reason`, decided ONCE at record start). With
+  `ctrl+shift+r` held, Ctrl is physically down for the whole utterance, so every
+  injected character arrives as a SHORTCUT — the binding must be a plain key.
+  The console rule is the same boundary read-aloud already observes for Ctrl+C.
+- **Only the STABLE half of a draft is typed.** Typing a word that is still
+  being revised means deleting it again a moment later, which reads as
+  flickering in the user's document. Measured on the live chain test: typing
+  only settled words produced **zero** corrections on a full paragraph, because
+  the revisions happened on the pill before the words ever reached the box.
+- **A dropped, silent or hallucinated clip takes its own draft back.** The gates
+  that drop a clip run AFTER drafts may already have been typed (a 0.3 s hold
+  still has 0.6 s of audio with the pre-roll), so each of those paths calls
+  `cancel_inline(erase=True)`. Without it the app leaves text in a document for
+  speech it then decided was noise.
 - **Floating pill doesn't steal focus** (`WA_ShowWithoutActivating` +
   `WindowDoesNotAcceptFocus`), so clicking it to start/stop dictation leaves the target
   window focused for paste.
@@ -436,6 +468,13 @@ selection never changes into SAPI; `pyttsx3` runs only when explicitly selected.
 
 ## Constraints & gotchas
 
+- **Inline typing needs a plain-key dictate hotkey.** `caps lock` / `scroll lock` /
+  `f9` qualify; any combo containing ctrl/alt/shift/win does not, because that
+  modifier is held for the whole utterance and every injected character would
+  arrive as a shortcut. The app refuses and logs the reason rather than typing
+  garbage. Apps with aggressive autocomplete (browser address bars, some IDEs)
+  can also fight injected characters — that shows up as `inline_partial` in
+  `--report`.
 - **The `Fn` key cannot be bound** — it's handled in keyboard firmware and never reaches
   Windows, so no software can capture it. Recommend an F-key (F9) instead.
 - Avoid **Windows-key** hotkeys (OS intercepts them) and common browser combos (`Ctrl+T/W/R`).
@@ -536,6 +575,15 @@ All are editable inline — click a hotkey pill and press your combo (single key
 - **Before ANY behavior change:** run `pytest tests -q` (fast suites) and, for anything
   touching the dictation pipeline, `RUN_CORPUS=1 pytest tests/test_corpus_gate.py`
   (the golden-audio gate — the objective definition of "dictation still works").
+  For anything touching INLINE TYPING, also run
+  `RUN_INLINE=1 pytest tests/integration/test_inline_typing_live.py -s` and
+  `RUN_PREVIEW=1 RUN_INLINE=1 pytest tests/integration/test_live_preview_live.py -s -k whole_chain`
+  — real SendInput into a real focused window, including the test that proves an
+  erase stops at our own text. **Run those two files ONE AT A TIME and from an
+  interactive session**: Windows grants foreground rights to the process that
+  received the last user input, so a second file in the same run (or a headless
+  agent run) cannot focus its window. They SKIP rather than type blind, which is
+  deliberate — a green run that skipped proves nothing, so read the summary.
   For anything touching read-aloud, also run
   `RUN_TTS_EVAL=1 pytest tests/test_tts_eval.py tests/integration/test_tts_stress_live.py -v -s`;
   it is the objective word-fidelity, speed, voice, VLC, Stop, and replacement gate.
@@ -556,6 +604,11 @@ All are editable inline — click a hotkey pill and press your combo (single key
   threads). **Read-aloud watchpoints:** no blocking speak-until-finished call on
   ANY TTS backend, the VLC warm-up's stop check, the neural voice id never
   reaching SAPI, and truncate-don't-re-read on a mid-utterance failure.
+  **Inline-typing watchpoints:** the exact/unknown distinction in
+  `send_text`/`send_backspaces` (a refusal is 0, only a partial batch is None),
+  the certainty check ordered BEFORE the empty-record check in finalize, the
+  worker-confined `_TypedState`, the session id on every job, the erase-on-drop
+  paths, and `block_reason`'s modifier/console/own-window refusals.
   **Keyboard watchpoints:** modifiers are never suppressed or replayed; only a
   matched non-modifier down/up PAIR may be consumed; hook callbacks must return
   falsy to suppress (a Qt `Signal.emit()` returns `True`); `ChordHotkey._reconcile`

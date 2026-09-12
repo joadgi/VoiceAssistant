@@ -22,13 +22,14 @@ from PySide6.QtWidgets import (
 
 from . import applog, metrics, winapi
 from .chord_hotkey import ChordHotkey
+from .inline_typist import block_reason, stream_target
 from .live_preview import LivePreview
 from .config import (
     Config, DEFAULTS, MODIFIER_KEYS, normalize_hotkey, should_suppress_hotkey,
     validate_hotkey,
 )
 from .ocr import OCREngine, RegionSelector, ScreenCapture
-from .paste import Paster
+from .paste import INLINE_NONE, INLINE_PARTIAL, INLINE_TYPED, Paster
 from .recorder import VoiceRecorder
 from .selection import (
     SRC_CONSOLE_BLOCKED, SRC_EMPTY, SRC_REFOCUS_FAILED, SRC_INPUT_BUSY, SelectionReader,
@@ -49,6 +50,7 @@ class MainWindow(QMainWindow):
     # Worker → GUI marshalling
     _sig_read_text_ready = Signal(int, str, str)  # (request generation, text, source tier)
     _sig_paste_done = Signal(bool, str)
+    _sig_inline_done = Signal(str, str)  # (outcome, final text)
     _sig_crash_notice = Signal(str)
 
     def __init__(self, entry_script):
@@ -113,6 +115,14 @@ class MainWindow(QMainWindow):
         # slip past and we could paste into ourselves.
         self._own_hwnds = set()
 
+        # Inline typing (Stage 2): the draft is typed into the target window
+        # while you speak. Sessions are monotonic so a job queued by one
+        # dictation can never act on the next one's state — back-to-back
+        # dictations usually share an HWND.
+        self._inline_session = 0
+        self._inline_target = None      # HWND being typed into, or None
+        self._inline_jobs = {}          # transcription job id -> session
+
         self._build_ui()
         self._connect_signals()
 
@@ -145,6 +155,7 @@ class MainWindow(QMainWindow):
         self._sig_hotkey_read.connect(self._on_read_aloud_toggle)
         self._sig_read_text_ready.connect(self._on_read_text_ready)
         self._sig_paste_done.connect(self._on_paste_done)
+        self._sig_inline_done.connect(self._on_inline_done)
         self._sig_crash_notice.connect(self._on_crash_notice)
         applog.set_notifier(self._sig_crash_notice.emit)
 
@@ -415,6 +426,7 @@ class MainWindow(QMainWindow):
         # the final decode is submitted behind them.
         self.recorder.recording_started.connect(self.live_preview.begin)
         self.live_preview.preview_text.connect(self.indicator.show_preview)
+        self.live_preview.preview_text.connect(self._on_preview_draft)
         self.recorder.level_update.connect(self._on_level_update)
         self.recorder.max_duration_reached.connect(self._on_max_duration)
         self.recorder.error.connect(self._on_mic_error)
@@ -754,9 +766,83 @@ class MainWindow(QMainWindow):
         self._update_status("Recording stopped (reached the maximum length)")
         self.recorder.stop()
 
+    # -----------------------------------------------------------------------
+    # Inline typing (Stage 2) — see inline_typist.py for the safety contract
+    # -----------------------------------------------------------------------
+    def _inline_begin(self):
+        """Open an inline-typing session for this recording, if it is allowed.
+
+        Every disqualifying condition is decided ONCE, here, against the target
+        captured at record time — never mid-utterance, where a surprise is
+        expensive. The reason is logged so "it didn't type" is answerable.
+        """
+        self._inline_target = None
+        hwnd = self._pending_target_hwnd
+        self._own_hwnds.add(int(self.winId()))
+        reason = block_reason(
+            enabled=(self.config.get("inline_typing", False)
+                     and self.config.get("live_preview", True)
+                     and self.config.get("auto_paste", True)
+                     and self._dictation_active),
+            hotkey=self.config.get("hotkey_record", ""),
+            hwnd=hwnd,
+            is_own_window=hwnd in self._own_hwnds,
+            is_console=bool(hwnd) and winapi.is_console_window(hwnd),
+        )
+        if reason:
+            if self.config.get("inline_typing", False):
+                applog.info(f"inline typing not used: {reason}")
+            return
+        self._inline_session += 1
+        self._inline_target = hwnd
+        self.paster.begin_inline(hwnd, self._inline_session)
+        applog.dbg(f"inline typing session {self._inline_session} -> hwnd {hwnd}")
+
+    @Slot(str, str)
+    def _on_preview_draft(self, stable, tail):
+        """A new draft: type the settled half into the target window.
+
+        Only the stable half is typed. The moving tail stays on the pill —
+        typing a word that is still being revised means deleting it again a
+        moment later, which reads as flickering in the user's document.
+        """
+        if self._inline_target is None:
+            return
+        self.paster.type_to(self._inline_target, self._inline_session,
+                            stream_target(stable))
+
+    def _inline_discard(self, erase=True):
+        """End the session, taking back the draft this app typed."""
+        if self._inline_target is None:
+            return
+        self.paster.cancel_inline(self._inline_session, erase=erase)
+        self._inline_target = None
+
+    @Slot(str, str)
+    def _on_inline_done(self, outcome, text):
+        """The final reconciliation finished (or declined)."""
+        m = (self._metrics_awaiting_paste.popleft()
+             if self._metrics_awaiting_paste else {})
+        if outcome == INLINE_TYPED:
+            self.indicator.show_done()
+            self._update_status("Transcribed as you spoke")
+            metrics.record(metrics.OUTCOME_INLINE_TYPED, **m)
+            return
+        # INLINE_PARTIAL: a draft is in the user's document that we could not
+        # finish correcting. Never retype over it — say so, and hand them the
+        # accurate text (the worker already put it on the clipboard).
+        self.indicator.show_error("Draft left in place — final text copied")
+        self._update_status(
+            "Typed draft could not be corrected — the accurate text is on the "
+            "clipboard and in the panel (Ctrl+V to replace it)"
+        )
+        self._append_output(text, prefix="[Voice]")
+        metrics.record(metrics.OUTCOME_INLINE_PARTIAL, **m)
+
     @Slot()
     def _on_recording_started(self):
         applog.dbg("_on_recording_started: showing red pill")
+        self._inline_begin()
         self.btn_record.setText("  RECORDING")
         self.btn_record.setProperty("recording", "true")
         self.btn_record.style().unpolish(self.btn_record)
@@ -818,6 +904,7 @@ class MainWindow(QMainWindow):
             applog.dbg(f"  ignored - hold too short ({hold_duration:.2f}s < {min_seconds}s)")
             self._update_status("Ignored — hotkey tapped, not held. Hold it while you speak.")
             self.indicator.show_error("Too short — hold to talk")
+            self._inline_discard()
             metrics.record(metrics.OUTCOME_DROPPED_SHORT, **base)
             return
         if max_amp < min_peak:
@@ -827,6 +914,7 @@ class MainWindow(QMainWindow):
                 "Check the mic is unmuted and selected in Settings."
             )
             self.indicator.show_error("No sound — check mic")
+            self._inline_discard()
             metrics.record(metrics.OUTCOME_DROPPED_QUIET, **base)
             return
 
@@ -835,12 +923,17 @@ class MainWindow(QMainWindow):
             self.indicator.show_transcribing()
             job_id = self.transcriber.transcribe(audio, context=target_hwnd)
             if job_id is not None:
+                if self._inline_target is not None:
+                    self._inline_jobs[job_id] = self._inline_session
+                    while len(self._inline_jobs) > 16:
+                        self._inline_jobs.pop(min(self._inline_jobs), None)
                 self._metrics_pending[job_id] = base
                 # Bound the map: a job that never delivers must not leak.
                 while len(self._metrics_pending) > 16:
                     self._metrics_pending.pop(min(self._metrics_pending), None)
         else:
             self._update_status("No audio captured")
+            self._inline_discard()
             self.indicator.show_idle()
 
     @Slot(float)
@@ -913,8 +1006,12 @@ class MainWindow(QMainWindow):
         m = self._metrics_pending.pop(result.job_id, {})
         m["transcribe_ms"] = float(getattr(result, "latency_ms", 0.0) or 0.0)
         m["retried"] = bool(result.retried)
+        inline_session = self._inline_jobs.pop(result.job_id, None)
 
         if result.no_speech:
+            # The draft typed something the final pass then judged to be
+            # nothing. Take our own characters back rather than leaving them.
+            self._inline_discard()
             self.indicator.show_idle()
             self._update_status("No speech detected")
             metrics.record(metrics.OUTCOME_NO_SPEECH, **m)
@@ -928,6 +1025,7 @@ class MainWindow(QMainWindow):
         # off the CLEANED text, not just the raw no_speech flag — otherwise a
         # blank "[Voice]" marker gets appended to the panel.
         if not text.strip():
+            self._inline_discard()
             self.indicator.show_idle()
             self._update_status("No speech detected")
             metrics.record(metrics.OUTCOME_NO_SPEECH, **m)
@@ -937,6 +1035,7 @@ class MainWindow(QMainWindow):
         # filters: sub-1.2s clip, VAD found nothing, text is a known artifact.
         if is_probable_hallucination(result, text):
             applog.dbg("  suppressed probable hallucination (retry artifact)")
+            self._inline_discard()
             self.indicator.show_idle()
             self._update_status("Ignored noise (no clear speech)")
             metrics.record(metrics.OUTCOME_HALLUCINATION, **m)
@@ -948,13 +1047,26 @@ class MainWindow(QMainWindow):
 
         if (self._dictation_active and self.config.get("auto_paste", True)
                 and target_hwnd and not is_own_window and text.strip()):
-            # Paste runs on the paste worker — the GUI thread never blocks.
-            self.indicator.show_pasting()
-            self._update_status("Pasting...")
             m["chars"] = len(text)
             self._metrics_awaiting_paste.append(m)
-            self.paster.submit(target_hwnd, text, self._sig_paste_done.emit)
+            if inline_session is not None and self._inline_target == target_hwnd:
+                # The draft is already in the window: correct it to the final
+                # text instead of pasting a second copy underneath it. The
+                # worker owns the accounting, so it decides whether that is
+                # possible and tells us which way it went.
+                self.indicator.show_transcribing()
+                self._update_status("Correcting…")
+                self._inline_target = None
+                self.paster.finalize_inline(target_hwnd, inline_session, text,
+                                            self._sig_inline_done.emit)
+            else:
+                # Paste runs on the paste worker — the GUI thread never blocks.
+                self._inline_discard()
+                self.indicator.show_pasting()
+                self._update_status("Pasting...")
+                self.paster.submit(target_hwnd, text, self._sig_paste_done.emit)
         else:
+            self._inline_discard()
             self.indicator.show_idle()
             self._update_status("Transcription complete")
             self._append_output(text, prefix="[Voice]")
@@ -1293,6 +1405,7 @@ class MainWindow(QMainWindow):
             self.config.set("start_minimized", vals["start_minimized"])
             self.config.set("light_cleanup", vals["light_cleanup"])
             self.config.set("live_preview", vals["live_preview"])
+            self.config.set("inline_typing", vals["inline_typing"])
             self.live_preview.enabled = vals["live_preview"]
             self.live_preview.light_cleanup = vals["light_cleanup"]
             self.config.set("debug_logging", vals["debug_logging"])
