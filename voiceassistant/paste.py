@@ -13,7 +13,7 @@ import pyperclip
 
 from . import applog, winapi
 from .inline_typist import (
-    MAX_FINAL_BACKSPACES, MAX_STREAM_BACKSPACES, plan_edit,
+    MAX_STREAM_BACKSPACES, plan_edit, plan_final_edit,
 )
 from .text import sanitize_for_paste
 from .workers import SerialWorker
@@ -39,7 +39,13 @@ class _TypedState:
         self.session = session
         self.text = ""        # characters this app has typed into `hwnd`
         self.certain = True   # False once a batch was accepted only in part
-        self.broken = False   # True once typing stopped for this dictation
+        # True once INJECTION itself failed for this dictation, which is
+        # permanent. A plan merely refused for being too large is NOT broken:
+        # nothing was sent, so the record is still exact and the next draft
+        # gets a fresh attempt. Conflating the two meant one oversized
+        # revision — which a preview commit reliably produces on a long hold —
+        # silently ended live typing for the rest of the dictation.
+        self.broken = False
 
 
 class Paster:
@@ -132,8 +138,8 @@ class Paster:
             # (that is what `certain` tracks), so those characters are still
             # ours to take back. Skipping them here left a half-sentence in the
             # document with no log line and no message.
-            plan = plan_edit(state.text, "", MAX_FINAL_BACKSPACES)
-            if plan is not None and self._refocus_target(state):
+            plan = plan_final_edit(state.text, "")
+            if self._refocus_target(state):
                 self._apply_plan(state, plan)
         self._typed = None
 
@@ -154,9 +160,15 @@ class Paster:
                       "refused" if plan is None else "back=%d type=%d" % (plan[0], len(plan[1]))))
         if plan is None:
             # The draft revised more than a correction should chase mid-flight.
-            # Stop typing and let the final reconciliation do it properly.
-            applog.info("inline typing paused: draft revision exceeded the correction limit")
-            state.broken = True
+            # Skip THIS DRAFT only: nothing was sent, so the record is still
+            # exact and the next draft is judged fresh against it. Measured
+            # 2026-09-16: a preview commit re-decodes the live window from a
+            # new offset, which shifts words near the seam and produced exactly
+            # one oversized revision — 3 of 4 commits in the log. Latching
+            # `broken` here meant that single tick stopped live typing for the
+            # REST of the hold, so a long dictation went dead partway through
+            # and everything after it arrived only at finalize.
+            applog.dbg("inline type skipped: revision exceeded the streaming limit")
             return
         self._apply_plan(state, plan)
 
@@ -244,14 +256,8 @@ class Paster:
             elif not self._refocus_target(state):
                 outcome = INLINE_PARTIAL
             else:
-                plan = plan_edit(state.text, sanitize_for_paste(final_text),
-                                 MAX_FINAL_BACKSPACES)
-                if plan is None:
-                    applog.info(
-                        "inline typing could not be reconciled: the final text "
-                        "differs by more than the correction limit")
-                    outcome = INLINE_PARTIAL
-                elif self._apply_plan(state, plan):
+                plan = plan_final_edit(state.text, sanitize_for_paste(final_text))
+                if self._apply_plan(state, plan):
                     outcome = INLINE_TYPED
                 else:
                     outcome = INLINE_PARTIAL

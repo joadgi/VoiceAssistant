@@ -33,8 +33,9 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from voiceassistant import paste as paste_mod  # noqa: E402
 from voiceassistant.inline_typist import (  # noqa: E402
-    MAX_FINAL_BACKSPACES, MAX_STREAM_BACKSPACES, block_reason, common_prefix_len,
-    hotkey_holds_modifier, plan_edit, polish_stream_text, stream_target,
+    MAX_STREAM_BACKSPACES, block_reason, common_prefix_len,
+    hotkey_holds_modifier, plan_edit, plan_final_edit, polish_stream_text,
+    stream_target,
 )
 from voiceassistant.paste import (  # noqa: E402
     INLINE_NONE, INLINE_PARTIAL, INLINE_TYPED, Paster,
@@ -81,10 +82,43 @@ class TestPlanEdit:
     def test_erase_everything(self):
         assert plan_edit("Hello", "", 48) == (5, "")
 
-    def test_over_budget_is_refused(self):
+    def test_over_budget_is_refused_while_streaming(self):
         typed = "x" * 200
         assert plan_edit(typed, "y" * 200, MAX_STREAM_BACKSPACES) is None
-        assert plan_edit(typed, "y" * 200, MAX_FINAL_BACKSPACES) is not None
+
+    def test_the_final_edit_is_never_refused(self):
+        # It has the authoritative text and an exact record of its own draft,
+        # so there is nothing left for a cap to protect against.
+        for typed, target in (("x" * 5000, "y" * 6000), ("Hello", ""),
+                              ("", "Hello"), ("same", "same")):
+            plan = plan_final_edit(typed, target)
+            assert plan is not None
+            backspaces, to_type = plan
+            assert backspaces <= len(typed), "a plan deleted past its own text"
+            assert typed[:len(typed) - backspaces] + to_type == target
+
+    def test_one_early_comma_does_not_cost_the_paragraph(self):
+        """The 2026-09-16 incident, byte for byte.
+
+        The greedy draft and the beam-search final disagreed about one comma
+        68 characters in. Under the old 400-backspace cap that refused the
+        whole reconciliation and left a truncated draft in the user's message
+        box; the last two sentences they spoke were lost.
+        """
+        typed = ("Okay, I'm in full support of having Azure do as much as Azure "
+                 "can do. And then in regards to some of those modeling plays, "
+                 "set that up. " + "Filler sentence to carry the length. " * 12 +
+                 "And then you can be the brain modeling the pieces of it as")
+        final = ("Okay, I'm in full support of having Azure do as much as Azure "
+                 "can do, and then in regards to some of those modeling plays, "
+                 "set that up. " + "Filler sentence to carry the length. " * 12 +
+                 "and then you can be the brain modeling the pieces of it as "
+                 "needed. But most of this should be able to be sent to Azure.")
+        assert common_prefix_len(typed, final) < 100, "fixture lost its early divergence"
+        assert len(typed) - common_prefix_len(typed, final) > 400, "fixture no longer over the old cap"
+        backspaces, to_type = plan_final_edit(typed, final)
+        assert typed[:len(typed) - backspaces] + to_type == final
+        assert backspaces <= len(typed)
 
     def test_from_empty(self):
         assert plan_edit("", "Hello", 48) == (0, "Hello")
@@ -351,27 +385,78 @@ class TestWorkerState:
         assert done == [INLINE_TYPED]
         assert win.content == "Hello world."
 
-    def test_oversized_stream_revision_stops_typing_but_finalizes(self, worker):
+    def test_oversized_stream_revision_is_skipped_not_typed(self, worker):
         p, fake, win = worker
         p._begin_inline_job(self.HWND, 1)
         long_draft = "A" + "b" * (MAX_STREAM_BACKSPACES + 20)
         self._type(p, long_draft)
         self._type(p, "A" + "c" * (MAX_STREAM_BACKSPACES + 20))
         assert win.content == long_draft, "a huge mid-flight delete burst was issued"
-        assert p._typed.broken is True
         done = []
         p._finalize_inline_job(self.HWND, 1, "A totally different sentence.", self._collector(done))
         assert done == [INLINE_TYPED]
         assert win.content == "A totally different sentence."
 
-    def test_final_correction_over_budget_leaves_the_draft(self, worker):
+    def test_a_refused_revision_does_not_end_typing_for_the_dictation(self, worker):
+        """One oversized draft must cost one draft, not the rest of the hold.
+
+        A live-preview commit re-decodes the window from a new offset, which
+        shifts words near the seam and reliably produces a single oversized
+        revision (3 of 4 commits in the 2026-09-16 log). Latching `broken`
+        there stopped live typing for the remainder of every long dictation.
+        Nothing is sent when a plan is refused, so the record stays exact and
+        the next draft deserves a fresh judgement.
+        """
         p, fake, win = worker
         p._begin_inline_job(self.HWND, 1)
-        self._type(p, "x" * (MAX_FINAL_BACKSPACES + 10))
+        settled = "A" + "b" * (MAX_STREAM_BACKSPACES + 20)
+        self._type(p, settled)
+        # The commit-seam tick: too big a revision, so it is skipped entirely.
+        self._type(p, "A" + "c" * (MAX_STREAM_BACKSPACES + 20))
+        assert win.content == settled
+        assert p._typed.broken is False, "a refusal was treated as an injection failure"
+        # The draft re-converges on the next tick and typing MUST resume.
+        self._type(p, settled + " and it kept going.")
+        assert win.content == settled + " and it kept going.", "typing never resumed"
+        assert p._typed.certain is True
+
+    def test_injection_failure_still_stops_typing_permanently(self, worker):
+        # The other half of the split: a batch Windows would not deliver is a
+        # real failure and must remain permanent for the dictation.
+        p, fake, win = worker
+        p._begin_inline_job(self.HWND, 1)
+        self._type(p, "Hello")
+        fake.refuse = True
+        self._type(p, "Hello world")
+        fake.refuse = False
+        assert p._typed.broken is True
+        before = win.content
+        self._type(p, "Hello world and more")
+        assert win.content == before, "typing resumed after a real injection failure"
+
+    def test_a_large_final_correction_rewrites_the_whole_draft(self, worker):
+        # Was `test_final_correction_over_budget_leaves_the_draft`, which pinned
+        # a 400-backspace cap. Live evidence (see `plan_final_edit`) showed the
+        # cap silently truncating real dictations, and leaving a draft that is
+        # KNOWN to be wrong is never better than retyping our own characters.
+        p, fake, win = worker
+        p._begin_inline_job(self.HWND, 1)
+        self._type(p, "x" * 900)
         done = []
         p._finalize_inline_job(self.HWND, 1, "y" * 10, self._collector(done))
-        assert done == [INLINE_PARTIAL]
-        assert win.content == "x" * (MAX_FINAL_BACKSPACES + 10)
+        assert done == [INLINE_TYPED]
+        assert win.content == "y" * 10
+
+    def test_a_large_orphaned_draft_is_still_taken_back(self, worker):
+        # The erase path shared the same cap, so a long dropped clip left its
+        # draft behind — the exact thing erase-on-drop exists to prevent.
+        p, fake, win = worker
+        win.content = "user's existing note. "
+        win.user_text_len = len(win.content)
+        p._begin_inline_job(self.HWND, 1)
+        self._type(p, "z" * 900)
+        p._cancel_inline_job(1, erase=True)
+        assert win.content == "user's existing note. "
 
     def test_cancel_with_erase_takes_back_only_our_own_text(self, worker):
         p, fake, win = worker
@@ -519,7 +604,7 @@ class TestWorkerState:
         p, fake, win = worker
         p._begin_inline_job(self.HWND, 1)
         self._type(p, "Hello")
-        monkeypatch.setattr(paste_mod, "plan_edit",
+        monkeypatch.setattr(paste_mod, "plan_final_edit",
                             lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
         done = []
         p._finalize_inline_job(self.HWND, 1, "Hello world.", self._collector(done))

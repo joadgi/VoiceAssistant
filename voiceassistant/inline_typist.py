@@ -26,10 +26,13 @@ feature can damage the user's document, and none of it is decorative:
    Windows accepted only in part — corrections stop permanently for that
    dictation. Backspacing past our own text eats the user's work, and no
    feature is worth that.
-2. **A correction is bounded.** Past `MAX_STREAM_BACKSPACES` mid-sentence the
-   plan is refused rather than issuing a long delete burst into a live
-   document. The final reconciliation is allowed more, because it happens once
-   and it is what makes the pasted result accurate.
+2. **A MID-SENTENCE correction is bounded; the FINAL one is not.** Past
+   `MAX_STREAM_BACKSPACES` the streaming plan is refused rather than issuing a
+   long delete burst into a live document on a guess about a word that is
+   still moving — typing pauses and the final pass cleans up. The final
+   reconciliation has the authoritative text and an exact record of its own
+   draft, so it may rewrite that draft ENTIRELY (`plan_final_edit`). Capping
+   it was a measured mistake: see the comment on `plan_final_edit`.
 3. **Never run while the dictate hotkey holds a modifier.** With `ctrl+shift+r`
    held, Ctrl is physically down for the whole utterance, so every injected
    character arrives as a SHORTCUT — "select all", "new tab", "bold". The
@@ -48,9 +51,6 @@ import re
 # Mid-utterance corrections are bounded: a long delete burst into a live
 # document is not something to do on a guess about a word that is still moving.
 MAX_STREAM_BACKSPACES = 48
-# The final reconciliation happens once, with the accurate text, and is what
-# makes the result trustworthy — so it may correct a whole sentence.
-MAX_FINAL_BACKSPACES = 400
 
 # Modifier names as `config.validate_hotkey` spells them.
 _MODIFIERS = {"ctrl", "shift", "alt", "windows", "cmd", "meta"}
@@ -124,6 +124,39 @@ def plan_edit(typed, target, max_backspaces):
     if backspaces > max_backspaces:
         return None
     return backspaces, target[keep:]
+
+
+def plan_final_edit(typed, target):
+    """The FINAL reconciliation: rewrite our own draft, however much it takes.
+
+    Never returns None. The streaming cap exists because a mid-sentence delete
+    burst is issued on a GUESS about a word that is still moving. Neither
+    reason survives here: the text is authoritative, the record of what we
+    typed is exact (`certain` is checked before this runs), and so every
+    character this deletes is provably one of ours.
+
+    WHY THE CAP HAD TO GO — measured 2026-09-16 on a live 42 s dictation into
+    ChatGPT.exe. `plan_edit` diffs on the common PREFIX, and the draft is a
+    greedy, VAD-free decode while the final pass uses beam search, so the two
+    disagree about punctuation. Here they disagreed at character 68:
+
+        draft "...as Azure can do. And then..."
+        final "...as Azure can do, and then..."
+
+    One comma. It made the common prefix 68 of 628 typed characters, so the
+    plan wanted 560 backspaces, the 400 cap refused it, and the user was left
+    with a truncated 628-character DRAFT in the message box while the accurate
+    732-character text went silently to the clipboard. The last two sentences
+    they spoke were simply gone.
+
+    There is no cheaper correct plan: backspace-and-retype can only edit from
+    the end, so a divergence at character 68 costs everything after it. And
+    there is no version of "leave the wrong text in the document" that beats
+    paying it — 18 backspace batches and 8 text batches are imperceptible,
+    losing a paragraph is not. `polish_stream_text` already fixed exactly this
+    bug for character zero; the cap was hiding the general case.
+    """
+    return plan_edit(typed, target, len(typed))
 
 
 def stream_target(stable_text, tail_text=None):

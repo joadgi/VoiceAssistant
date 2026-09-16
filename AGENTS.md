@@ -527,6 +527,40 @@ selection never changes into SAPI; `pyttsx3` runs only when explicitly selected.
   we type anything" BEFORE "is the record certain", so a partial batch that
   never reached the record reported "nothing typed" and the app pasted a second
   copy underneath the orphaned characters. Order those checks the other way.
+- **A refused mid-stream correction costs ONE DRAFT, not the rest of the
+  dictation** (`paste.py` `_type_to_job`). `_TypedState.broken` conflated two
+  unlike things: an injection Windows would not deliver (permanent, correct)
+  and a plan merely declined for exceeding `MAX_STREAM_BACKSPACES` (nothing
+  was sent, so the record is still exact). Measured 2026-09-16: a live-preview
+  commit re-decodes the window from a new offset with only a 200-char prompt
+  for left context, which shifts the words either side of the seam and
+  produces exactly one oversized revision — **3 of the 4 commits in the log**
+  did it. Latching `broken` on that single tick killed live typing for the
+  WHOLE REMAINDER of every hold past ~28 s, so the longest dictations were the
+  ones that went dead partway through and only landed at finalize. A refusal
+  now skips that draft and the next one is judged fresh against the unchanged
+  record. Injection failure and focus loss still stop streaming permanently —
+  that half is deliberate (streaming never steals focus back).
+- **The FINAL inline reconciliation is never refused for being large**
+  (`inline_typist.plan_final_edit`). `plan_edit` diffs on the common PREFIX,
+  and the streamed draft is a greedy/no-VAD decode while the final pass uses
+  beam search — so the two routinely disagree about PUNCTUATION, and one early
+  disagreement makes every character after it "different". Measured 2026-09-16
+  on a live 42 s dictation into ChatGPT.exe: draft `...as Azure can do. And
+  then...` vs final `...as Azure can do, and then...`, diverging at character
+  **68 of 628**. That asked for **560** backspaces, the `MAX_FINAL_BACKSPACES
+  = 400` cap refused the whole plan, and the user kept a **truncated 628-char
+  draft** in their message box while the accurate 732-char text went to the
+  clipboard — the last two sentences they spoke were gone. The cap is deleted.
+  A mid-sentence cap is still right (`MAX_STREAM_BACKSPACES`) because that
+  burst is issued on a GUESS about a word still moving; neither reason applies
+  at finalize, where the text is authoritative and `certain` has already proven
+  every character to be ours. There is also no cheaper correct plan —
+  backspace-and-retype only edits from the end — and no version of "leave text
+  we KNOW is wrong in the document" that beats paying it. The same cap sat on
+  the erase path, so a dropped clip over 400 chars silently failed to take its
+  draft back. `polish_stream_text` already fixed this exact bug for character
+  zero; the cap was hiding the general case.
 - **A dictation must never end silently with a draft in the user's document.**
   Found by the 2026-09-12 audit, four separate ways it could: a decode that
   RAISED reached only the generic error slot (no metric, pill just idled, draft
@@ -730,7 +764,10 @@ All are editable inline — click a hotkey pill and press your combo (single key
   `send_text`/`send_backspaces` (a refusal is 0, only a partial batch is None),
   the certainty check ordered BEFORE the empty-record check in finalize, the
   worker-confined `_TypedState`, the session id on every job, the erase-on-drop
-  paths, and `block_reason`'s modifier/console/own-window refusals.
+  paths, `block_reason`'s modifier/console/own-window refusals, and the rule
+  that the final edit is bounded only by its own record (never reintroduce a
+  fixed `MAX_FINAL_BACKSPACES` — it truncates real dictations), and the split
+  between a refused plan (skip one draft) and a failed injection (`broken`).
   **Keyboard watchpoints:** modifiers are never suppressed or replayed; only a
   matched non-modifier down/up PAIR may be consumed; hook callbacks must return
   falsy to suppress (a Qt `Signal.emit()` returns `True`); `ChordHotkey._reconcile`
