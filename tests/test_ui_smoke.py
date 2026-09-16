@@ -200,6 +200,47 @@ def test_stopped_selection_capture_cannot_start_speaking_later(
     assert spoken == ["current selection"]
 
 
+def test_empty_selection_never_reads_the_screen_aloud(main_window, monkeypatch):
+    """The 2026-09-16 bug. An empty capture used to OCR a box around the MOUSE
+    POINTER and speak it: 13 of the user's last 18 read presses ended that way,
+    the last reciting 511 characters of screen furniture for 24.5 seconds.
+
+    A failed read must now stay SILENT and say what happened. Reading the
+    screen is still available — deliberately, on the OCR hotkey — and the
+    message has to name that key, because it is the only way out the user has.
+    """
+    from voiceassistant import winapi
+
+    spoken, captured = [], []
+    monkeypatch.setattr(winapi, "get_foreground_window", lambda: 1234)
+    monkeypatch.setattr(winapi, "get_window_app", lambda hwnd: "acrobat.exe")
+    monkeypatch.setattr(main_window.tts, "speak", spoken.append)
+    monkeypatch.setattr(main_window.ocr, "read_image",
+                        lambda img: captured.append(img))
+    # OCR must look READY, or the old fallback would bail on `is_loaded` and
+    # this test would pass against the very code it exists to reject.
+    monkeypatch.setattr(type(main_window.ocr), "is_loaded", property(lambda self: True))
+    monkeypatch.setattr(
+        main_window.screen_capture, "capture_around_cursor",
+        lambda **kw: pytest.fail("read-aloud grabbed the screen on an empty "
+                                 "selection"),
+    )
+    main_window.config.set("hotkey_screen_read", "ctrl+shift+s")
+
+    for source in ("empty", "console_blocked", "refocus_failed", "input_busy"):
+        main_window._read_gen = 5
+        main_window._read_in_flight = True
+        main_window._on_read_text_ready(5, "", source)
+
+        assert spoken == [], f"{source} spoke something"
+        assert captured == [], f"{source} ran OCR"
+        assert main_window._read_in_flight is False, f"{source} wedged in-flight"
+
+    # ...and the way out is named, for every cause the user can act on.
+    for source in ("empty", "console_blocked"):
+        assert "ctrl+shift+s" in main_window._read_failure_message(source), source
+
+
 # ---------------------------------------------------------------------------
 # The pill key-CAPTURE flow: pressing keys on a HotkeyCaptureWidget must
 # translate Qt key events into the right combo string (the literal

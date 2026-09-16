@@ -93,8 +93,8 @@ Pasted/idle/error. The final paste path is unchanged. Setting: `live_preview`.
    keystrokes, no focus switch, and it works when the window ISN'T focused.
 2. **Ctrl+C sentinel** (refocus → sentinel → Ctrl+C → poll → restore) for apps UIA
    doesn't expose. Skipped entirely for console windows.
-3. **OCR the area around the cursor** (`window._read_ocr_fallback`) for text that
-   isn't text — scanned PDFs, images, copy-protected content.
+3. **OCR the area around the cursor** — still available, but on its OWN hotkey.
+   Read-aloud does NOT escalate to it automatically (see the key decision below).
 The tier is reported back so failures name the real cause and `--report` counts them.
 
 **OCR:** hotkey (cursor region) or drag-selected region → `mss` grab → `OCREngine` →
@@ -398,6 +398,25 @@ selection never changes into SAPI; `pyttsx3` runs only when explicitly selected.
   experienced as skipped sections. `_PacedAudioStream` exposes a 250 ms lead and then
   meters bytes at 24 kHz mono s16 (**48,000 bytes/s**). The same passage completed in
   **45.218 s** (0.259 s from its PCM duration). Pacing waits must remain stop-aware.
+- **A failed read-aloud says why; it never improvises a screen read**
+  (`_on_read_text_ready`). Tier 3 used to fire on ANY empty capture: OCR a
+  600x300 box around the **mouse pointer** and speak whatever landed in it. The
+  pointer has nothing to do with where a selection is, and the case that
+  triggers it most is simply pressing the key with nothing selected. Measured
+  2026-09-16 from `metrics.jsonl`: **13 of the last 18** read presses ended
+  that way, and the last one recited **511 characters of screen furniture for
+  24.5 s** at 1.98x. `metrics.record("read_ocr", chars=0)` was written BEFORE
+  the OCR ran, so `--report` showed 13 tidy zero-character rows while the app
+  was talking — the instrumentation hid the bug it existed to catch. Read-aloud
+  now stays silent on failure, names the real cause, and names the OCR hotkey
+  as the way out; bad outcomes record the app (`read_empty app=chrome.exe`),
+  per the metrics rule above. The capability is one key away and aimed
+  deliberately — it is the GUESSING that was removed. A text-layer heuristic
+  (escalate only when UIA exposes no TextPattern) was built and **rejected**:
+  `GetFocusedElement` is system-wide, so it cannot be measured from a headless
+  agent run, and the two scopes tried gave opposite answers on the same 18 live
+  windows (any-descendant: 17 "has text", focused-only: 1). Do not reintroduce
+  automatic escalation without a way to measure it on a real desktop.
 - **A neural voice is a hard choice; never switch it to SAPI automatically.**
   The old fallback converted a transient neural startup delay into an unexpected
   robotic Windows voice. Stopping that voice and pressing Read again could then
@@ -703,7 +722,10 @@ All are editable inline — click a hotkey pill and press your combo (single key
   must stay on BOTH passes), and the threading law (`workers.SerialWorker` — no ad-hoc
   threads). **Read-aloud watchpoints:** no blocking speak-until-finished call on
   ANY TTS backend, the VLC warm-up's stop check, the neural voice id never
-  reaching SAPI, and truncate-don't-re-read on a mid-utterance failure.
+  reaching SAPI, truncate-don't-re-read on a mid-utterance failure, and no
+  automatic OCR escalation on an empty capture
+  (`test_ui_smoke.test_empty_selection_never_reads_the_screen_aloud` fails
+  against the pre-2026-09-16 handler).
   **Inline-typing watchpoints:** the exact/unknown distinction in
   `send_text`/`send_backspaces` (a refusal is 0, only a partial batch is None),
   the certainty check ordered BEFORE the empty-record check in finalize, the

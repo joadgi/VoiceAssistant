@@ -1358,46 +1358,41 @@ class MainWindow(QMainWindow):
             self._update_status(f"Reading {len(text)} chars aloud ({source})...")
             return
 
-        # TIER 3: nothing readable as text. Fall back to OCR of the screen —
-        # this is what makes scanned PDFs, images and copy-protected content
-        # readable at all. Say so, so the behaviour isn't surprising.
-        if source in (SRC_CONSOLE_BLOCKED, SRC_EMPTY, SRC_REFOCUS_FAILED):
-            if self._read_ocr_fallback(source):
-                return
-        metrics.record(f"read_{source}", chars=0)
+        # NO AUTOMATIC TIER 3. Read-aloud used to answer an empty capture by
+        # OCR-ing a box around the MOUSE POINTER and speaking it. The pointer
+        # has nothing to do with where a selection is, and the case that fires
+        # it most is simply "the user pressed the key with nothing selected" --
+        # measured 2026-09-16, 13 of the last 18 presses, the last one reciting
+        # 511 characters of screen furniture for 24.5 seconds at 1.98x.
+        #
+        # Reading the screen is still one key away: it is the OCR hotkey's
+        # whole job, aimed deliberately, and the message below names it. What
+        # was removed is read-aloud GUESSING that you meant that instead.
+        metrics.record(
+            f"read_{source}", chars=0,
+            app=winapi.get_window_app(self._read_target_hwnd) or None,
+        )
         self._update_status(self._read_failure_message(source))
 
     def _read_failure_message(self, source):
+        """Say what actually happened, and name the OCR key as the way out.
+
+        These used to end in an automatic screen read, so the message could be
+        vague. Now that read-aloud refuses to improvise, the message IS the
+        product: it has to tell the user the one thing to do next.
+        """
+        ocr_key = self.config["hotkey_screen_read"]
         if source == SRC_INPUT_BUSY:
             return "Release Ctrl, Alt, Shift, and Windows, then try reading the selection again."
         if source == SRC_CONSOLE_BLOCKED:
-            return ("That's a terminal — Ctrl+C there would interrupt your command, "
-                    "so it wasn't sent. Nothing readable found on screen either.")
+            return ("That's a terminal — Ctrl+C there would interrupt your command, so it "
+                    f"wasn't sent. Select and copy it yourself, or press {ocr_key} to read "
+                    "the screen.")
         if source == SRC_REFOCUS_FAILED:
             return ("Couldn't switch back to that window (Windows blocked it), so the "
                     "selection wasn't read — click the window, then press the hotkey.")
-        return "Nothing to read — highlight some text first, then press the hotkey."
-
-    def _read_ocr_fallback(self, source):
-        """OCR the area around the cursor and read that. Returns True if it
-        produced speech."""
-        if not self.ocr.is_loaded:
-            return False
-        try:
-            img = self.screen_capture.capture_around_cursor(
-                width=self.config["screen_capture_width"],
-                height=self.config["screen_capture_height"],
-            )
-        except Exception:
-            applog.exception("read-aloud OCR fallback capture failed")
-            return False
-        applog.dbg(f"read-aloud: escalating to OCR (source={source})")
-        self._update_status(
-            "No selectable text — reading the area around your cursor instead..."
-        )
-        metrics.record("read_ocr", chars=0)
-        self.ocr.read_image(img)
-        return True
+        return ("Nothing selected — highlight some text first, then press the hotkey "
+                f"(or press {ocr_key} to read the screen at your cursor).")
 
     # -----------------------------------------------------------------------
     # Hotkey editing

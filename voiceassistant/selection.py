@@ -19,6 +19,16 @@ refocus did not verifiably take (it would copy the wrong window's selection).
 TIER 3 — OCR of the screen, for text that is not text (scanned PDFs, images,
 DRM'd content). Not done here: `window.py` owns the capture + OCR engines, so
 this module simply reports that it found nothing and lets the caller escalate.
+
+TIER 3 IS NOT AUTOMATIC. OCR reads a box around the MOUSE POINTER, which has
+nothing to do with where a selection is, so escalating whenever no text was
+found means speaking whatever UI chrome the pointer happens to sit on.
+Measured 2026-09-16: 13 of the user's last 18 read-aloud presses ended in that
+fallback, the last one reciting 511 characters of screen furniture for 24.5
+seconds. This module still reports WHY the capture was empty; `window.py` now
+turns that into a message naming the OCR hotkey instead of guessing. Tier 3 is
+unchanged and one key away -- it is the escalation that was removed, not the
+capability.
 """
 
 import time
@@ -28,7 +38,17 @@ import pyperclip
 from . import applog, uia, winapi
 from .workers import SerialWorker
 
-_SENTINEL = "\x00__VA_CLIP_SENTINEL__\x00"
+# The sentinel MUST survive a round trip through the real Windows clipboard.
+# It used to be wrapped in NUL bytes, and Windows clipboard text is
+# NUL-TERMINATED: pyperclip.copy measures the string with wcslen, so a
+# leading NUL wrote an EMPTY clipboard. paste() then returned "", which is
+# != the sentinel, so the poll below broke on its FIRST iteration -- 10 ms
+# after Ctrl+C, long before any app could answer it -- and tier 2 reported
+# "nothing selected" on every read the OS did not happen to complete inside
+# that one tick. Measured 2026-09-16: the old sentinel round-tripped to 0
+# chars. Zero-width spaces survive verbatim and cannot collide with real
+# copied content.
+_SENTINEL = "\u200b__VA_CLIP_SENTINEL__\u200b"
 
 # Why the capture produced no text — drives both the user-facing message and
 # whether the caller should escalate to OCR.
@@ -80,7 +100,13 @@ class SelectionReader:
             return self._tidy(text), SRC_UIA
 
         with winapi.clipboard_input_lock:
-            return self._capture_clipboard(combo, target_hwnd)
+            text, source = self._capture_clipboard(combo, target_hwnd)
+        if not text:
+            # Names which tier gave up, with no payload — the log used to say
+            # nothing at all on this path, which is why a 72% failure rate had
+            # to be reconstructed from metrics after the fact.
+            applog.dbg(f"read-aloud: no selection captured (source={source})")
+        return text, source
 
     def _capture_clipboard(self, combo, target_hwnd):
         if not winapi.wait_for_modifiers_released(2.0):

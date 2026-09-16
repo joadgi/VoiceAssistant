@@ -55,7 +55,10 @@ def env(monkeypatch):
     monkeypatch.setattr(sel_mod.winapi, "send_escape",
                         lambda: esc.__setitem__("n", esc["n"] + 1))
     # Tier 1 finds nothing by default, so the tier-2 tests exercise Ctrl+C.
-    monkeypatch.setattr(sel_mod.uia, "get_selection", lambda hwnd=None: "")
+    # `True` = the app DOES expose a text layer, so an empty result means
+    # "nothing is selected" and must NOT escalate to OCR.
+    monkeypatch.setattr(sel_mod.uia, "get_selection",
+                        lambda hwnd=None: "")
     # By default Ctrl+C "copies a selection" onto the (fake) clipboard.
     monkeypatch.setattr(sel_mod.winapi, "send_ctrl_c",
                         lambda: clip.copy("the selected text"))
@@ -77,7 +80,8 @@ def test_uia_hit_short_circuits_the_clipboard_path(env):
     it dangerous with a terminal focused."""
     mp = env["monkeypatch"]
     touched = {"ctrl_c": 0, "refocus": 0}
-    mp.setattr(sel_mod.uia, "get_selection", lambda hwnd=None: "highlighted words")
+    mp.setattr(sel_mod.uia, "get_selection",
+               lambda hwnd=None: "highlighted words")
     mp.setattr(sel_mod.winapi, "send_ctrl_c",
                lambda: touched.__setitem__("ctrl_c", touched["ctrl_c"] + 1))
     mp.setattr(sel_mod.winapi, "set_foreground_window",
@@ -173,6 +177,20 @@ def test_empty_prior_clipboard_sentinel_cleared(env):
 
 
 # --------------------------------------------------------------------------- #
+# Each failure keeps its OWN source, so window.py can name the real cause
+# --------------------------------------------------------------------------- #
+def test_each_failure_keeps_its_own_source(env):
+    """These four used to collapse into one automatic screen read, so the
+    distinction never reached the user. Now the source IS the message."""
+    mp = env["monkeypatch"]
+    mp.setattr(sel_mod.winapi, "send_ctrl_c", lambda: None)
+    assert _reader()._capture("f6", target_hwnd=1) == ("", SRC_EMPTY)
+
+    mp.setattr(sel_mod.winapi, "is_console_window", lambda hwnd: True)
+    assert _reader()._capture("f6", target_hwnd=1) == ("", SRC_CONSOLE_BLOCKED)
+
+
+# --------------------------------------------------------------------------- #
 # Contracts
 # --------------------------------------------------------------------------- #
 def test_job_always_calls_back_even_on_exception(env):
@@ -202,7 +220,8 @@ def test_capture_via_worker_invokes_callback(monkeypatch):
     monkeypatch.setattr(sel_mod.winapi, "set_foreground_window", lambda hwnd: focus.__setitem__(0, hwnd) or True)
     monkeypatch.setattr(sel_mod.winapi, "is_console_window", lambda hwnd: False)
     monkeypatch.setattr(sel_mod.winapi, "send_escape", lambda: None)
-    monkeypatch.setattr(sel_mod.uia, "get_selection", lambda hwnd=None: "")
+    monkeypatch.setattr(sel_mod.uia, "get_selection",
+                        lambda hwnd=None: "")
     monkeypatch.setattr(sel_mod.winapi, "send_ctrl_c", lambda: clip.copy("worker sel"))
 
     got, done = [], threading.Event()
