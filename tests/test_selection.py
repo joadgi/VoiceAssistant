@@ -191,6 +191,84 @@ def test_each_failure_keeps_its_own_source(env):
 
 
 # --------------------------------------------------------------------------- #
+# The sentinel must survive the REAL clipboard, and the poll must WAIT
+# --------------------------------------------------------------------------- #
+class _WindowsClip:
+    """pyperclip stand-in carrying the real Windows clipboard's NUL semantics.
+
+    Clipboard text on Windows is NUL-TERMINATED and `pyperclip.copy` sizes the
+    string with wcslen, so everything from the first NUL onward is discarded.
+    `_FakeClip` above stores whatever it is handed, verbatim -- which is
+    precisely why a NUL-wrapped sentinel passed this suite for months while
+    round-tripping to 0 characters on the user's machine, breaking tier 2 on
+    every read.
+    """
+
+    def __init__(self, value=""):
+        self.value = value
+
+    def copy(self, v):
+        self.value = v.split("\x00")[0]
+
+    def paste(self):
+        return self.value
+
+
+def test_sentinel_survives_a_windows_clipboard_round_trip():
+    """FAILS against the old NUL-wrapped sentinel, which read back as ""."""
+    clip = _WindowsClip()
+    clip.copy(sel_mod._SENTINEL)
+    assert clip.paste() == sel_mod._SENTINEL, (
+        "the sentinel does not survive the Windows clipboard, so the poll in "
+        "_capture_clipboard compares against a value that can never appear"
+    )
+
+
+def test_poll_waits_for_a_copy_that_lands_late(monkeypatch):
+    """Ctrl+C is ASYNCHRONOUS -- the target app answers it milliseconds later,
+    which is the entire reason the poll loop exists.
+
+    With the old sentinel the loop read "" on its FIRST pass, saw it differ
+    from the sentinel, and broke instantly with empty text: tier 2 reported
+    "nothing selected" ~10 ms after Ctrl+C, before any app could respond. The
+    default `_FakeClip` hides this by copying synchronously inside send_ctrl_c.
+    """
+    clip = _WindowsClip("ORIGINAL-CLIP")
+    monkeypatch.setattr(sel_mod, "pyperclip", clip)
+    monkeypatch.setattr(sel_mod.time, "sleep", lambda *_a, **_k: None)
+    monkeypatch.setattr(sel_mod.winapi, "wait_for_modifiers_released", lambda timeout: True)
+    focus = [None]
+    monkeypatch.setattr(sel_mod.winapi, "get_foreground_window", lambda: focus[0])
+    monkeypatch.setattr(sel_mod.winapi, "set_foreground_window",
+                        lambda hwnd: focus.__setitem__(0, hwnd) or True)
+    monkeypatch.setattr(sel_mod.winapi, "is_console_window", lambda hwnd: False)
+    monkeypatch.setattr(sel_mod.winapi, "send_escape", lambda: None)
+    monkeypatch.setattr(sel_mod.uia, "get_selection", lambda hwnd=None: "")
+
+    # Ctrl+C lands on the 12th poll (~120 ms), like a real app under load.
+    pending = {"n": 0}
+    monkeypatch.setattr(sel_mod.winapi, "send_ctrl_c",
+                        lambda: pending.__setitem__("n", 12))
+    real_paste = clip.paste
+
+    def slow_paste():
+        if pending["n"]:
+            pending["n"] -= 1
+            if pending["n"] == 0:
+                clip.value = "the selected text"
+        return real_paste()
+
+    clip.paste = slow_paste
+
+    text, source = _reader()._capture("f6", target_hwnd=1234)
+
+    assert (text, source) == ("the selected text", SRC_CLIPBOARD), (
+        "the poll gave up before the copy landed"
+    )
+    assert clip.value == "ORIGINAL-CLIP", "clipboard not restored"
+
+
+# --------------------------------------------------------------------------- #
 # Contracts
 # --------------------------------------------------------------------------- #
 def test_job_always_calls_back_even_on_exception(env):
