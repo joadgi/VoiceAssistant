@@ -78,6 +78,10 @@ DEFAULTS = {
     # and refuses to run unless the dictate hotkey is a plain key.
     "inline_typing": False,
     "debug_logging": False,
+    # One-shot: the "closing hides it, it does not quit" tray notice has been
+    # shown. Closing the window leaves the process - and the SWALLOWED Caps
+    # Lock binding - resident, which users reasonably read as "I quit it".
+    "close_to_tray_notified": False,
 }
 
 

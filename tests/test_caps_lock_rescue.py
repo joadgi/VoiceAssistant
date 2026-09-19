@@ -14,6 +14,13 @@ Three guarantees:
      `keyboard.send` because that marks its events as replayed so our
      suppressing hook passes them through.
   3. Quitting clears it too, after the hooks are removed.
+  4. It rescues ITSELF while running - on the lost keyup that strands it, and
+     on a periodic check for the strandings no keyup event covers. Guarantee 1
+     only ever fires at startup, which is no help to a process that stays up
+     for days (measured 2026-09-19: stuck for three of them).
+  5. Closing the window says, once, that the app is still running and where
+     Quit is - a user who believes they quit cannot know what is still eating
+     their Caps Lock.
 
 Num Lock and Scroll Lock are deliberately NOT cleared: Num Lock off breaks the
 numeric keypad, and Scroll Lock is harmless.
@@ -327,3 +334,192 @@ class TestMutedMicrophoneIsNamed:
         w._pending_target_hwnd = 4242
         w._on_recording_stopped(np.zeros(16000, dtype=np.float32))
         assert "no sound" in w.indicator._label.text().lower()
+
+
+# ===========================================================================
+# Guarantee 4 - the stuck key fixes itself
+# ===========================================================================
+class _RescueRig:
+    """Put the window in the one state a user cannot escape from: Caps Lock
+    bound, actually swallowed, and currently on."""
+
+    @staticmethod
+    def arm(w, win_mod, monkeypatch, caps_on=True, suppressed=True,
+            binding="caps lock"):
+        w.config.set("hotkey_record", binding)
+        w._record_suppression_active = suppressed
+        w._ptt_active = False
+        w._caps_rescue_at = 0.0
+        monkeypatch.setattr(winapi, "lock_key_is_on",
+                            lambda vk=winapi.VK_CAPITAL: caps_on)
+        sent = []
+        monkeypatch.setattr(win_mod.kb, "send", lambda key: sent.append(key))
+        return sent
+
+
+class TestAutomaticRescue:
+    def test_it_clears_a_stranded_caps_lock(self, mw, monkeypatch):
+        w, win_mod = mw
+        sent = _RescueRig.arm(w, win_mod, monkeypatch)
+        assert w._rescue_stuck_caps("test") is True
+        assert sent == ["caps lock"]
+
+    def test_it_uses_keyboard_send_not_raw_injection(self, mw, monkeypatch):
+        """Same reason as the menu hatch: a raw winapi tap is eaten by our own
+        suppressing hook, so the automatic fix would silently do nothing."""
+        w, win_mod = mw
+        _RescueRig.arm(w, win_mod, monkeypatch)
+        raw = []
+        monkeypatch.setattr(winapi, "clear_caps_lock", lambda: raw.append(1))
+        w._rescue_stuck_caps("test")
+        assert raw == [], "used raw injection, which our own hook would swallow"
+
+    def test_it_does_nothing_when_caps_is_already_off(self, mw, monkeypatch):
+        w, win_mod = mw
+        sent = _RescueRig.arm(w, win_mod, monkeypatch, caps_on=False)
+        assert w._rescue_stuck_caps("test") is False
+        assert sent == [], "turned caps ON for a user who did not have it on"
+
+    def test_it_never_fights_a_key_the_user_can_fix_themselves(self, mw, monkeypatch):
+        """Suppression can be refused at registration. A Caps Lock we do NOT
+        swallow is one the user can toggle deliberately - turning it off under
+        them every few seconds would be far worse than the bug."""
+        w, win_mod = mw
+        sent = _RescueRig.arm(w, win_mod, monkeypatch, suppressed=False)
+        assert w._rescue_stuck_caps("test") is False
+        assert sent == []
+
+    def test_it_never_interrupts_a_live_hold(self, mw, monkeypatch):
+        w, win_mod = mw
+        sent = _RescueRig.arm(w, win_mod, monkeypatch)
+        w._ptt_active = True
+        assert w._rescue_stuck_caps("test") is False
+        assert sent == []
+
+    def test_it_leaves_a_non_caps_binding_alone(self, mw, monkeypatch):
+        """Scroll Lock has no business toggling anyone's caps."""
+        w, win_mod = mw
+        sent = _RescueRig.arm(w, win_mod, monkeypatch, binding="scroll lock")
+        assert w._rescue_stuck_caps("test") is False
+        assert sent == []
+
+    def test_it_backs_off_instead_of_hammering_the_key(self, mw, monkeypatch):
+        """The background check runs twice a second. If a clear ever failed to
+        take, an ungated rescue would inject Caps Lock forever."""
+        w, win_mod = mw
+        sent = _RescueRig.arm(w, win_mod, monkeypatch)
+        assert w._rescue_stuck_caps("first") is True
+        assert w._rescue_stuck_caps("immediately after") is False
+        assert sent == ["caps lock"]
+
+    def test_it_survives_a_failure(self, mw, monkeypatch):
+        w, win_mod = mw
+        _RescueRig.arm(w, win_mod, monkeypatch)
+
+        def boom(key):
+            raise OSError("nope")
+
+        monkeypatch.setattr(win_mod.kb, "send", boom)
+        assert w._rescue_stuck_caps("test") is False   # must not raise
+
+
+class TestRescueIsActuallyWired:
+    def test_a_lost_keyup_triggers_it(self, mw, monkeypatch):
+        """The watchdog already detected the exact event that strands caps -
+        our hook missing the release - and used to only stop the recording."""
+        w, win_mod = mw
+        calls = []
+        monkeypatch.setattr(w, "_rescue_stuck_caps", lambda reason: calls.append(reason))
+        w.config.set("hotkey_record", "caps lock")
+        w._ptt_active = True
+        monkeypatch.setattr(win_mod.kb, "is_pressed", lambda part: False)
+        w._on_ptt_watchdog()
+        assert calls, "a lost keyup no longer rescues a stranded caps lock"
+
+    def test_the_background_check_triggers_it(self, mw, monkeypatch):
+        """Caps also strands in the unhooked gap during hotkey
+        re-registration, which no keyup event covers."""
+        w, win_mod = mw
+        calls = []
+        monkeypatch.setattr(w, "_rescue_stuck_caps", lambda reason: calls.append(reason))
+        monkeypatch.setattr(winapi, "show_requested", lambda: False)
+        w._poll_show_request()
+        assert calls, "nothing checks for a stranded caps lock while running"
+
+
+# ===========================================================================
+# Guarantee 5 - closing the window admits the app is still running
+# ===========================================================================
+class _BalloonTray:
+    def __init__(self):
+        self.messages = []
+
+    def isVisible(self):
+        return True
+
+    def showMessage(self, title, body, icon, msecs):
+        self.messages.append((title, body))
+
+
+class TestCloseToTrayNotice:
+    def test_the_first_close_says_it_is_still_running(self, mw):
+        w, _ = mw
+        w.tray = _BalloonTray()
+        w.config.set("close_to_tray_notified", False)
+        w._notify_still_running()
+        assert len(w.tray.messages) == 1
+        title, body = w.tray.messages[0]
+        assert "still running" in title.lower()
+        assert "quit" in body.lower(), "never says where Quit actually is"
+        assert "caps lock" in body.lower(), (
+            "never says the key is still bound - which is the thing that "
+            "strands the user after they think they closed the app")
+
+    def test_it_only_says_it_once(self, mw):
+        w, _ = mw
+        w.tray = _BalloonTray()
+        w.config.set("close_to_tray_notified", False)
+        w._notify_still_running()
+        w._notify_still_running()
+        assert len(w.tray.messages) == 1
+
+    def test_a_failed_balloon_is_not_recorded_as_shown(self, mw):
+        """Otherwise the one notice that matters is silently consumed."""
+        w, _ = mw
+
+        class _Broken:
+            def showMessage(self, *a):
+                raise OSError("no tray")
+
+        w.tray = _Broken()
+        w.config.set("close_to_tray_notified", False)
+        w._notify_still_running()                      # must not raise
+        assert w.config.get("close_to_tray_notified") is False
+
+    def test_closing_the_window_actually_shows_it(self, mw, monkeypatch):
+        w, _ = mw
+        w.tray = _BalloonTray()
+        w._force_quit = False
+        w.config.set("close_to_tray_notified", False)
+        monkeypatch.setattr(w, "hide", lambda: None)
+
+        class _Ev:
+            def ignore(self):
+                pass
+
+            def accept(self):
+                pass
+
+        w.closeEvent(_Ev())        # close-to-tray returns before any teardown
+        assert w.tray.messages, "closing to tray told the user nothing visible"
+
+
+class TestTrayIconIsIdentifiable:
+    def test_it_is_painted_not_a_stock_glyph(self, qapp):
+        """SP_ComputerIcon is a generic grey monitor - indistinguishable in the
+        Windows 11 overflow flyout, which is the ONLY route to Quit."""
+        from voiceassistant.window import _make_tray_icon
+
+        icon = _make_tray_icon()
+        assert not icon.isNull()
+        assert icon.availableSizes(), "tray icon carries no pixmap"

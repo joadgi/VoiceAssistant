@@ -13,10 +13,12 @@ import keyboard as kb
 import numpy as np
 import pyperclip
 from PySide6.QtCore import Qt, QTimer, Signal, Slot
-from PySide6.QtGui import QAction, QColor, QFont, QTextCharFormat
+from PySide6.QtGui import (
+    QAction, QColor, QFont, QIcon, QPainter, QPen, QPixmap, QTextCharFormat,
+)
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialog, QGroupBox, QHBoxLayout, QLabel, QMainWindow, QMenu,
-    QProgressBar, QPushButton, QSlider, QStatusBar, QStyle, QSystemTrayIcon,
+    QProgressBar, QPushButton, QSlider, QStatusBar, QSystemTrayIcon,
     QTextEdit, QVBoxLayout, QWidget,
 )
 
@@ -39,6 +41,39 @@ from .text import clean_transcript, is_probable_hallucination
 from .transcriber import Transcriber
 from .tts import LOCAL_MAX_SPEED, TTSEngine
 from .widgets import HotkeyCaptureWidget, RecordingIndicator
+
+# Do not re-send the rescue tap faster than this. If a clear somehow does not
+# take, the 500ms poll would otherwise hammer the key.
+CAPS_RESCUE_MIN_INTERVAL_S = 3.0
+
+
+def _make_tray_icon():
+    """Paint the tray icon instead of borrowing a stock one.
+
+    The tray icon is the ONLY route to Quit (closing the window merely hides
+    it), so it has to be findable in the Windows 11 overflow flyout.
+    SP_ComputerIcon - a generic grey monitor - was indistinguishable from
+    everything else in there, which is how an app that looked closed kept
+    running for days with Caps Lock still bound.
+    """
+    pix = QPixmap(64, 64)
+    pix.fill(QColor(0, 0, 0, 0))
+    p = QPainter(pix)
+    try:
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor("#c62828"))                    # the recording red
+        p.drawRoundedRect(2, 2, 60, 60, 16, 16)
+        p.setBrush(QColor("#ffffff"))
+        p.drawRoundedRect(26, 13, 12, 23, 6, 6)          # mic capsule
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(QColor("#ffffff"), 4, Qt.PenStyle.SolidLine,
+                      Qt.PenCapStyle.RoundCap))
+        p.drawArc(20, 25, 24, 23, 180 * 16, 180 * 16)    # cradle
+        p.drawLine(32, 48, 32, 53)                       # stem
+    finally:
+        p.end()
+    return QIcon(pix)
 
 
 class MainWindow(QMainWindow):
@@ -130,6 +165,12 @@ class MainWindow(QMainWindow):
         self._ptt_active = False
         self._last_hotkey_press_time = 0.0
         self._force_quit = False
+        # Automatic stuck-Caps-Lock rescue (see _rescue_stuck_caps). The
+        # suppression flag is set by _setup_hotkeys and is true ONLY when the
+        # swallowing hook actually registered - that is the one state the user
+        # has no manual escape from, and so the only one we may act on.
+        self._record_suppression_active = False
+        self._caps_rescue_at = 0.0
         # Debounce flag for read-aloud hotkey
         self._read_in_flight = False
         # A stopped selection capture may still finish on its worker. Bind the
@@ -519,15 +560,22 @@ class MainWindow(QMainWindow):
             def release_cb(_event):
                 self._sig_hotkey_release.emit()
 
+            # Record whether the SWALLOWING hook actually took. Suppression
+            # can be refused (the fallback below), and a key we do not swallow
+            # is one the user can still fix by hand - so the automatic rescue
+            # must never fire then and fight them for their own key.
+            self._record_suppression_active = False
             for key in dict.fromkeys(self._hotkey_parts(hk_record)):
                 try:
                     kb.on_press_key(key, press_cb, suppress=suppress_record)
                     kb.on_release_key(key, release_cb, suppress=suppress_record)
+                    self._record_suppression_active = suppress_record
                 except Exception:
                     # Suppression can be refused; a working un-suppressed hotkey
                     # beats no hotkey at all.
                     kb.on_press_key(key, press_cb)
                     kb.on_release_key(key, release_cb)
+                    self._record_suppression_active = False
         except Exception as e:
             errors.append(f"Record hotkey ({hk_record}): {e}")
 
@@ -668,6 +716,9 @@ class MainWindow(QMainWindow):
             self._stop_ptt_watchdog()
             if self.recorder.is_recording:
                 self._on_stop_record()
+            # A lost keyup is the exact event that strands Caps Lock: our hook
+            # missed it, so Windows may well have seen the press and toggled.
+            self._rescue_stuck_caps("lost keyup")
 
     # -----------------------------------------------------------------------
     # Recording handlers
@@ -866,6 +917,49 @@ class MainWindow(QMainWindow):
             return
         applog.info("caps lock cleared from the menu")
         self._update_status("Caps Lock turned off")
+
+    def _rescue_stuck_caps(self, reason):
+        """Turn a STRANDED Caps Lock off by ourselves. True if it did.
+
+        While Caps Lock is bound and swallowed the user physically cannot turn
+        it off, so caps-on is never a state they chose - it is an error state
+        with no manual way out. It strands whenever the key toggles while our
+        hook is not suppressing it: a lost keyup (18 in 1730 dictations here),
+        the gap during hotkey re-registration, or the app not running when it
+        was pressed.
+
+        The only recovery used to be the startup clear in _setup_hotkeys,
+        which never runs again on a process that stays up for days. Measured
+        on this machine 2026-09-19: stuck from a lost keyup and unrecoverable
+        for three days, because the app that ate the key was still resident
+        behind a closed window.
+
+        Uses `keyboard.send` for the same reason _on_clear_caps does - it
+        marks its events as replayed, so our own suppressing hook passes them
+        through. A raw winapi tap here would be swallowed by us.
+        """
+        # Only act when WE are the reason it cannot be fixed by hand.
+        if not self._record_suppression_active:
+            return False
+        if "caps lock" not in normalize_hotkey(self.config.get("hotkey_record", "")):
+            return False
+        # Mid-dictation the key is legitimately held down; never fight a hold.
+        if self._ptt_active:
+            return False
+        if not winapi.lock_key_is_on(winapi.VK_CAPITAL):
+            return False
+        now = time.monotonic()
+        if now - self._caps_rescue_at < CAPS_RESCUE_MIN_INTERVAL_S:
+            return False
+        self._caps_rescue_at = now
+        try:
+            kb.send("caps lock")
+        except Exception:
+            applog.exception("automatic caps lock rescue failed")
+            return False
+        applog.info("stuck Caps Lock cleared automatically (%s)" % reason)
+        self._update_status("Caps Lock was stuck - turned it off")
+        return True
 
     @Slot(str, int, str)
     def _on_inline_done(self, outcome, hwnd, text):
@@ -1612,10 +1706,19 @@ class MainWindow(QMainWindow):
     def _poll_show_request(self):
         if winapi.show_requested():
             self.show_normal()
+        # Safety net. A lost keyup is not the only way caps strands: it also
+        # happens in the unhooked gap during hotkey re-registration, and
+        # whenever it was already on before the hooks went up. The startup
+        # clear in _setup_hotkeys cannot help a process that stays up for
+        # days - which is exactly how caps stayed stuck for three of them.
+        self._rescue_stuck_caps("background check")
 
     def _setup_tray(self):
         self.tray = QSystemTrayIcon(self)
-        self.tray.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon))
+        self.tray.setIcon(_make_tray_icon())
+        # This icon is the only route to Quit, so it must be identifiable at
+        # 16px in a crowded overflow flyout, and say what it is on hover.
+        self.tray.setToolTip("Voice Assistant - right-click for Quit")
         menu = QMenu(self)
         show_action = QAction("Show Voice Assistant", self)
         show_action.triggered.connect(self.show_normal)
@@ -1673,11 +1776,36 @@ class MainWindow(QMainWindow):
         if was_visible:
             self.show()
 
+    def _notify_still_running(self):
+        """Say - once, where it can actually be read - that closing is not
+        quitting.
+
+        setQuitOnLastWindowClosed is off, so the X hides the window and leaves
+        the process, its global hooks and the loaded model resident. The only
+        notice of that was a status-bar line in the very window disappearing
+        at that moment, which nobody can read. A user who believes they closed
+        the app is then left with a swallowed Caps Lock and no idea what is
+        holding it. Point at the tray, because that is where Quit lives.
+        """
+        if self.config.get("close_to_tray_notified"):
+            return
+        try:
+            self.tray.showMessage(
+                "Voice Assistant is still running",
+                "It is minimized to the tray, not closed, and Caps Lock stays "
+                "bound to dictation. Right-click this icon to Quit.",
+                QSystemTrayIcon.MessageIcon.Information, 10000,
+            )
+        except Exception:
+            return          # a balloon must never block hiding the window
+        self.config.set("close_to_tray_notified", True)
+
     def closeEvent(self, event):
         if not self._force_quit and self.tray.isVisible():
             event.ignore()
             self.hide()
             self._update_status("Still running in the tray")
+            self._notify_still_running()
             return
         # Full teardown — hooks, timers, workers, players, temp files.
         try:
