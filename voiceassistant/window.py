@@ -177,6 +177,8 @@ class MainWindow(QMainWindow):
         # callback to a generation so that stale text can never start speaking
         # after the user pressed Stop or began a newer read.
         self._read_gen = 0
+        # Last "read-aloud can't keep up" balloon (see _on_tts_falling_behind).
+        self._tts_slow_notified_at = None
         # Watch PTT release; native polling is valid only for unsuppressed
         # bindings. Dedicated blocked keys retain their duration backstop.
         # Metrics for the in-flight dictation. Keyed by transcription job id
@@ -491,6 +493,7 @@ class MainWindow(QMainWindow):
         self.tts.speaking_finished.connect(self._on_tts_finished)
         self.tts.status.connect(self._update_status)
         self.tts.error.connect(self._on_error)
+        self.tts.falling_behind.connect(self._on_tts_falling_behind)
 
         self.region_selector.region_selected.connect(self._on_region_selected)
         self.region_selector.cancelled.connect(lambda: self._update_status("Selection cancelled"))
@@ -1165,6 +1168,34 @@ class MainWindow(QMainWindow):
             )
         except Exception:
             pass
+
+    # One balloon per stretch of CPU trouble, not one per read.
+    TTS_SLOW_NOTIFY_INTERVAL_S = 600.0
+
+    @Slot(str)
+    def _on_tts_falling_behind(self, msg):
+        """Read-aloud is generating speech slower than it plays.
+
+        Deliberately NOT _on_degraded: that marks the Whisper label DEGRADED
+        until restart, and this is almost always another program saturating
+        the CPU for a while. The channel reasoning is the same, though. The app
+        lives in the tray, so a status line alone is invisible, and the user
+        hears stutter with no cause. Measured 2026-10-20, that is exactly how a
+        runaway DisplayFusion presented: "it is having a hard time reading."
+        """
+        self._update_status(msg)
+        now = time.monotonic()
+        last = self._tts_slow_notified_at
+        if last is not None and now - last < self.TTS_SLOW_NOTIFY_INTERVAL_S:
+            return
+        try:
+            self.tray.showMessage(
+                "Voice Assistant - read-aloud can't keep up", msg,
+                QSystemTrayIcon.MessageIcon.Warning, 10000,
+            )
+        except Exception:
+            return  # not shown, so do not start the quiet period
+        self._tts_slow_notified_at = now
 
     @Slot()
     def _on_ocr_ready(self):

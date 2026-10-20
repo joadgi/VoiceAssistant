@@ -98,6 +98,13 @@ LOCAL_MAX_SPEED = 2.6
 # at input 1.2 is about 1.15 once punctuation pauses are included.
 LOCAL_QUALITY_MODEL_SPEED = 1.2
 LOCAL_QUALITY_EFFECTIVE_SPEED = 1.15
+# ONNX Runtime's default is one spinning worker per physical core (16 here).
+# Measured 2026-10-20 on this 16-core Ryzen with another program loading the
+# CPU, mean synthesis time per second of audio over 9 blocks each: default
+# 0.50, 16 threads without spinning 0.41, 8 threads without spinning 0.37.
+# Spinning workers burn cores while idle, and on a starved CPU those are the
+# cores our own audio threads need, so spinning stays off.
+KOKORO_INTRA_OP_THREADS = max(1, min(8, (os.cpu_count() or 2) // 2))
 
 
 def _neural_meta():
@@ -429,6 +436,63 @@ class _PacedAudioStream:
         return None
 
 
+CPU_BUSY_HINT = (
+    "The CPU is too busy - check Task Manager for a program using most of it."
+)
+
+
+class _SynthesisPace:
+    """Track whether local synthesis stays ahead of the speakers.
+
+    Kokoro runs on the CPU, so a program that saturates it starves read-aloud.
+    Measured 2026-10-20: with a runaway DisplayFusion holding 20-33 of 32
+    logical cores, blocks took 1.1-1.6x their own playing time to generate,
+    against ~0.3x normally. Of 970 logged blocks, 888 generated in under 0.5x
+    and every block at or over 1.0x fell inside a CPU-contention episode. The
+    stream ran dry between batches, the user heard stutter, and nothing in the
+    app said why.
+
+    Pure arithmetic on durations the caller measures, so it is testable
+    without a clock. ``played_s`` is wall time since playback started, or None
+    for the block that starts playback.
+    """
+
+    AUDIBLE_GAP_S = 0.5     # a dry spell this long is a pause the user hears
+    MIN_SLOW_START_S = 1.0  # a sub-second phrase starting late is not news
+
+    def __init__(self):
+        self.blocks = 0
+        self.audio_s = 0.0
+        self.worst_ratio = 0.0
+        self.gap_s = 0.0
+        self._dry_at_s = 0.0  # playback time at which queued audio runs out
+
+    def add(self, synth_s, audio_s, played_s=None):
+        """Record one block; return a user-facing reason if it fell behind."""
+        self.blocks += 1
+        self.audio_s += audio_s
+        ratio = synth_s / audio_s if audio_s > 0 else 0.0
+        self.worst_ratio = max(self.worst_ratio, ratio)
+        if played_s is None:
+            self._dry_at_s = audio_s
+            if synth_s >= self.MIN_SLOW_START_S and ratio >= 1.0:
+                return (
+                    f"Read-aloud started late: speech took {ratio:.1f}x "
+                    "longer to generate than to play."
+                )
+            return None
+        gap = played_s - self._dry_at_s
+        self._dry_at_s = max(self._dry_at_s, played_s) + audio_s
+        if gap > 0:
+            self.gap_s += gap
+        if gap >= self.AUDIBLE_GAP_S:
+            return (
+                f"Read-aloud paused {gap:.1f}s waiting for speech to be "
+                "generated."
+            )
+        return None
+
+
 class TTSEngine(QObject):
     """Local/online neural TTS plus an explicit Windows SAPI option."""
 
@@ -436,6 +500,9 @@ class TTSEngine(QObject):
     speaking_finished = Signal()
     status = Signal(str)
     error = Signal(str)
+    # Local synthesis fell behind playback (see _SynthesisPace). At most once
+    # per utterance. Not an error: the read continues, just with pauses.
+    falling_behind = Signal(str)
     FIRST_AUDIO_TIMEOUT = 6.0   # chosen neural voice gets a bounded startup window
     SYNTHESIS_STALL_TIMEOUT = 10.0  # no more bytes while buffering -> honest error
     START_BUFFER_PLAY_SECONDS = 3.0  # long reads: absorb jitter at high playback speeds
@@ -749,6 +816,10 @@ class TTSEngine(QObject):
 
             options = ort.SessionOptions()
             options.log_severity_level = 3
+            options.intra_op_num_threads = KOKORO_INTRA_OP_THREADS
+            options.add_session_config_entry(
+                "session.intra_op.allow_spinning", "0"
+            )
             session = ort.InferenceSession(
                 KOKORO_MODEL_PATH,
                 providers=["CPUExecutionProvider"],
@@ -854,6 +925,10 @@ class TTSEngine(QObject):
         one live trace contained 2.60x, 2.50x, 2.20x, and 1.90x blocks in the
         same playback stream.
         No network, MP3 decoder boundary, or second Python thread is involved.
+
+        Each block is timed against playback. When synthesis falls behind (the
+        CPU is saturated by another program), ``falling_behind`` fires once so
+        the stutter arrives with its cause instead of looking like a TTS bug.
         """
         import numpy as np
 
@@ -875,9 +950,10 @@ class TTSEngine(QObject):
 
         cancel_event = threading.Event()
         stream = _StreamingAudioBuffer(stop_event, cancel_event)
+        pace = _SynthesisPace()
+        warned = False
         started = False
         playback_started_at = None
-        total_pcm_bytes = 0
         error = None
         try:
             for index, (phonemes, pause_after) in enumerate(batches):
@@ -896,17 +972,34 @@ class TTSEngine(QObject):
                     np.clip(np.asarray(samples).reshape(-1), -1.0, 1.0)
                     * 32767.0
                 ).astype("<i2", copy=False).tobytes()
+                ready_at = time.monotonic()
+                synth_s = ready_at - synth_started
+                audio_s = len(pcm) / 2 / LOCAL_PCM_SAMPLE_RATE
                 applog.dbg(
                     "local neural block ready "
                     f"(block={index + 1}/{len(batches)}, phonemes={len(phonemes)}, "
                     f"requested={requested_speed:.2f}x, model_input={model_speed:.2f}, "
                     f"tempo={tempo_factor:.2f}x, "
                     f"pause={pause_after:.2f}s, "
-                    f"audio={len(pcm) / 2 / LOCAL_PCM_SAMPLE_RATE:.2f}s, "
-                    f"synth={time.monotonic() - synth_started:.2f}s)"
+                    f"audio={audio_s:.2f}s, "
+                    f"synth={synth_s:.2f}s)"
                 )
+                behind = pace.add(
+                    synth_s,
+                    audio_s,
+                    None if playback_started_at is None
+                    else ready_at - playback_started_at,
+                )
+                if behind and not warned and not stop_event.is_set():
+                    warned = True
+                    applog.info(
+                        "local neural synthesis behind playback "
+                        f"(block={index + 1}/{len(batches)}, "
+                        f"worst_synth_ratio={pace.worst_ratio:.2f}, "
+                        f"est_gap={pace.gap_s:.2f}s)"
+                    )
+                    self.falling_behind.emit(f"{behind} {CPU_BUSY_HINT}")
                 stream.write(pcm)
-                total_pcm_bytes += len(pcm)
                 if not started and pcm and not stop_event.is_set():
                     applog.dbg(
                         "local neural playback ready "
@@ -925,28 +1018,45 @@ class TTSEngine(QObject):
 
         if stop_event.is_set():
             stream.cancel()
+            self._log_local_outcome(
+                "stopped", stream, pace, len(batches), playback_started_at
+            )
             return
         if error is not None and not started:
             raise error
         if not started:
             raise RuntimeError("Local neural TTS returned no playable audio")
         self._wait_vlc_stream(stream, stop_event)
-        expected_audio_s = total_pcm_bytes / (
-            LOCAL_PCM_SAMPLE_RATE * 2
-        )
-        playback_wall_s = (
-            time.monotonic() - playback_started_at
-            if playback_started_at is not None else 0.0
-        )
-        starvation_count, max_starvation_s = stream.starvation_stats
-        applog.dbg(
-            "local neural playback complete "
-            f"(blocks={len(batches)}, callback_waits={starvation_count}, "
-            f"max_callback_wait={max_starvation_s:.3f}s, "
-            f"audio={expected_audio_s:.3f}s, wall={playback_wall_s:.3f}s)"
+        self._log_local_outcome(
+            "stopped" if stop_event.is_set() else "complete",
+            stream, pace, len(batches), playback_started_at,
         )
         if error is not None:
             raise error
+
+    @staticmethod
+    def _log_local_outcome(outcome, stream, pace, total_blocks, playback_started_at):
+        """One summary line per local read, including reads the user stopped.
+
+        This used to say "complete" for a read the user STOPPED: a 167 s read
+        stopped at 97 s logged ``audio=167.215s, wall=96.812s``, which reads as
+        VLC ending 70 s early. A read stopped while still synthesizing logged
+        nothing at all, so the stuttering reads the user gave up on left no
+        trace. Counts and durations only, never text.
+        """
+        wall_s = (
+            time.monotonic() - playback_started_at
+            if playback_started_at is not None else 0.0
+        )
+        waits, max_wait_s = stream.starvation_stats
+        applog.dbg(
+            f"local neural playback {outcome} "
+            f"(blocks={pace.blocks}/{total_blocks}, callback_waits={waits}, "
+            f"max_callback_wait={max_wait_s:.3f}s, "
+            f"worst_synth_ratio={pace.worst_ratio:.2f}, "
+            f"est_gap={pace.gap_s:.2f}s, "
+            f"audio={pace.audio_s:.3f}s, wall={wall_s:.3f}s)"
+        )
 
     def _start_vlc_pcm_stream(self, stream, stop_event, progress):
         """Start one raw 24 kHz mono PCM stream already synthesized at speed."""

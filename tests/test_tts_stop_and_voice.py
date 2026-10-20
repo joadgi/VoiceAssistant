@@ -561,6 +561,199 @@ def test_stop_interrupts_pcm_pacing_immediately():
     assert paced.read(4096) is None
 
 
+# --------------------------------------------------------------------------- #
+# Falling behind - a starved CPU must be named, not heard as unexplained stutter
+# --------------------------------------------------------------------------- #
+def test_synthesis_pace_is_quiet_on_a_healthy_read():
+    """Real 2026-10-20 06:17 numbers: ~0.3x synthesis, no pauses, no warning."""
+    from voiceassistant.tts import _SynthesisPace
+
+    pace = _SynthesisPace()
+    assert pace.add(3.34, 11.81) is None
+    played = 0.0
+    for synth, audio in [(2.55, 8.95), (4.17, 14.07), (4.23, 14.42), (1.91, 5.67)]:
+        played += synth
+        assert pace.add(synth, audio, played) is None
+    assert pace.gap_s == 0.0
+    assert pace.worst_ratio < 0.5
+
+
+def test_synthesis_pace_names_a_slow_start():
+    """06:57 that morning: 17.4 s of silence before a 15.1 s block played."""
+    from voiceassistant.tts import _SynthesisPace
+
+    reason = _SynthesisPace().add(17.42, 15.13)
+    assert reason and "started late" in reason
+    assert "1.2x" in reason
+    # A sub-second phrase that starts a little late is not worth a balloon.
+    assert _SynthesisPace().add(0.6, 0.5) is None
+
+
+def test_synthesis_pace_names_an_audible_dry_spell():
+    from voiceassistant.tts import _SynthesisPace
+
+    pace = _SynthesisPace()
+    assert pace.add(0.3, 1.0) is None                 # starts playback
+    reason = pace.add(2.0, 1.0, played_s=2.0)         # 1 s queued, ready at 2 s
+    assert reason and "paused 1.0s" in reason
+    # After a pause the speakers resume from the late block, so the next
+    # deadline moves too: ready at 2.9 s against a 3.0 s dry point is on time.
+    assert pace.add(0.9, 1.0, played_s=2.9) is None
+    assert abs(pace.gap_s - 1.0) < 1e-9
+    # A sub-threshold dry spell (queue empty at 4.0 s, block ready at 4.2 s)
+    # is counted but not announced.
+    assert pace.add(1.3, 1.0, played_s=4.2) is None
+    assert abs(pace.gap_s - 1.2) < 1e-9
+
+
+def _local_engine_on_fake_clock(monkeypatch, synth_times, audio_s=1.0):
+    """A local engine whose Kokoro 'takes' synth_times[i] on a fake clock."""
+    import numpy as np
+    import voiceassistant.tts as tts
+
+    now = [0.0]
+    monkeypatch.setattr(
+        tts, "time",
+        types.SimpleNamespace(monotonic=lambda: now[0], sleep=lambda s: None),
+    )
+    eng = _engine()
+    eng._use_local = True
+    samples = int(audio_s * tts.LOCAL_PCM_SAMPLE_RATE)
+
+    class FakeKokoro:
+        def _prepare(self, text, voice, speed, lang, is_phonemes,
+                     sentence_pause, clause_pause):
+            return "style", "phonemes", [(f"p{i}", 0.1) for i in range(len(synth_times))]
+
+        def _create_batch(self, phonemes, voice_style, speed, trim, pause):
+            now[0] += synth_times[int(phonemes[1:])]
+            return np.zeros(samples, dtype=np.float32), None
+
+    eng._kokoro = FakeKokoro()
+    eng._time_stretch_local_audio = lambda s, factor: s
+    eng._start_vlc_pcm_stream = (
+        lambda stream, stop_event, progress: progress.append("started")
+    )
+    eng._wait_vlc_stream = lambda stream, stop_event: None
+    return eng
+
+
+def test_local_read_warns_once_when_synthesis_falls_behind(monkeypatch):
+    eng = _local_engine_on_fake_clock(monkeypatch, [0.3, 2.0, 2.0, 2.0])
+    warnings = []
+    eng.falling_behind.connect(warnings.append)
+    eng._speak_local("Four short phrases.", threading.Event(), [])
+
+    assert len(warnings) == 1, "one stuttering read raised more than one warning"
+    assert "paused" in warnings[0]
+    assert "CPU" in warnings[0], "the warning never names the cause"
+
+
+def test_healthy_local_read_raises_no_warning(monkeypatch):
+    eng = _local_engine_on_fake_clock(monkeypatch, [0.3, 0.3, 0.3])
+    warnings = []
+    eng.falling_behind.connect(warnings.append)
+    eng._speak_local("Three short phrases.", threading.Event(), [])
+    assert warnings == []
+
+
+def test_a_stopped_local_read_is_logged_as_stopped_not_complete(monkeypatch):
+    """A 167 s read stopped at 97 s used to log as 'complete'."""
+    import voiceassistant.tts as tts
+
+    lines = []
+    monkeypatch.setattr(tts.applog, "dbg", lines.append)
+    eng = _local_engine_on_fake_clock(monkeypatch, [0.3, 0.3])
+    eng._wait_vlc_stream = lambda stream, stop_event: stop_event.set()
+    eng._speak_local("Two phrases.", threading.Event(), [])
+
+    outcome = [line for line in lines if "local neural playback " in line
+               and "ready" not in line]
+    assert len(outcome) == 1
+    assert outcome[0].startswith("local neural playback stopped (blocks=2/2")
+
+
+def test_a_read_stopped_mid_synthesis_still_leaves_its_stats(monkeypatch):
+    """The stuttering reads the user gave up on used to log nothing at all."""
+    import voiceassistant.tts as tts
+
+    lines = []
+    monkeypatch.setattr(tts.applog, "dbg", lines.append)
+    stop_event = threading.Event()
+    eng = _local_engine_on_fake_clock(monkeypatch, [0.3, 2.0, 2.0])
+    original = eng._kokoro._create_batch
+
+    def stop_during_second_block(phonemes, *args):
+        result = original(phonemes, *args)
+        if phonemes == "p1":
+            stop_event.set()
+        return result
+
+    eng._kokoro._create_batch = stop_during_second_block
+    eng._speak_local("Three phrases.", stop_event, [])
+
+    outcome = [line for line in lines if line.startswith("local neural playback stopped")]
+    assert len(outcome) == 1, lines
+    assert "blocks=2/3" in outcome[0]
+    assert "est_gap=1.00s" in outcome[0]
+
+
+def test_kokoro_session_is_capped_and_does_not_spin(monkeypatch):
+    """ORT's default (one spinning worker per core) measured slowest here."""
+    import voiceassistant.tts as tts
+
+    sessions = []
+
+    class FakeOptions:
+        def __init__(self):
+            self.config = {}
+            self.intra_op_num_threads = 0
+
+        def add_session_config_entry(self, key, value):
+            self.config[key] = value
+
+    fake_ort = types.ModuleType("onnxruntime")
+    fake_ort.SessionOptions = FakeOptions
+    fake_ort.InferenceSession = (
+        lambda path, providers, sess_options: sessions.append(
+            (providers, sess_options)) or "session"
+    )
+    fake_kokoro = types.ModuleType("kokoro_onnx")
+    fake_kokoro.Kokoro = types.SimpleNamespace(
+        from_session=lambda session, voices: "kokoro"
+    )
+    monkeypatch.setitem(sys.modules, "onnxruntime", fake_ort)
+    monkeypatch.setitem(sys.modules, "kokoro_onnx", fake_kokoro)
+    monkeypatch.setattr(tts.os.path, "isfile", lambda path: True)
+
+    eng = _engine()
+    eng._kokoro = None
+    assert eng._load_kokoro() == "kokoro"
+
+    providers, options = sessions[0]
+    assert providers == ["CPUExecutionProvider"]
+    assert 1 <= options.intra_op_num_threads <= 8
+    assert options.config["session.intra_op.allow_spinning"] == "0"
+
+
+def test_falling_behind_log_and_warning_carry_no_text(monkeypatch):
+    """Same privacy rule as every other log line: counts, never payload."""
+    import voiceassistant.tts as tts
+
+    logged = []
+    monkeypatch.setattr(tts.applog, "dbg", logged.append)
+    monkeypatch.setattr(tts.applog, "info", logged.append)
+    eng = _local_engine_on_fake_clock(monkeypatch, [0.3, 2.0])
+    warnings = []
+    eng.falling_behind.connect(warnings.append)
+    secret = "Quarterly margin for the confidential launch."
+    eng._speak_local(secret, threading.Event(), [])
+
+    assert warnings
+    for line in logged + warnings:
+        assert "confidential" not in line and "margin" not in line
+
+
 def test_local_speed_is_honestly_clamped_to_measured_ceiling():
     from voiceassistant.tts import LOCAL_MAX_SPEED
 

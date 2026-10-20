@@ -398,6 +398,24 @@ selection never changes into SAPI; `pyttsx3` runs only when explicitly selected.
   experienced as skipped sections. `_PacedAudioStream` exposes a 250 ms lead and then
   meters bytes at 24 kHz mono s16 (**48,000 bytes/s**). The same passage completed in
   **45.218 s** (0.259 s from its PCM duration). Pacing waits must remain stop-aware.
+- **A starved CPU must be NAMED, not heard as stutter** (`tts._SynthesisPace`,
+  `falling_behind` -> `MainWindow._on_tts_falling_behind`). Kokoro runs on the CPU.
+  On 2026-10-20 a runaway DisplayFusion (1,400+ threads, 20-33 of 32 cores, ~98%
+  kernel time) made blocks take **1.1-1.6x** their own playing time against ~0.3x
+  normally; the stream ran dry between batches and the report was only "it is
+  having a hard time reading." Of 970 logged blocks, 888 generated under 0.5x and
+  EVERY block at or over 1.0x fell inside a contention episode, so the triggers are
+  a first block slower than real time and an estimated dry spell of >= 0.5 s. One
+  warning per read, one tray balloon per 10 minutes. It is deliberately not
+  `_on_degraded`, which marks the Whisper label until restart. Raising our process
+  priority was measured and did NOT help against kernel-time thrash; the real fix
+  for that episode was outside the app. Diagnose it from `debug.log`: compare each
+  block's `synth=` to its `audio=`. The end-of-read line says `stopped` or
+  `complete` honestly (it used to say "complete" for a read the user stopped, which
+  looked like VLC ending 70 s early) and is written even when the stop came
+  mid-synthesis. The ONNX session runs **8 intra-op threads with spinning off**:
+  ORT's default (one spinning worker per physical core) measured slowest here,
+  0.50 vs 0.37 mean synth-per-audio-second under load.
 - **A failed read-aloud says why; it never improvises a screen read**
   (`_on_read_text_ready`). Tier 3 used to fire on ANY empty capture: OCR a
   600x300 box around the **mouse pointer** and speak whatever landed in it. The

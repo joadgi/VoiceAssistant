@@ -241,6 +241,56 @@ def test_empty_selection_never_reads_the_screen_aloud(main_window, monkeypatch):
         assert "ctrl+shift+s" in main_window._read_failure_message(source), source
 
 
+class _BalloonTray:
+    def __init__(self, broken=False):
+        self.messages = []
+        self.broken = broken
+
+    def showMessage(self, title, body, icon, msecs):
+        if self.broken:
+            raise OSError("no tray")
+        self.messages.append((title, body))
+
+
+def test_tts_falling_behind_reaches_the_tray_once_per_episode(main_window):
+    """2026-10-20: a starved CPU was heard as stutter with no cause given."""
+    w = main_window
+    w.tray = _BalloonTray()
+    msg = "Read-aloud paused 2.6s waiting for speech to be generated. The CPU..."
+
+    w.tts.falling_behind.emit(msg)
+    w.tts.falling_behind.emit(msg)        # the next read under the same load
+
+    assert len(w.tray.messages) == 1, "one CPU episode raised a balloon per read"
+    assert "keep up" in w.tray.messages[0][0]
+    assert w.tray.messages[0][1] == msg
+    assert w.status_bar.currentMessage() == msg
+
+    # A later episode is news again.
+    w._tts_slow_notified_at -= w.TTS_SLOW_NOTIFY_INTERVAL_S + 1
+    w.tts.falling_behind.emit(msg)
+    assert len(w.tray.messages) == 2
+
+
+def test_tts_falling_behind_does_not_mark_whisper_degraded(main_window):
+    """Not _on_degraded: that label means the MODEL is degraded until restart."""
+    w = main_window
+    w.tray = _BalloonTray()
+    before = w.label_model_status.text()
+    w.tts.falling_behind.emit("Read-aloud started late: ...")
+    assert w.label_model_status.text() == before
+    assert "DEGRADED" not in w.label_model_status.text()
+
+
+def test_a_failed_slow_tts_balloon_does_not_start_the_quiet_period(main_window):
+    w = main_window
+    w.tray = _BalloonTray(broken=True)
+    w.tts.falling_behind.emit("Read-aloud paused 1.0s ...")   # must not raise
+    w.tray = _BalloonTray()
+    w.tts.falling_behind.emit("Read-aloud paused 1.0s ...")
+    assert len(w.tray.messages) == 1, "the one balloon that matters was eaten"
+
+
 # ---------------------------------------------------------------------------
 # The pill key-CAPTURE flow: pressing keys on a HotkeyCaptureWidget must
 # translate Qt key events into the right combo string (the literal
