@@ -806,6 +806,12 @@ All are editable inline — click a hotkey pill and press your combo (single key
   **279 lines** of `simulated: no capture device` / `worker 'test' job failed` into
   the live `debug.log` — the file the user is told to read when dictation misbehaves.
   Test noise in a diagnostic log is worse than no log at all.
+  **The redirect runs at SESSION scope too.** pytest builds `scope="module"`
+  fixtures BEFORE function-scoped ones, so the read-aloud gate's module fixture
+  loaded Kokoro against the REAL paths and logged "local neural TTS ready" into the
+  live `debug.log` (found 2026-10-20; 19 module/class fixtures exist). The guards'
+  meta-tests live in `tests/test_runtime_isolation.py`. They used to sit in
+  `conftest.py`, which pytest never collects, so they had never run once.
 - **`crash.log` may contain `Windows fatal exception: code 0x8001010d`**
   (`RPC_E_CANTCALLOUT_ININPUTSYNCCALL`). These are FIRST-CHANCE COM exceptions that
   faulthandler records and COM then handles internally — the app keeps running, and
