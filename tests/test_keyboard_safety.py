@@ -576,4 +576,83 @@ class TestModifierAliasedKeysAreRejected:
         assert cleaned["hotkey_record"] not in ("pause", "right ctrl", "right alt")
         assert cleaned["hotkey_screen_read"] not in ("pause", "right ctrl", "right alt")
         assert cleaned["hotkey_read_aloud"] == "scroll lock"
-        assert len(set(cleaned.values())) == 3, "two actions ended up on one binding"
+        assert len(set(cleaned.values())) == len(cleaned), "two actions ended up on one binding"
+
+
+# --------------------------------------------------------------------------- #
+# Pause-reading: a chord that only claims its key while something is read
+# --------------------------------------------------------------------------- #
+P = 25
+PAUSE_KEYS = type("K", (Keys,), {"codes": dict(Keys.codes, p=(P,))})
+
+
+def _pause_hook(enabled):
+    fired = []
+    hook = ChordHotkey("ctrl+shift+p", lambda: fired.append(1) or True,
+                       PAUSE_KEYS, enabled=enabled)
+    return hook, fired
+
+
+def test_pause_chord_passes_through_when_nothing_is_being_read():
+    """Ctrl+Shift+P is VS Code's command palette: outside a read it must reach
+    the focused app exactly as if the app were not running."""
+    hook, fired = _pause_hook(lambda: False)
+    for edge in (("down", 29), ("down", 42), ("down", P), ("down", P),
+                 ("up", P), ("up", 42), ("up", 29)):
+        assert hook(event(*edge)) is True, edge
+    assert fired == []
+    assert not hook._blocked
+
+
+def test_pause_chord_is_consumed_as_a_pair_while_reading():
+    hook, fired = _pause_hook(lambda: True)
+    assert hook(event("down", 29)) is True
+    assert hook(event("down", 42)) is True
+    assert hook(event("down", P)) is False
+    assert hook(event("down", P)) is False       # autorepeat stays ours
+    assert hook(event("up", P)) is False
+    assert fired == [1]
+
+
+def test_a_press_that_passed_through_is_never_claimed_later():
+    """Reading starts while P is held: an autorepeat must not fire and its
+    key-up must not be swallowed, or the app sees P down and never P up."""
+    reading = [False]
+    hook, fired = _pause_hook(lambda: reading[0])
+    hook(event("down", 29))
+    hook(event("down", 42))
+    assert hook(event("down", P)) is True
+    reading[0] = True
+    assert hook(event("down", P)) is True        # autorepeat after reading began
+    assert hook(event("up", P)) is True
+    assert fired == []
+    # The NEXT press is judged afresh.
+    assert hook(event("down", P)) is False
+    assert hook(event("up", P)) is False
+    assert fired == [1]
+
+
+def test_a_claimed_press_keeps_its_key_up_when_reading_ends():
+    """The read finishes between P-down and P-up: the up must still be consumed
+    so the app never receives a key-up for a key-down it never saw."""
+    reading = [True]
+    hook, fired = _pause_hook(lambda: reading[0])
+    hook(event("down", 29))
+    hook(event("down", 42))
+    assert hook(event("down", P)) is False
+    reading[0] = False
+    assert hook(event("up", P)) is False
+    assert fired == [1]
+
+
+def test_an_enabled_check_that_raises_lets_the_keys_through():
+    def broken():
+        raise RuntimeError("engine gone")
+
+    hook, fired = _pause_hook(broken)
+    hook(event("down", 29))
+    hook(event("down", 42))
+    assert hook(event("down", P)) is True
+    assert hook(event("up", P)) is True
+    assert fired == []
+    assert hook.last_error == "engine gone"

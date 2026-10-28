@@ -59,7 +59,7 @@ class HotkeyCaptureWidget(QFrame):
 
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setMinimumWidth(160)
+        self.setMinimumWidth(theme.px(110))   # a floor; most bindings are wider
 
         lay = QHBoxLayout(self)
         lay.setContentsMargins(12, 6, 12, 6)
@@ -107,6 +107,7 @@ class HotkeyCaptureWidget(QFrame):
 
     def rescale(self):
         """Re-apply the current style at the current zoom (sizes come from theme.px)."""
+        self.setMinimumWidth(theme.px(110))
         if self._capturing:
             self._set_capture_style()
         else:

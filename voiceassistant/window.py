@@ -28,8 +28,8 @@ from .chord_hotkey import ChordHotkey
 from .inline_typist import block_reason, stream_target
 from .live_preview import LivePreview
 from .config import (
-    Config, DEFAULTS, MODIFIER_KEYS, normalize_hotkey, should_suppress_hotkey,
-    validate_hotkey,
+    Config, DEFAULTS, HOTKEY_KEYS, MODIFIER_KEYS, normalize_hotkey,
+    should_suppress_hotkey, validate_hotkey,
 )
 from .ocr import OCREngine, RegionSelector, ScreenCapture
 from .paste import INLINE_NONE, INLINE_PARTIAL, INLINE_TYPED, Paster
@@ -83,6 +83,7 @@ class MainWindow(QMainWindow):
     _sig_hotkey_release = Signal()
     _sig_hotkey_screen = Signal()
     _sig_hotkey_read = Signal()
+    _sig_hotkey_pause = Signal()
     # Worker → GUI marshalling
     _sig_read_text_ready = Signal(int, str, str)  # (request generation, text, source tier)
     _sig_paste_done = Signal(bool, str)
@@ -95,7 +96,9 @@ class MainWindow(QMainWindow):
         applog.set_debug(self.config.get("debug_logging", False))
         self._entry_script = entry_script
         self.setWindowTitle("Voice Assistant")
-        self.setMinimumSize(720, 520)
+        # No fixed minimum: the layout's own minimum applies, so the window can
+        # never be dragged narrower than its controls (a fixed 720 px let them
+        # overlap), and zooming in grows it instead of crushing the rows.
         self.resize(820, 600)
 
         # --- Engines ---
@@ -197,6 +200,7 @@ class MainWindow(QMainWindow):
         self._sig_hotkey_release.connect(self._hotkey_release_handler)
         self._sig_hotkey_screen.connect(self._on_cursor_read)
         self._sig_hotkey_read.connect(self._on_read_aloud_toggle)
+        self._sig_hotkey_pause.connect(self._on_pause_read_toggle)
         self._sig_read_text_ready.connect(self._on_read_text_ready)
         self._sig_paste_done.connect(self._on_paste_done)
         self._sig_inline_done.connect(self._on_inline_done)
@@ -343,6 +347,10 @@ class MainWindow(QMainWindow):
 
         self.hk_dictate = HotkeyCaptureWidget("Dictate", self.config["hotkey_record"])
         self.hk_read = HotkeyCaptureWidget("Read", self.config["hotkey_read_aloud"])
+        self.hk_pause = HotkeyCaptureWidget("Pause", self.config["hotkey_pause_read"])
+        self.hk_pause.setToolTip("Pause or resume read-aloud. Only taken from other "
+                                 "apps while something is being read. Click, then "
+                                 "press the keys you want.")
         self.hk_ocr = HotkeyCaptureWidget("OCR", self.config["hotkey_screen_read"])
 
         self.hk_dictate.hotkey_changed.connect(
@@ -351,26 +359,30 @@ class MainWindow(QMainWindow):
         self.hk_read.hotkey_changed.connect(
             lambda c: self._save_hotkey("hotkey_read_aloud", "Read", c)
         )
+        self.hk_pause.hotkey_changed.connect(
+            lambda c: self._save_hotkey("hotkey_pause_read", "Pause", c)
+        )
         self.hk_ocr.hotkey_changed.connect(
             lambda c: self._save_hotkey("hotkey_screen_read", "OCR", c)
         )
         hk_row.addWidget(self.hk_dictate)
         hk_row.addWidget(self.hk_read)
+        hk_row.addWidget(self.hk_pause)
         hk_row.addWidget(self.hk_ocr)
-        for hk in (self.hk_dictate, self.hk_read, self.hk_ocr):
-            self._z(lambda hk=hk: (hk.setMinimumWidth(theme.px(160)),
-                                   hk.layout().setContentsMargins(*map(theme.px, (12, 6, 12, 6))),
+        # Chips size to their own text, like Bridge's filter chips: a fixed
+        # 160 px each was what pushed this row past the window at 100%.
+        for hk in (self.hk_dictate, self.hk_read, self.hk_pause, self.hk_ocr):
+            if not hk.toolTip():
+                hk.setToolTip("Click, then press the keys you want")
+            self._z(lambda hk=hk: (hk.layout().setContentsMargins(*map(theme.px, (12, 6, 12, 6))),
                                    hk.rescale()))
 
         hk_reset = QPushButton("Reset")
         hk_reset.setProperty("variant", "ghost")
         hk_reset.setProperty("size", "sm")
-        hk_reset.setToolTip("Put all three hotkeys back to their defaults")
+        hk_reset.setToolTip("Put every hotkey back to its default")
         hk_reset.clicked.connect(self._reset_hotkeys_to_defaults)
         hk_row.addWidget(hk_reset)
-        hk_hint = QLabel("click one, then press your keys")
-        hk_hint.setProperty("role", "hint")
-        hk_row.addWidget(hk_hint)
         hk_row.addStretch()
         body_lay.addLayout(hk_row)
 
@@ -460,7 +472,16 @@ class MainWindow(QMainWindow):
 
         playback_lay.addWidget(QLabel("Voice"))
         self.voice_combo = QComboBox()
-        self._z(lambda: self.voice_combo.setMinimumWidth(theme.px(230)))
+        # Sized by a minimum LENGTH, not its longest entry: the default sized the
+        # closed box to "[Online Neural] Christopher (Male, US) - News" (350 px)
+        # and that alone pushed the row past the window. The open list still
+        # shows every name in full.
+        self.voice_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.voice_combo.setMinimumContentsLength(16)
+        self._z(lambda: (self.voice_combo.setMinimumWidth(theme.px(190)),
+                         self.voice_combo.view().setMinimumWidth(
+                             self.voice_combo.view().sizeHintForColumn(0) + theme.px(24))))
         voices = self.tts.get_voices()
         for vid, vname in voices:
             self.voice_combo.addItem(vname, vid)
@@ -494,7 +515,20 @@ class MainWindow(QMainWindow):
 
         self.speed_apply_label = QLabel("applies to next read")
         self.speed_apply_label.setProperty("role", "hint")
+        self.speed_apply_label.setWordWrap(True)   # wraps rather than widening the row
+        self._z(lambda: self.speed_apply_label.setMinimumWidth(theme.px(96)))  # <= 2 lines
         playback_lay.addWidget(self.speed_apply_label)
+
+        # Enabled only while a read's audio is playing: the lead-in while the
+        # first block is generated has nothing to hold yet.
+        self.btn_pause_read = QPushButton("Pause")
+        self.btn_pause_read.setProperty("variant", "outline")
+        self.btn_pause_read.setEnabled(False)
+        self._z(lambda: self.btn_pause_read.setMinimumWidth(theme.px(84)))
+        playback_lay.addWidget(self.btn_pause_read)
+        # The tray menu carries the same control (added in _setup_tray).
+        self.act_pause_read = QAction("Pause Reading", self)
+        self.act_pause_read.setEnabled(False)
 
         self.btn_speak_toggle = QPushButton("Speak")
         self.btn_speak_toggle.setObjectName("btn_speak")
@@ -597,6 +631,8 @@ class MainWindow(QMainWindow):
         self.btn_copy.clicked.connect(self._on_copy)
         self.btn_clear.clicked.connect(self._on_clear)
         self.btn_speak_toggle.clicked.connect(self._on_speak_toggle)
+        self.btn_pause_read.clicked.connect(self._on_pause_read_toggle)
+        self.act_pause_read.triggered.connect(self._on_pause_read_toggle)
         self.btn_settings.clicked.connect(self._on_settings)
 
         self.voice_combo.currentIndexChanged.connect(self._on_voice_change)
@@ -634,6 +670,8 @@ class MainWindow(QMainWindow):
 
         self.tts.speaking_started.connect(self._on_tts_started)
         self.tts.speaking_finished.connect(self._on_tts_finished)
+        self.tts.playback_started.connect(self._on_tts_playback_started)
+        self.tts.paused_changed.connect(self._on_tts_paused_changed)
         self.tts.status.connect(self._update_status)
         self.tts.error.connect(self._on_error)
         self.tts.falling_behind.connect(self._on_tts_falling_behind)
@@ -664,6 +702,7 @@ class MainWindow(QMainWindow):
             winapi.clear_caps_lock()
         hk_screen = self._clean_hotkey("hotkey_screen_read")
         hk_read = self._clean_hotkey("hotkey_read_aloud")
+        hk_pause = self._clean_hotkey("hotkey_pause_read")
         errors = []
 
         try:
@@ -739,14 +778,21 @@ class MainWindow(QMainWindow):
         # physically held. Without it a single dropped Ctrl key-up made every
         # later Alt press fire read-aloud (measured with the old ctrl+alt
         # chord) and could swallow a keystroke on a normal chord.
-        for label, combo, emit, attr in (
-            ("Read aloud", hk_read, self._sig_hotkey_read.emit, "_read_hotkey"),
-            ("Screen", hk_screen, self._sig_hotkey_screen.emit, "_screen_hotkey"),
+        #
+        # Pause only claims its key while a read is running (`enabled`), so the
+        # same chord keeps working in other apps the rest of the time. The check
+        # runs inside the hook: a plain attribute read, nothing more.
+        for label, combo, emit, attr, enabled in (
+            ("Read aloud", hk_read, self._sig_hotkey_read.emit, "_read_hotkey", None),
+            ("Pause reading", hk_pause, self._sig_hotkey_pause.emit, "_pause_hotkey",
+             lambda: self.tts.is_speaking),
+            ("Screen", hk_screen, self._sig_hotkey_screen.emit, "_screen_hotkey", None),
         ):
             try:
                 matcher = ChordHotkey(
                     combo, emit, kb,
-                    released_probe=winapi.released_modifier_scan_codes)
+                    released_probe=winapi.released_modifier_scan_codes,
+                    enabled=enabled)
                 setattr(self, attr, matcher)
                 kb.hook(matcher, suppress=True)
             except Exception as e:
@@ -755,7 +801,8 @@ class MainWindow(QMainWindow):
         if errors:
             self._update_status("Hotkey errors: " + "; ".join(errors))
         else:
-            self._update_status(f"Hotkeys: {hk_record}=dictate  {hk_read}=read selection  {hk_screen}=OCR")
+            self._update_status(f"Hotkeys: {hk_record}=dictate  {hk_read}=read selection  "
+                                f"{hk_pause}=pause reading  {hk_screen}=OCR")
             applog.info("keyboard safety active: modifier passthrough and checked input batches")
 
     def _clean_hotkey(self, config_key):
@@ -783,8 +830,7 @@ class MainWindow(QMainWindow):
                 f"{label}: use a single key like F9 or Caps Lock, or a combo like Ctrl+Shift+F9"
             )
             return False
-        other_keys = [k for k in ("hotkey_record", "hotkey_read_aloud", "hotkey_screen_read")
-                      if k != config_key]
+        other_keys = [k for k in HOTKEY_KEYS if k != config_key]
         if any(normalize_hotkey(self.config[k]) == combo for k in other_keys):
             self._update_status(f"{combo} is already used by another hotkey")
             return False
@@ -912,9 +958,16 @@ class MainWindow(QMainWindow):
             "Stop recording" if self.recorder.is_recording else "Dictate", self)
         act_dictate.triggered.connect(self._on_indicator_clicked)
         menu.addAction(act_dictate)
-        act_read = QAction("Read selection aloud", self)
+        # While a read is running the same toggle STOPS it, so say so.
+        act_read = QAction(
+            "Stop reading" if self.tts.is_speaking else "Read selection aloud", self)
         act_read.triggered.connect(self._on_read_aloud_toggle)
         menu.addAction(act_read)
+        if self.tts.can_pause:
+            act_pause_read = QAction(
+                "Resume reading" if self.tts.is_paused else "Pause reading", self)
+            act_pause_read.triggered.connect(self._on_pause_read_toggle)
+            menu.addAction(act_pause_read)
         menu.addSeparator()
         act_pause = QAction("Pause dictation", self)
         act_pause.setCheckable(True)
@@ -1564,6 +1617,38 @@ class MainWindow(QMainWindow):
         self.voice_combo.setEnabled(True)
         self.speed_slider.setEnabled(True)
         self.speed_apply_label.setText("applies to next read")
+        self._set_pause_controls(enabled=False, paused=False)
+
+    @Slot()
+    def _on_tts_playback_started(self):
+        if self.tts.is_speaking:
+            self._set_pause_controls(enabled=True, paused=self.tts.is_paused)
+
+    @Slot(bool)
+    def _on_tts_paused_changed(self, paused):
+        if not self.tts.is_speaking:
+            return  # a stop already reset the controls
+        self._set_pause_controls(enabled=True, paused=paused)
+        self._update_status("Read aloud paused" if paused else "Read aloud resumed")
+
+    def _set_pause_controls(self, enabled, paused):
+        hotkey = self.config.get("hotkey_pause_read", "")
+        self.btn_pause_read.setEnabled(enabled)
+        self.btn_pause_read.setText("Resume" if paused else "Pause")
+        self.btn_pause_read.setToolTip(
+            f"{'Resume' if paused else 'Pause'} read-aloud ({hotkey})")
+        self.act_pause_read.setEnabled(enabled)
+        self.act_pause_read.setText("Resume Reading" if paused else "Pause Reading")
+
+    @Slot()
+    def _on_pause_read_toggle(self):
+        """Pause or resume read-aloud: button, tray, pill menu and hotkey."""
+        if self.tts.toggle_pause():
+            return  # paused_changed updates the controls
+        if self.tts.is_speaking:
+            self._update_status("Read aloud is still starting - pause it once it is speaking")
+        else:
+            self._update_status("Nothing is being read aloud")
 
     # -----------------------------------------------------------------------
     # Read-aloud (selection) flow
@@ -1676,11 +1761,11 @@ class MainWindow(QMainWindow):
     def _reset_hotkeys_to_defaults(self):
         self._read_gen += 1
         self._read_in_flight = False
-        self.config.set("hotkey_record", DEFAULTS["hotkey_record"])
-        self.config.set("hotkey_read_aloud", DEFAULTS["hotkey_read_aloud"])
-        self.config.set("hotkey_screen_read", DEFAULTS["hotkey_screen_read"])
+        for key in HOTKEY_KEYS:
+            self.config.set(key, DEFAULTS[key])
         self.hk_dictate.set_hotkey(DEFAULTS["hotkey_record"])
         self.hk_read.set_hotkey(DEFAULTS["hotkey_read_aloud"])
+        self.hk_pause.set_hotkey(DEFAULTS["hotkey_pause_read"])
         self.hk_ocr.set_hotkey(DEFAULTS["hotkey_screen_read"])
         kb.unhook_all()
         self._setup_hotkeys()
@@ -1709,13 +1794,14 @@ class MainWindow(QMainWindow):
 
     def _update_dictation_hint(self):
         hk = self.config["hotkey_record"]
+        change = "  ·  click a hotkey above to change it"
         if self._dictation_active:
             self.dictation_hint.setText(
-                f"Hold {hk} and speak — release to paste where your cursor is"
+                f"Hold {hk} and speak — release to paste where your cursor is{change}"
             )
         else:
             self.dictation_hint.setText(
-                "Text goes to the panel below only"
+                f"Text goes to the panel below only{change}"
             )
 
     @Slot()
@@ -1900,6 +1986,7 @@ class MainWindow(QMainWindow):
         caps_action = QAction("Turn Caps Lock off", self)
         caps_action.triggered.connect(self._on_clear_caps)
         menu.addAction(caps_action)
+        menu.addAction(self.act_pause_read)
         stop_action = QAction("Stop Reading", self)
         stop_action.triggered.connect(self.tts.stop)
         menu.addAction(stop_action)

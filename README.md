@@ -16,10 +16,11 @@ SAPI locally.
 - **Your own vocabulary** — tell it the words you actually say (product names, acronyms, systems) in Settings → Transcription and it stops mishearing them. Measured on this project's jargon: 8 of 13 terms recognised without it, 13 of 13 with it. A vocabulary also makes Whisper invent text on silence, so the app re-checks any short transcript with the vocabulary switched off and drops anything the model cannot hear on its own. Empty by default.
 - **Inline typing (optional)** — the settled words can also be typed straight into the window you are dictating into, so text appears as you speak instead of arriving all at once. When the accurate transcription lands, the app corrects what it typed in place rather than pasting a second copy. It only ever deletes characters it typed itself, and it refuses to run unless your dictate hotkey is a plain key (Caps Lock, Scroll Lock, F9) — with a modifier combo the typed characters would reach the app as shortcuts. It never types into a terminal. Off by default; enable it in Settings → Transcription.
 - **Read highlighted text aloud** — highlight text in any app and hear it through a local neural voice, with optional Microsoft online and Windows SAPI choices.
+- **Pause and resume read-aloud** — **Pause** in the Playback card, the tray menu, the pill's right-click menu, or the Pause hotkey (`Ctrl+Shift+P` by default) holds the voice on the word it was saying; press again to carry on. The Pause hotkey is only taken while something is being read, so the rest of the time `Ctrl+Shift+P` still reaches your apps.
 - **OCR at cursor** — capture on-screen text from images, PDFs, error dialogs, or anything else you can't select, and have it read aloud.
 - **Fast local speed control** — Michael and the other local voices generate at an intelligible rate, then pitch-preserving tempo compression supplies playback from 0.5x–2.6x. One speed is fixed for each press of Speak; the Voice and Speed controls lock during that read, then slider changes apply to the next read.
 - **Local and online neural voices** — Michael, Adam, Eric, Liam, Heart, and Sarah run locally; Microsoft voices remain available as clearly marked online choices.
-- **Fully customizable hotkeys** — every hotkey (Dictate, Read, OCR) is yours to change: click any hotkey pill on the main window, then press a **single key (like F9), a combo, or even a modifier-only combo (like Ctrl+Alt)** for push-to-talk. Nothing is hardcoded. (The `Fn` key can't be bound — it's handled in keyboard firmware and never reaches Windows.)
+- **Fully customizable hotkeys** — every hotkey (Dictate, Read, Pause, OCR) is yours to change: click any hotkey pill on the main window, then press a **single key (like F9), a combo, or even a modifier-only combo (like Ctrl+Alt)** for push-to-talk. Nothing is hardcoded. (The `Fn` key can't be bound — it's handled in keyboard firmware and never reaches Windows.)
 - **Local Whisper transcription** — `faster-whisper` on NVIDIA GPU (CUDA) with CPU fallback.
 - **Bridge look, with zoom** — the window uses the same design system as Bridge (dark navy, cyan accents, the Inter typeface, which ships with the app). Use **− / +** in the header, or **Ctrl+−**, **Ctrl+=** and **Ctrl+0**, to make the whole interface smaller or larger (70%–140%), including the floating dictation pill. It changes live and is remembered.
 
@@ -159,6 +160,7 @@ VoiceAssistant/
 |---|---|---|
 | Dictate | `Ctrl+Shift+R` | Hold to record, release to transcribe + paste |
 | Read Selection | `Ctrl+Shift+T` | Press once to read highlighted text, press again to stop |
+| Pause Reading | `Ctrl+Shift+P` | Pause the current read, press again to resume (only taken while reading) |
 | OCR at Cursor | `Ctrl+Shift+S` | Capture 600x300 region around cursor, OCR, read aloud |
 
 All hotkeys are customizable inline on the main window — click the pill, press your combo.

@@ -245,6 +245,7 @@ class _StreamingAudioBuffer:
         self._head_offset = 0
         self._available = 0
         self._done = False
+        self._eof_delivered = False
         self._error = None
         self._first_audio_at = None
         self._last_audio_at = None
@@ -265,6 +266,12 @@ class _StreamingAudioBuffer:
     def starvation_stats(self):
         with self._condition:
             return self._starvation_count, self._max_starvation_s
+
+    @property
+    def eof_delivered(self):
+        """True once the consumer has been handed the end of the stream."""
+        with self._condition:
+            return self._eof_delivered
 
     def write(self, data):
         if not data:
@@ -337,7 +344,10 @@ class _StreamingAudioBuffer:
                 if self._cancelled():
                     return None
                 if self._done:
-                    return None if self._error is not None else b""
+                    if self._error is not None:
+                        return None
+                    self._eof_delivered = True
+                    return b""
                 if waited_from is None:
                     waited_from = time.monotonic()
                 self._condition.wait(0.05)
@@ -377,6 +387,13 @@ class _PacedAudioStream:
     This makes Ended line up with what has actually reached the speakers. The
     waiter is stop-aware; test clocks/waiters are injectable so the duration
     contract can be pinned without making the suite sleep in real time.
+
+    The clock deliberately keeps running through a PAUSE. Freezing it looks
+    tidier and was measured worse: VLC shifts its own clock by the pause, so
+    data that also arrived late counted the pause twice and VLC sat silent
+    after resume for about as long as it had been paused (1.8 s after a 2 s
+    pause). Left running, VLC buffers ahead while paused -- 10 s during a 10 s
+    pause, then played every sample at 1x with nothing skipped.
     """
 
     def __init__(
@@ -493,6 +510,74 @@ class _SynthesisPace:
         return None
 
 
+class _PauseState:
+    """Pause bookkeeping for ONE utterance: the GUI thread writes, the worker reads.
+
+    ``backend`` is set once audio is actually playing ("vlc" or "sapi"); before
+    that there is nothing to hold. ``was_paused`` outlives resume because LibVLC
+    never reports Ended for a raw callback stream that was really paused -- 12
+    of 12 paused PCM runs on 2026-10-28 stayed Playing forever, across the
+    mmdevice, directsound and waveout outputs and both ways of resuming -- so
+    such a read's end is detected from its own playback clock instead (see
+    ``_wait_vlc_stream``). ``seconds()`` is the time spent paused, which any
+    "how long has this been playing" arithmetic must leave out.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._since = None
+        self._total = 0.0
+        self.backend = None
+        self.was_paused = False
+
+    @property
+    def live(self):
+        return self.backend is not None
+
+    @property
+    def paused(self):
+        return self._since is not None
+
+    def pause(self):
+        with self._lock:
+            if self._since is not None:
+                return False
+            self._since = time.monotonic()
+            self.was_paused = True
+            return True
+
+    def resume(self):
+        with self._lock:
+            if self._since is None:
+                return False
+            self._total += time.monotonic() - self._since
+            self._since = None
+            return True
+
+    def seconds(self):
+        with self._lock:
+            ongoing = time.monotonic() - self._since if self._since is not None else 0.0
+            return self._total + ongoing
+
+
+class _UtteranceStop(threading.Event):
+    """The stop event of one utterance, carrying that utterance's pause state.
+
+    Every worker-side function already receives the stop event, and each
+    utterance has exactly one, so the pause state rides on it rather than on
+    the engine: a job still unwinding can never see the NEXT read's state.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.pause = _PauseState()
+
+
+def _paused_seconds(stop_event):
+    state = getattr(stop_event, "pause", None)
+    return state.seconds() if state is not None else 0.0
+
+
 class TTSEngine(QObject):
     """Local/online neural TTS plus an explicit Windows SAPI option."""
 
@@ -503,6 +588,9 @@ class TTSEngine(QObject):
     # Local synthesis fell behind playback (see _SynthesisPace). At most once
     # per utterance. Not an error: the read continues, just with pauses.
     falling_behind = Signal(str)
+    # Audio of the current utterance is actually playing, so it can pause.
+    playback_started = Signal()
+    paused_changed = Signal(bool)
     FIRST_AUDIO_TIMEOUT = 6.0   # chosen neural voice gets a bounded startup window
     SYNTHESIS_STALL_TIMEOUT = 10.0  # no more bytes while buffering -> honest error
     START_BUFFER_PLAY_SECONDS = 3.0  # long reads: absorb jitter at high playback speeds
@@ -510,6 +598,11 @@ class TTSEngine(QObject):
     SHORT_TEXT_MAX_CHARS = 600
     NEURAL_RETRIES = 1          # one cheap neural retry for a fast service hiccup
     RETRY_PAUSE_S = 0.4
+    # A read that was paused ends when its stream is exhausted and VLC's media
+    # time has stood still this long (VLC never says Ended for it; see
+    # _PauseState). Measured: get_time() advances every ~0.25-0.3 s while
+    # audio plays, and an unpaused read reaches Ended ~0.45 s after EOF.
+    PAUSED_END_STALL_S = 0.6
 
     def __init__(self, volume=1.0):
         super().__init__()
@@ -570,6 +663,17 @@ class TTSEngine(QObject):
     @property
     def is_speaking(self):
         return self._speaking
+
+    @property
+    def is_paused(self):
+        state = getattr(self._active_stop, "pause", None)
+        return bool(self._speaking and state is not None and state.paused)
+
+    @property
+    def can_pause(self):
+        """True while the current read's audio is playing or paused."""
+        state = getattr(self._active_stop, "pause", None)
+        return bool(self._speaking and state is not None and state.live)
 
     def get_voices(self):
         """Return local neural, online neural, then explicit offline voices."""
@@ -670,7 +774,7 @@ class TTSEngine(QObject):
             )
         self.stop()  # no-op when idle
         self._gen += 1
-        stop_event = threading.Event()
+        stop_event = _UtteranceStop()
         self._active_stop = stop_event
         self._speaking = True
         self._worker.submit(self._speak_job, spoken_text, self._gen, stop_event)
@@ -683,8 +787,9 @@ class TTSEngine(QObject):
         shut up. Runs on the GUI thread — every call here is non-blocking or
         bounded to a couple of milliseconds.
         """
-        if self._active_stop is not None:
-            self._active_stop.set()
+        active = self._active_stop
+        if active is not None:
+            active.set()
         with self._async_lock:
             loop = self._active_async_loop
             task = self._active_async_task
@@ -696,6 +801,92 @@ class TTSEngine(QObject):
         self._vlc_stop()
         self._stop_offline()
         self._speaking = False
+        self._release_pause(active)
+
+    # ------------------------------------------------------------------ #
+    # Pause / resume
+    #
+    # Each backend's OWN pause holds the audio exactly where it is: VLC's
+    # set_pause (silent within ~50 ms, measured) or SAPI's SpVoice.Pause. A
+    # read can only pause once its audio is playing (`playback_started`); the
+    # lead-in while the first block is generated has nothing to hold yet.
+    # Stop still works from a paused read, and a stopped or finished read is
+    # never left paused.
+    # ------------------------------------------------------------------ #
+    def pause(self):
+        """Hold the current read where it is. Returns True if it paused."""
+        stop = self._active_stop
+        state = getattr(stop, "pause", None)
+        if (state is None or stop.is_set() or not self._speaking
+                or not state.live or state.paused):
+            return False
+        if not self._hold(state.backend, True):
+            return False
+        state.pause()
+        applog.dbg(f"read-aloud paused ({state.backend})")
+        self.paused_changed.emit(True)
+        return True
+
+    def resume(self):
+        """Continue a paused read. Returns True if it resumed."""
+        stop = self._active_stop
+        state = getattr(stop, "pause", None)
+        if state is None or not state.paused or not self._hold(state.backend, False):
+            return False
+        state.resume()
+        applog.dbg(f"read-aloud resumed (paused {state.seconds():.1f}s in total)")
+        self.paused_changed.emit(False)
+        return True
+
+    def toggle_pause(self):
+        """Pause, or resume a paused read. Returns True if anything changed."""
+        return self.resume() if self.is_paused else self.pause()
+
+    def _hold(self, backend, paused):
+        """Pause or resume the backend that is playing. False if it refused."""
+        try:
+            if backend == "sapi":
+                voice = self._sapi_voice()
+                if voice is None:
+                    return False
+                if paused:
+                    voice.Pause()
+                else:
+                    voice.Resume()
+                return True
+            with self._vlc_lock:
+                if self._vlc_player is None:
+                    return False
+                self._vlc_player.set_pause(1 if paused else 0)
+            return True
+        except Exception:
+            applog.exception("read-aloud pause/resume failed")
+            return False
+
+    def _sapi_voice(self):
+        """pyttsx3's underlying SAPI SpVoice, or None when the driver hides it."""
+        driver = getattr(getattr(self._pyttsx_engine, "proxy", None), "_driver", None)
+        return getattr(driver, "_tts", None)
+
+    def _release_pause(self, stop_event):
+        """A stopped or finished read must not stay paused. SAPI keeps a pause
+        COUNT on the one shared voice: purged but left paused, the next
+        offline read would never make a sound."""
+        state = getattr(stop_event, "pause", None)
+        if state is None or not state.resume():
+            return
+        if state.backend == "sapi":
+            self._hold("sapi", False)
+        self.paused_changed.emit(False)
+
+    def _go_live(self, stop_event, backend):
+        """The worker reports that this utterance's audio is now playing."""
+        if stop_event.is_set():
+            return
+        state = getattr(stop_event, "pause", None)
+        if state is not None and state.backend is None:
+            state.backend = backend
+            self.playback_started.emit()
 
     def _stop_offline(self):
         """Purge SAPI's queue and cut the current utterance.
@@ -776,6 +967,7 @@ class TTSEngine(QObject):
             else:
                 self.error.emit(f"TTS error: {e}")
         finally:
+            self._release_pause(stop_event)
             if gen == self._gen:
                 self._speaking = False
                 self._active_stop = None
@@ -984,11 +1176,14 @@ class TTSEngine(QObject):
                     f"audio={audio_s:.2f}s, "
                     f"synth={synth_s:.2f}s)"
                 )
+                # Paused time is not playing time: VLC holds the audio while
+                # synthesis carries on, so counting the pause would report a
+                # dry spell that never happened (and blame the CPU for it).
                 behind = pace.add(
                     synth_s,
                     audio_s,
                     None if playback_started_at is None
-                    else ready_at - playback_started_at,
+                    else ready_at - playback_started_at - _paused_seconds(stop_event),
                 )
                 if behind and not warned and not stop_event.is_set():
                     warned = True
@@ -1019,7 +1214,8 @@ class TTSEngine(QObject):
         if stop_event.is_set():
             stream.cancel()
             self._log_local_outcome(
-                "stopped", stream, pace, len(batches), playback_started_at
+                "stopped", stream, pace, len(batches), playback_started_at,
+                _paused_seconds(stop_event),
             )
             return
         if error is not None and not started:
@@ -1030,19 +1226,24 @@ class TTSEngine(QObject):
         self._log_local_outcome(
             "stopped" if stop_event.is_set() else "complete",
             stream, pace, len(batches), playback_started_at,
+            _paused_seconds(stop_event),
         )
         if error is not None:
             raise error
 
     @staticmethod
-    def _log_local_outcome(outcome, stream, pace, total_blocks, playback_started_at):
+    def _log_local_outcome(outcome, stream, pace, total_blocks, playback_started_at,
+                           paused_s=0.0):
         """One summary line per local read, including reads the user stopped.
 
         This used to say "complete" for a read the user STOPPED: a 167 s read
         stopped at 97 s logged ``audio=167.215s, wall=96.812s``, which reads as
         VLC ending 70 s early. A read stopped while still synthesizing logged
         nothing at all, so the stuttering reads the user gave up on left no
-        trace. Counts and durations only, never text.
+        trace. Counts and durations only, never text. ``wall`` includes any
+        time the user held the read paused, which ``paused`` states, so the two
+        lines up against ``audio``. While paused VLC keeps reading ahead into
+        its own buffer, so callback waits can also include that catch-up.
         """
         wall_s = (
             time.monotonic() - playback_started_at
@@ -1055,7 +1256,8 @@ class TTSEngine(QObject):
             f"max_callback_wait={max_wait_s:.3f}s, "
             f"worst_synth_ratio={pace.worst_ratio:.2f}, "
             f"est_gap={pace.gap_s:.2f}s, "
-            f"audio={pace.audio_s:.3f}s, wall={wall_s:.3f}s)"
+            f"audio={pace.audio_s:.3f}s, wall={wall_s:.3f}s, "
+            f"paused={paused_s:.3f}s)"
         )
 
     def _start_vlc_pcm_stream(self, stream, stop_event, progress):
@@ -1115,6 +1317,7 @@ class TTSEngine(QObject):
         if stop_event.is_set():
             self._vlc_stop()
             return
+        self._go_live(stop_event, "vlc")
         # The PCM already contains the requested speed. Live testing proved
         # that VLC silently ignored non-1.0 rates on this callback-backed raw
         # stream, so applying _speed here both lies to the UI and risks a future
@@ -1414,15 +1617,25 @@ class TTSEngine(QObject):
         if stop_event.is_set():
             self._vlc_stop()
             return
+        self._go_live(stop_event, "vlc")
         try:
             self._vlc_player.set_rate(self._speed)
         except Exception:
             pass
 
     def _wait_vlc_stream(self, stream, stop_event):
-        """Wait for an already-started LibVLC stream to finish."""
+        """Wait for an already-started LibVLC stream to finish.
+
+        A read that was PAUSED never reaches Ended on the raw PCM stream (see
+        _PauseState), so for it the end is also accepted when the stream has
+        handed VLC its last byte and VLC's media time has stopped moving while
+        unpaused. Reads that were never paused end exactly as before.
+        """
         import vlc
 
+        pause = getattr(stop_event, "pause", None)
+        last_media_ms = None
+        last_moved = time.monotonic()
         while True:
             if stop_event.is_set():
                 self._vlc_stop()
@@ -1434,6 +1647,21 @@ class TTSEngine(QObject):
                 if stream.error is not None:
                     raise stream.error
                 return
+            if pause is not None and pause.was_paused:
+                now = time.monotonic()
+                media_ms = self._vlc_player.get_time()
+                if pause.paused or media_ms != last_media_ms:
+                    last_media_ms, last_moved = media_ms, now
+                elif (getattr(stream, "eof_delivered", False)
+                      and now - last_moved >= self.PAUSED_END_STALL_S):
+                    applog.dbg(
+                        "read-aloud ended after a pause "
+                        f"(media_time={media_ms}ms, paused={pause.seconds():.1f}s)"
+                    )
+                    self._vlc_stop()
+                    if stream.error is not None:
+                        raise stream.error
+                    return
             time.sleep(0.05)
 
     def _play_vlc_stream(self, stream, stop_event, progress):
@@ -1654,12 +1882,17 @@ class TTSEngine(QObject):
                 applog.exception("offline TTS: runAndWait failed")
             return True
 
+        self._go_live(stop_event, "sapi")
+        # The budget covers SPEAKING time; a read the user holds paused for a
+        # minute is not a wedged driver.
         deadline = time.monotonic() + self._offline_chunk_budget(chunk)
+        paused_before = _paused_seconds(stop_event)
         try:
             while not done.is_set():
                 if stop_event.is_set():
                     break
-                if time.monotonic() > deadline:
+                paused_s = _paused_seconds(stop_event) - paused_before
+                if time.monotonic() - paused_s > deadline:
                     applog.error("offline TTS: chunk exceeded its budget; moving on")
                     break
                 engine.iterate()

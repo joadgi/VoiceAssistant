@@ -5,7 +5,7 @@ Writes are ATOMIC (temp file + os.replace) so a crash mid-save can never
 truncate the file, and a corrupt file is backed up — never silently discarded.
 
 HOTKEY CONTRACT (user directive — never hardcode): every action's hotkey
-(Dictate / Read / OCR) is a per-user setting, editable in the UI and stored
+(Dictate / Read / Pause / OCR) is a per-user setting, editable in the UI and stored
 here; DEFAULTS are factory defaults only. Modifier-only combos (ctrl+alt) are
 a supported deliberate choice. Only bindings that would break basic function
 are rejected (bare typing keys, a single bare modifier, escape).
@@ -46,6 +46,10 @@ DEFAULTS = {
     "hotkey_record": "ctrl+shift+r",
     "hotkey_screen_read": "ctrl+shift+s",
     "hotkey_read_aloud": "ctrl+shift+t",
+    # Pause/resume read-aloud. Taken from the focused app ONLY while a read is
+    # running (ChordHotkey's `enabled`), so the rest of the time Ctrl+Shift+P
+    # still reaches VS Code's command palette.
+    "hotkey_pause_read": "ctrl+shift+p",
 
     "audio_device": -1,
     "dictation_mode": True,
@@ -88,7 +92,8 @@ DEFAULTS = {
 
 
 MODIFIER_KEYS = {"ctrl", "shift", "alt", "windows", "cmd", "meta"}
-HOTKEY_KEYS = ("hotkey_record", "hotkey_screen_read", "hotkey_read_aloud")
+HOTKEY_KEYS = ("hotkey_record", "hotkey_screen_read", "hotkey_read_aloud",
+               "hotkey_pause_read")
 
 # Single keys worth DEDICATING to push-to-talk. Each was checked against
 # `keyboard`'s scan-code tables: these are the only keys whose codes do NOT

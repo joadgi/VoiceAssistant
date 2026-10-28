@@ -1,8 +1,8 @@
 """Global chord matcher that consumes only the input it is entitled to.
 
-Serves the read-aloud AND OCR hotkeys. Both want the same thing: fire once
-per chord press, keep the trigger out of the focused app, and never disturb
-anything else the user types.
+Serves the read-aloud, pause-reading AND OCR hotkeys. All want the same
+thing: fire once per chord press, keep the trigger out of the focused app, and
+never disturb anything else the user types.
 
 WHY NOT `keyboard.add_hotkey`: its suppressing state machine was found
 delaying and replaying Ctrl/Alt, and the non-suppressing variant runs the
@@ -23,6 +23,13 @@ THE RULES, in priority order:
    `scroll lock` bound, Shift+ScrollLock and Ctrl+ScrollLock fire too, since
    the chord only requires that key to be held. Pick a key whose variants the
    user does not need.
+4. **An `enabled` check is decided once per press.** Pause-reading binds a
+   chord that only matters while something is being read, so it takes the
+   key only then: otherwise the press passes through to the focused app
+   (Ctrl+Shift+P still opens VS Code's palette). The answer is fixed at the
+   moment the chord completes. A press that passed through can never be
+   claimed later -- not even by an autorepeat after reading starts -- because
+   its key-up would then be swallowed after the app already saw the key-down.
 
 A hook only knows the events it is delivered, so `_held` is NOT independent
 evidence that a key is physically down. One dropped key-up latches a modifier
@@ -44,10 +51,14 @@ work, sleeps, or model work run in this handler.
 
 
 class ChordHotkey:
-    def __init__(self, combo, callback, keyboard, released_probe=None):
+    def __init__(self, combo, callback, keyboard, released_probe=None, enabled=None):
         """`released_probe(codes) -> set` names which of `codes` Windows
         reports as physically released. Optional: without it the matcher
-        behaves exactly as before, on cached hook state alone."""
+        behaves exactly as before, on cached hook state alone.
+
+        `enabled() -> bool`, also optional, is asked when the chord completes
+        (rule 4). It runs inside the hook, so it must be a cheap read with no
+        I/O; an exception counts as "no" and the keys pass through."""
         self._parts = tuple(
             frozenset(keyboard.key_to_scan_codes(part))
             for part in combo.split("+") if part
@@ -65,6 +76,7 @@ class ChordHotkey:
         self._latched = False
         self._callback = callback
         self._released_probe = released_probe
+        self._enabled = enabled
         self.last_error = None
 
     def _reconcile(self, current_code):
@@ -114,6 +126,11 @@ class ChordHotkey:
         active = all(part & self._held for part in self._parts)
         blocked = code in self._blocked
         fire = down and active and not self._latched
+        if fire and not self._is_enabled():
+            # Latch WITHOUT blocking: this press goes to the focused app, and
+            # so must every event of it until release (rule 4).
+            self._latched = True
+            fire = False
         if fire:
             self._latched = True
             if code not in self._modifiers:
@@ -134,3 +151,12 @@ class ChordHotkey:
                 # while its later key-up is consumed. No I/O in the hook.
                 self.last_error = str(exc)
         return True if code in self._modifiers else not blocked
+
+    def _is_enabled(self):
+        if self._enabled is None:
+            return True
+        try:
+            return bool(self._enabled())
+        except Exception as exc:
+            self.last_error = str(exc)
+            return False

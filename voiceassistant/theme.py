@@ -223,6 +223,7 @@ QPushButton[variant="ghost"] {{ background: transparent; border: 1px solid {bord
 QPushButton[variant="ghost"]:hover {{ border-color: {cyan}; color: {text}; }}
 QPushButton[variant="outline"] {{ background: transparent; border: 1px solid rgba(0, 212, 255, 0.5); color: {cyan}; }}
 QPushButton[variant="outline"]:hover {{ background-color: {t_cyan}; border-color: {cyan}; }}
+QPushButton[variant="outline"]:disabled {{ background: transparent; border-color: {border_soft}; color: #3b475a; }}
 QPushButton[size="sm"] {{ padding: 4px 12px; font-size: 11px; min-height: 14px; }}
 QPushButton[variant="icon"] {{
     background: transparent; border: 1px solid {border}; color: {text_dim};

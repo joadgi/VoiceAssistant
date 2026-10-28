@@ -452,3 +452,45 @@ def test_pill_follows_zoom(main_window):
     finally:
         w._apply_zoom(1.0)
         ind._set_idle()
+
+
+def test_pause_controls_follow_the_read(main_window):
+    """Pause is offered only while a read's audio is playing, and every
+    control says what pressing it will do next."""
+    from types import SimpleNamespace
+
+    from voiceassistant.tts import _UtteranceStop
+
+    w = main_window
+    held = []
+    w.tts._vlc_player = SimpleNamespace(set_pause=held.append, stop=lambda: None)
+    assert not w.btn_pause_read.isEnabled() and not w.act_pause_read.isEnabled()
+
+    stop = _UtteranceStop()
+    w.tts._gen += 1
+    w.tts._active_stop, w.tts._speaking = stop, True
+    w._on_tts_started()
+    assert not w.btn_pause_read.isEnabled(), "offered before any audio played"
+    labels = [a.text() for a in w._build_pill_menu().actions()]
+    assert "Stop reading" in labels and "Pause reading" not in labels
+
+    w.tts._go_live(stop, "vlc")          # emits playback_started
+    assert w.btn_pause_read.isEnabled() and w.btn_pause_read.text() == "Pause"
+    assert "Pause reading" in [a.text() for a in w._build_pill_menu().actions()]
+
+    w.btn_pause_read.click()
+    assert held == [1]
+    assert w.btn_pause_read.text() == "Resume"
+    assert w.act_pause_read.text() == "Resume Reading"
+    assert "Resume reading" in [a.text() for a in w._build_pill_menu().actions()]
+
+    w.act_pause_read.trigger()           # the tray menu's copy of the control
+    assert held == [1, 0]
+    assert w.btn_pause_read.text() == "Pause"
+
+    w.btn_pause_read.click()
+    w._on_speak_toggle()                 # Stop, from a paused read
+    assert stop.is_set() and not stop.pause.paused
+    assert not w.btn_pause_read.isEnabled() and w.btn_pause_read.text() == "Pause"
+    assert not w.act_pause_read.isEnabled()
+    assert [a.text() for a in w._build_pill_menu().actions()][1] == "Read selection aloud"

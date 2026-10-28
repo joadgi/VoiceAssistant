@@ -244,10 +244,10 @@ def test_config_loadtime_sanitize_resets_invalid(tmp_config):
 def test_sanitize_dedup_makes_actions_distinct():
     data = dict(DEFAULTS)
     for k in HOTKEY_KEYS:
-        data[k] = "ctrl+alt"  # collide all three
+        data[k] = "ctrl+alt"  # collide every action
     cleaned = sanitize_settings(data)
     vals = [cleaned[k] for k in HOTKEY_KEYS]
-    assert len(set(vals)) == 3, f"actions still share a combo: {vals}"
+    assert len(set(vals)) == len(HOTKEY_KEYS), f"actions still share a combo: {vals}"
 
 
 def test_sanitize_dedup_reserve_pool_when_default_would_recollide():
@@ -259,7 +259,7 @@ def test_sanitize_dedup_reserve_pool_when_default_would_recollide():
     data["hotkey_screen_read"] = DEFAULTS["hotkey_screen_read"]
     cleaned = sanitize_settings(data)
     assert cleaned["hotkey_record"] != cleaned["hotkey_screen_read"]
-    assert len({cleaned[k] for k in HOTKEY_KEYS}) == 3
+    assert len({cleaned[k] for k in HOTKEY_KEYS}) == len(HOTKEY_KEYS)
 
 
 def test_set_hotkey_if_valid_rejects_duplicate(main_window):
@@ -604,3 +604,46 @@ def test_ptt_watchdog_uses_hook_state_for_a_suppressed_solo_key(
         fake_kb.held.clear()                  # a genuine release
         w._on_ptt_watchdog()
         assert w.recorder.stopped, "a real release was not noticed"
+
+
+def test_pause_hotkey_is_installed_and_only_claims_its_key_while_reading(
+        main_window, fake_kb, monkeypatch):
+    """Pause-reading rides the same matcher as Read and OCR, but asks the TTS
+    engine first: outside a read Ctrl+Shift+P must still reach the focused app
+    (VS Code's command palette)."""
+    import keyboard
+    from types import SimpleNamespace
+
+    import voiceassistant.window as win_mod
+
+    w = main_window
+    toggles = []
+    monkeypatch.setattr(w.tts, "toggle_pause", lambda: toggles.append(1) or True)
+    # The matcher asks Windows which modifiers are physically held; in a
+    # headless run none are, so stand in for a user holding Ctrl+Shift.
+    monkeypatch.setattr(win_mod.winapi, "released_modifier_scan_codes", lambda codes: set())
+    _REAL_SETUP_HOTKEYS(w)
+    matcher = getattr(w, "_pause_hotkey", None)
+    assert matcher is not None, "pause hotkey not installed"
+    assert any(cb is matcher for cb, _ in fake_kb.hooks)
+
+    ctrl, shift, p = (keyboard.key_to_scan_codes(k)[0] for k in ("ctrl", "shift", "p"))
+
+    def press_p():
+        ev = lambda d, c: SimpleNamespace(event_type=d, scan_code=c)
+        matcher(ev("down", ctrl))
+        matcher(ev("down", shift))
+        verdicts = (matcher(ev("down", p)), matcher(ev("up", p)))
+        matcher(ev("up", shift))
+        matcher(ev("up", ctrl))
+        return verdicts
+
+    w.tts._speaking = False
+    assert press_p() == (True, True), "Ctrl+Shift+P was taken with nothing being read"
+    assert toggles == []
+    w.tts._speaking = True
+    try:
+        assert press_p() == (False, False), "the pause key leaked into the app mid-read"
+    finally:
+        w.tts._speaking = False
+    assert toggles == [1]

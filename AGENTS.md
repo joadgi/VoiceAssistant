@@ -46,12 +46,12 @@ run.bat/shortcuts/startup-registry compatibility.
 | `voiceassistant/widgets.py` | `RecordingIndicator` pill (compact state pill that expands into the live-preview caption card) + the single `HotkeyCaptureWidget`. |
 | `voiceassistant/live_preview.py` | `LivePreview` — rolling draft of the active recording shown on the pill while the key is held. GUI-thread tick owns the policy (when to decode, commit, stop); pure `PreviewStabilizer` + `choose_commit` helpers. Shares the transcriber's model and worker; never touches the target window. |
 | `voiceassistant/inline_typist.py` | The inline-typing SAFETY CONTRACT (in-file), plus the pure arithmetic (`plan_edit`) and policy (`block_reason`) that decide what may be deleted and whether typing may run at all. No Windows calls, no threads. |
-| `voiceassistant/settings_dialog.py` / `theme.py` | Settings UI; `theme.py` is Bridge's design system translated to Qt — tokens copied from Bridge's `:root` (`project-cloud-dashboard/static/dashboard.html`), cards, cyan-gradient primary buttons, status pills. Widget state colours go through `theme.set_prop()` (a dynamic property + repolish), never inline hex. Icons live in `voiceassistant/assets/`; Bridge's Inter typeface ships in `voiceassistant/fonts/` (OFL) and renders with vertical-only hinting (full hinting rounded its 10-11 px bold space to ~2 px, so "MIC TEST" read as one word). **Zoom** (`ui_scale`, 70-140%, header − / + and Ctrl+−/=/0) is live: the sheet is written at 100% and `build_style()` scales every px, code-set sizes go through `theme.px()` inside `MainWindow._z()` hooks that re-run on change; re-theme only when the scale changes (doing it per window made the suite 4x slower). The floating dictation pill is its own top-level window, so `_apply_zoom` calls `RecordingIndicator.rescale()` explicitly; its `COMPACT_W`/`COMPACT_H`/`CARD_W` are `theme.px` properties and an open caption card is re-fitted. Pill radii stay just under half their height: Qt drops the rounding entirely past half. The title bar is painted navy via `winapi.style_title_bar` (DWM, Windows 11). Keep the tokens in step with Bridge rather than tuning colours here alone. |
+| `voiceassistant/settings_dialog.py` / `theme.py` | Settings UI; `theme.py` is Bridge's design system translated to Qt — tokens copied from Bridge's `:root` (`project-cloud-dashboard/static/dashboard.html`), cards, cyan-gradient primary buttons, status pills. Widget state colours go through `theme.set_prop()` (a dynamic property + repolish), never inline hex. Icons live in `voiceassistant/assets/`; Bridge's Inter typeface ships in `voiceassistant/fonts/` (OFL) and renders with vertical-only hinting (full hinting rounded its 10-11 px bold space to ~2 px, so "MIC TEST" read as one word). **Zoom** (`ui_scale`, 70-140%, header − / + and Ctrl+−/=/0) is live: the sheet is written at 100% and `build_style()` scales every px, code-set sizes go through `theme.px()` inside `MainWindow._z()` hooks that re-run on change; re-theme only when the scale changes (doing it per window made the suite 4x slower). The floating dictation pill is its own top-level window, so `_apply_zoom` calls `RecordingIndicator.rescale()` explicitly; its `COMPACT_W`/`COMPACT_H`/`CARD_W` are `theme.px` properties and an open caption card is re-fitted. Pill radii stay just under half their height: Qt drops the rounding entirely past half. The window has NO fixed minimum size: the layout's own minimum applies, so it can never be dragged narrower than its controls (a fixed 720 px let them overlap) and zooming in grows it; hotkey chips size to their text and the voice box to a minimum length, not its longest voice name. The title bar is painted navy via `winapi.style_title_bar` (DWM, Windows 11). Keep the tokens in step with Bridge rather than tuning colours here alone. |
 | `voiceassistant/recorder.py` | `VoiceRecorder` — **always-open** mic stream + pre-roll ring buffer; GUI-thread tick owns metering/duration-cap/mic-health. |
 | `voiceassistant/transcriber.py` | `Transcriber` + `TranscriptionResult` (faster-whisper, both-pass guards, job-bound context) + `PreviewResult`/`_preview_job` (the greedy live-preview decode on the same worker, generation-cancellable). |
 | `voiceassistant/tts.py` | `TTSEngine` — local Kokoro blocks or one online edge-tts generator → one VLC stream, per-utterance generations, explicit pyttsx3 option, bounded waits. Carries the STOP CONTRACT and VOICE CONTRACT (in-file). |
 | `voiceassistant/ocr.py` | `ScreenCapture` (mss) + `OCREngine` (Windows-native OCR default, EasyOCR fallback) + `RegionSelector`. |
-| `voiceassistant/chord_hotkey.py` | `ChordHotkey` — the global chord matcher shared by read-aloud AND OCR; modifiers always pass through, only matched non-modifier down/up pairs can be consumed, cached key state reconciled against Windows. The app contains no `keyboard.add_hotkey`. |
+| `voiceassistant/chord_hotkey.py` | `ChordHotkey` — the global chord matcher shared by read-aloud, pause-reading AND OCR; modifiers always pass through, only matched non-modifier down/up pairs can be consumed, cached key state reconciled against Windows. The app contains no `keyboard.add_hotkey`. |
 | `voiceassistant/paste.py` | `Paster` — the paste worker: clipboard snapshot/restore + Win32 Ctrl+V, off the GUI thread. Also owns the inline-typing state machine (`_TypedState`, worker-confined) and its finalize/cancel outcomes. |
 | `voiceassistant/selection.py` | `SelectionReader` — read-aloud's 3-tier selection grab (UIA → Ctrl+C sentinel → tell caller to OCR), off the GUI thread (mirrors `Paster`). |
 | `voiceassistant/uia.py` | UI Automation selection reader — highlighted text with **no clipboard, no keystrokes, no focus switch**. |
@@ -110,6 +110,11 @@ VLC `set_rate` is not used; slider changes apply to the next read. Optional onli
 one `edge-tts.Communicate` generator and one buffered VLC stream. LibVLC's native
 callback consumes either stream, so there is no extra Python producer thread. A neural
 selection never changes into SAPI; `pyttsx3` runs only when explicitly selected.
+
+**Pause:** once a read's audio is playing (`playback_started`), Pause holds it through
+the backend's own pause (VLC `set_pause`, SAPI `SpVoice.Pause`) and Resume carries on
+from the same word. The Pause button, the tray and pill menus and the Pause hotkey all
+call `TTSEngine.toggle_pause()`. Stop still works from a paused read.
 
 ## Key design decisions (the "why", for future reviews)
 
@@ -416,6 +421,32 @@ selection never changes into SAPI; `pyttsx3` runs only when explicitly selected.
   mid-synthesis. The ONNX session runs **8 intra-op threads with spinning off**:
   ORT's default (one spinning worker per physical core) measured slowest here,
   0.50 vs 0.37 mean synth-per-audio-second under load.
+- **Pause is the backend's OWN pause, and a paused read ends by its own clock**
+  (`tts._PauseState`, `TTSEngine.pause`). Everything here was measured on
+  2026-10-28 with the app's exact raw-PCM VLC stream before it was built:
+  - **VLC never reports Ended for a raw stream that was really paused** -- 12 of
+    12 runs stayed Playing forever, across the mmdevice, directsound and waveout
+    outputs and both resume calls (MP3, the online path, did end normally). So a
+    read that was paused ends when its stream has handed VLC its last byte AND
+    VLC's media time has stood still for `PAUSED_END_STALL_S` (0.6 s) while
+    unpaused. Reads that were never paused end on Ended exactly as before.
+  - **The PCM pacer keeps running through a pause.** Freezing it looked tidier
+    and was worse: VLC shifts its own clock by the pause, so late data counted
+    the pause twice and VLC sat SILENT after resume for about as long as it had
+    been paused (1.8 s after a 2 s pause). Left running, VLC buffers ahead while
+    paused (10 s during a 10 s pause) and then plays every sample at 1x.
+  - **Paused time is not playing time.** `_SynthesisPace` and the SAPI chunk
+    budget both subtract it; otherwise a long pause was reported as the CPU
+    falling behind, and a minute-long pause tripped the wedged-driver budget.
+  - **A read can only pause once its audio is playing**, and Stop or a job
+    ending for any reason releases the pause. SAPI keeps a pause COUNT on its
+    one shared voice, so the purge comes first and the resume after it.
+  - The **Pause hotkey** is only claimed while a read is running
+    (`ChordHotkey(enabled=...)`, rule 4): outside a read `ctrl+shift+p` still
+    opens VS Code's palette. The decision is fixed per press, so a key-down that
+    reached the app always keeps its key-up.
+  Live gate: `tests/integration/test_tts_pause_live.py` (muted real Kokoro+VLC):
+  a 3 s pause added 3.7 s to a 7.5 s read, media time frozen throughout.
 - **A failed read-aloud says why; it never improvises a screen read**
   (`_on_read_text_ready`). Tier 3 used to fire on ANY empty capture: OCR a
   600x300 box around the **mouse pointer** and speak whatever landed in it. The
@@ -720,15 +751,17 @@ user necessarily runs):
 |---|---|---|
 | Dictate | `Ctrl+Shift+R` | Hold to record, release to transcribe + paste |
 | Read selection | `Ctrl+Shift+T` | Press to read highlighted text; press again to stop |
+| Pause reading | `Ctrl+Shift+P` | Pause / resume the current read; only taken while reading |
 | OCR at cursor | `Ctrl+Shift+S` | Capture region around cursor, OCR, read aloud |
 
-**What Josh actually runs** (his `settings.json`, as of 2026-09-10) — all three triggers
-are withheld from the focused app:
+**What Josh actually runs** (his `settings.json`, as of 2026-10-28) — every trigger
+is withheld from the focused app:
 
 | Action | Binding | Withheld how |
 |---|---|---|
 | Dictate | `caps lock` | suppressed as a dedicated solo key |
-| Read selection | `scroll lock` | consumed by `ChordHotkey` |
+| Read selection | `f6` | consumed by `ChordHotkey` |
+| Pause reading | `f7` | consumed by `ChordHotkey`, only while reading (F7 reaches apps otherwise) |
 | OCR at cursor | `ctrl+shift+s` | consumed by `ChordHotkey` (so Save As is gone app-wide) |
 
 All are editable inline — click a hotkey pill and press your combo (single key or combo).
@@ -756,8 +789,8 @@ All are editable inline — click a hotkey pill and press your combo (single key
   agent run) cannot focus its window. They SKIP rather than type blind, which is
   deliberate — a green run that skipped proves nothing, so read the summary.
   For anything touching read-aloud, also run
-  `RUN_TTS_EVAL=1 pytest tests/test_tts_eval.py tests/integration/test_tts_stress_live.py -v -s`;
-  it is the objective word-fidelity, speed, voice, VLC, Stop, and replacement gate.
+  `RUN_TTS_EVAL=1 pytest tests/test_tts_eval.py tests/integration/test_tts_stress_live.py tests/integration/test_tts_pause_live.py -v -s`;
+  it is the objective word-fidelity, speed, voice, VLC, Stop, pause, and replacement gate.
   Validate a NON-default model with `CORPUS_MODEL=<name>` (the gate used to only ever
   test `DEFAULTS['whisper_model']`, so it could not vet what the user actually runs).
 - **The chain test:** `RUN_E2E=1 pytest tests/integration/test_end_to_end_live.py -s`
@@ -774,8 +807,9 @@ All are editable inline — click a hotkey pill and press your combo (single key
   must stay on BOTH passes), and the threading law (`workers.SerialWorker` — no ad-hoc
   threads). **Read-aloud watchpoints:** no blocking speak-until-finished call on
   ANY TTS backend, the VLC warm-up's stop check, the neural voice id never
-  reaching SAPI, truncate-don't-re-read on a mid-utterance failure, and no
-  automatic OCR escalation on an empty capture
+  reaching SAPI, truncate-don't-re-read on a mid-utterance failure, a paused
+  read's own end detection and the pacer NOT freezing during a pause
+  (`tests/test_tts_pause.py`), and no automatic OCR escalation on an empty capture
   (`test_ui_smoke.test_empty_selection_never_reads_the_screen_aloud` fails
   against the pre-2026-09-16 handler).
   **Inline-typing watchpoints:** the exact/unknown distinction in
