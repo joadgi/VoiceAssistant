@@ -58,6 +58,8 @@ DEFAULTS = {
     "start_minimized": True,
     "dark_mode": True,
     "font_size": 13,
+    # Interface zoom (header - 100% + / Ctrl+- Ctrl+= Ctrl+0): 0.7-1.4, live.
+    "ui_scale": 1.0,
     "sample_rate": 16000,
     "min_record_seconds": 0.2,
     "min_record_peak": 0.008,

@@ -361,3 +361,94 @@ class TestHotkeyCapture:
         self._press(w, Qt.Key.Key_Escape, Qt.KeyboardModifier.NoModifier)
         assert captured == []
         assert w._capturing is False  # capture ended, nothing emitted
+
+
+def test_theme_builds_and_its_icons_exist():
+    """The Bridge theme is one formatted string plus three SVGs; a stray brace or a
+    missing asset would silently drop the whole style sheet or an icon."""
+    from voiceassistant import theme
+
+    assert "{cyan}" not in theme.DARK_STYLE and "{assets}" not in theme.DARK_STYLE
+    for name in ("check.svg", "chevron-down.svg", "chevron-up.svg"):
+        assert os.path.exists(os.path.join(theme.ASSETS, name)), name
+        assert theme.ASSETS + "/" + name in theme.DARK_STYLE
+
+
+def test_model_badge_follows_model_state(main_window):
+    """The header pill's colour comes from its `state` property, not inline colours."""
+    w = main_window
+    w._on_model_loading("Loading large-v3...")
+    assert w.label_model_status.property("state") == "loading"
+    w._on_model_ready()
+    assert w.label_model_status.property("state") == "ok"
+    assert w._model_dot.property("state") == "ok"
+    w._on_degraded("CUDA unavailable; running on CPU")
+    assert w.label_model_status.property("state") == "degraded"
+    assert "DEGRADED" in w.label_model_status.text()
+
+
+def test_bundled_inter_font_loads(qapp):
+    """Bridge's typeface ships with the app; if the files go missing the UI silently
+    falls back to Segoe UI, which is exactly the drift this guards against."""
+    from voiceassistant import theme
+
+    assert "Inter" in theme.load_bundled_fonts()
+    assert theme.ui_family() == "Inter"
+    assert os.path.exists(os.path.join(theme.FONTS_DIR, "Inter-LICENSE.txt"))
+
+
+def test_zoom_is_live_and_remembered(main_window):
+    """Josh: the UI felt too big. Zoom rescales the theme and every coded size live,
+    clamps to the supported steps, and is saved for the next launch."""
+    from voiceassistant import theme
+
+    w = main_window
+    w._apply_zoom(0.8)
+    assert theme.SCALE == 0.8
+    assert w.label_zoom.text() == "80%"
+    assert w.config.get("ui_scale") == 0.8
+    assert w.label_model_status.height() == theme.px(24) == 19
+    assert "font-size: 10px" not in w.styleSheet()   # window has no local sheet
+    assert "font-size: 8px" in theme.build_style(0.8)  # 10px section caption at 80%
+    w._zoom_step(+1)
+    assert w.label_zoom.text() == "90%"
+    w._apply_zoom(5)                     # clamped to the largest step
+    assert theme.SCALE == theme.ZOOM_STEPS[-1]
+    assert not w.btn_zoom_in.isEnabled()
+    w._apply_zoom(1.0)
+    assert theme.SCALE == 1.0
+
+
+def test_pill_follows_zoom(main_window):
+    """The floating pill is its own top-level window, so the app style sheet alone
+    does not shrink it: it must rescale with the main window, in every state, and a
+    caption card that is open when the zoom changes must be re-fitted, not clipped."""
+    from voiceassistant import theme
+
+    w, ind = main_window, main_window.indicator
+    try:
+        w._apply_zoom(0.8)
+        assert ind.size().width() == ind.COMPACT_W == 160
+        assert ind.size().height() == ind.COMPACT_H == 32
+        assert "font-size: 10px" in ind._label.styleSheet()      # idle 12px at 80%
+        ind.show_recording()
+        assert "font-size: 10px" in ind._label.styleSheet()      # 13px at 80%
+        assert ind._dot.width() == theme.px(14) == 11
+        assert "border-radius: 5px" in ind._dot.styleSheet()     # never over half
+        w._apply_zoom(1.0)
+        assert ind.size().width() == 200
+        assert "font-size: 13px" in ind._label.styleSheet()      # state kept
+        assert ind._label.text() == "Recording"
+
+        ind.show_preview("the quick brown fox jumps over", "the lazy")
+        card_h = ind.height()
+        w._apply_zoom(0.7)
+        assert ind.width() == ind.CARD_W == 322
+        assert ind._preview.width() == ind.CARD_W - theme.px(24)
+        assert ind.height() < card_h                            # re-fitted, not left at 100%
+        assert ind.preview_text() == "the quick brown fox jumps over the lazy"
+        ind.clear_preview()
+        assert ind.size().width() == ind.COMPACT_W
+    finally:
+        w._apply_zoom(1.0)
+        ind._set_idle()

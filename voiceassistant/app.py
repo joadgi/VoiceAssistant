@@ -7,7 +7,7 @@ from PySide6.QtWidgets import QApplication
 
 from . import applog, winapi
 from .config import CONFIG_DIR
-from .theme import DARK_STYLE
+from .theme import apply_theme
 
 # run.bat / the startup registry entry launch the root main.py shim.
 ENTRY_SCRIPT = os.path.join(CONFIG_DIR, "main.py")
@@ -48,7 +48,7 @@ def main():
     app.setQuitOnLastWindowClosed(False)
     app.setApplicationName("Voice Assistant")
     app.setStyle("Fusion")
-    app.setStyleSheet(DARK_STYLE)
+    apply_theme(app)
 
     from .window import MainWindow  # deferred: heavy imports after the mutex
 

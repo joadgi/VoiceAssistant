@@ -25,7 +25,7 @@ Three features, in priority order:
 
 | Layer | Tech |
 |---|---|
-| UI | PySide6 (Qt), dark theme |
+| UI | PySide6 (Qt), styled with Bridge's design system (dark) |
 | Voice-to-text | `faster-whisper` (CTranslate2 Whisper) on CUDA, CPU fallback |
 | Text-to-speech | Local Kokoro ONNX neural synthesis → one raw PCM VLC stream (default); optional online `edge-tts`; explicit `pyttsx3` SAPI option |
 | Screen capture | `mss` |
@@ -46,7 +46,7 @@ run.bat/shortcuts/startup-registry compatibility.
 | `voiceassistant/widgets.py` | `RecordingIndicator` pill (compact state pill that expands into the live-preview caption card) + the single `HotkeyCaptureWidget`. |
 | `voiceassistant/live_preview.py` | `LivePreview` — rolling draft of the active recording shown on the pill while the key is held. GUI-thread tick owns the policy (when to decode, commit, stop); pure `PreviewStabilizer` + `choose_commit` helpers. Shares the transcriber's model and worker; never touches the target window. |
 | `voiceassistant/inline_typist.py` | The inline-typing SAFETY CONTRACT (in-file), plus the pure arithmetic (`plan_edit`) and policy (`block_reason`) that decide what may be deleted and whether typing may run at all. No Windows calls, no threads. |
-| `voiceassistant/settings_dialog.py` / `theme.py` | Settings UI, dark stylesheet. |
+| `voiceassistant/settings_dialog.py` / `theme.py` | Settings UI; `theme.py` is Bridge's design system translated to Qt — tokens copied from Bridge's `:root` (`project-cloud-dashboard/static/dashboard.html`), cards, cyan-gradient primary buttons, status pills. Widget state colours go through `theme.set_prop()` (a dynamic property + repolish), never inline hex. Icons live in `voiceassistant/assets/`; Bridge's Inter typeface ships in `voiceassistant/fonts/` (OFL) and renders with vertical-only hinting (full hinting rounded its 10-11 px bold space to ~2 px, so "MIC TEST" read as one word). **Zoom** (`ui_scale`, 70-140%, header − / + and Ctrl+−/=/0) is live: the sheet is written at 100% and `build_style()` scales every px, code-set sizes go through `theme.px()` inside `MainWindow._z()` hooks that re-run on change; re-theme only when the scale changes (doing it per window made the suite 4x slower). The floating dictation pill is its own top-level window, so `_apply_zoom` calls `RecordingIndicator.rescale()` explicitly; its `COMPACT_W`/`COMPACT_H`/`CARD_W` are `theme.px` properties and an open caption card is re-fitted. Pill radii stay just under half their height: Qt drops the rounding entirely past half. The title bar is painted navy via `winapi.style_title_bar` (DWM, Windows 11). Keep the tokens in step with Bridge rather than tuning colours here alone. |
 | `voiceassistant/recorder.py` | `VoiceRecorder` — **always-open** mic stream + pre-roll ring buffer; GUI-thread tick owns metering/duration-cap/mic-health. |
 | `voiceassistant/transcriber.py` | `Transcriber` + `TranscriptionResult` (faster-whisper, both-pass guards, job-bound context) + `PreviewResult`/`_preview_job` (the greedy live-preview decode on the same worker, generation-cancellable). |
 | `voiceassistant/tts.py` | `TTSEngine` — local Kokoro blocks or one online edge-tts generator → one VLC stream, per-utterance generations, explicit pyttsx3 option, bounded waits. Carries the STOP CONTRACT and VOICE CONTRACT (in-file). |

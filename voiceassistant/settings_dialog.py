@@ -30,18 +30,21 @@ class SettingsDialog(QDialog):
     @staticmethod
     def _hint(text):
         lbl = QLabel(text)
-        lbl.setStyleSheet("color: #6c7086; font-size: 10px;")
+        lbl.setProperty("role", "hint")   # muted caption, styled in theme.py
         lbl.setWordWrap(True)
         return lbl
 
     def _build_ui(self):
         root = QVBoxLayout(self)
+        root.setContentsMargins(18, 16, 18, 14)
+        root.setSpacing(14)
         tabs = QTabWidget()
         root.addWidget(tabs)
 
         # ---- Tab 1: Transcription (mic + Whisper) ----
         trans = QWidget()
         tlay = QFormLayout(trans)
+        tlay.setContentsMargins(16, 16, 16, 16)
         tlay.setSpacing(12)
 
         self.mic_combo = QComboBox()
@@ -130,6 +133,7 @@ class SettingsDialog(QDialog):
         # ---- Tab 2: General (display + startup + diagnostics) ----
         gen = QWidget()
         glay = QFormLayout(gen)
+        glay.setContentsMargins(16, 16, 16, 16)
         glay.setSpacing(12)
 
         self.font_spin = QSpinBox()
@@ -164,9 +168,16 @@ class SettingsDialog(QDialog):
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
+        ok = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        ok.setProperty("variant", "primary")   # Bridge primary: the cyan gradient
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        from . import theme, winapi
+        winapi.style_title_bar(int(self.winId()), theme.C["bg"], theme.C["text"])
 
     def get_values(self):
         return {

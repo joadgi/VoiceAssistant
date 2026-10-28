@@ -14,15 +14,16 @@ import numpy as np
 import pyperclip
 from PySide6.QtCore import Qt, QTimer, Signal, Slot
 from PySide6.QtGui import (
-    QAction, QColor, QFont, QIcon, QPainter, QPen, QPixmap, QTextCharFormat,
+    QAction, QColor, QFont, QIcon, QKeySequence, QPainter, QPen, QPixmap, QShortcut,
+    QTextCharFormat,
 )
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QDialog, QGroupBox, QHBoxLayout, QLabel, QMainWindow, QMenu,
+    QApplication, QComboBox, QDialog, QFrame, QHBoxLayout, QLabel, QMainWindow, QMenu,
     QProgressBar, QPushButton, QSlider, QStatusBar, QSystemTrayIcon,
     QTextEdit, QVBoxLayout, QWidget,
 )
 
-from . import applog, metrics, winapi
+from . import applog, metrics, theme, winapi
 from .chord_hotkey import ChordHotkey
 from .inline_typist import block_reason, stream_target
 from .live_preview import LivePreview
@@ -62,7 +63,7 @@ def _make_tray_icon():
     try:
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor("#c62828"))                    # the recording red
+        p.setBrush(QColor(theme.C["red"]))               # the recording red (Bridge --red)
         p.drawRoundedRect(2, 2, 60, 60, 16, 16)
         p.setBrush(QColor("#ffffff"))
         p.drawRoundedRect(26, 13, 12, 23, 6, 6)          # mic capsule
@@ -228,104 +229,117 @@ class MainWindow(QMainWindow):
     # UI construction
     # -----------------------------------------------------------------------
     def _build_ui(self):
+        """Bridge's layout language: gradient header with the orange mark and status
+        pills, a cyan-labelled hotkey row, then content in cards (see theme.py).
+        Every control keeps its attribute name; only placement and styling are here."""
+        self._zoom_hooks = []          # size setters re-run on every zoom change
         central = QWidget()
         self.setCentralWidget(central)
         root_layout = QVBoxLayout(central)
-        root_layout.setContentsMargins(16, 12, 16, 8)
-        root_layout.setSpacing(10)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
 
-        # ---- Top control bar ----
-        voice_group = QGroupBox("Voice")
-        voice_lay = QHBoxLayout(voice_group)
+        # ---- Header: `> voice` mark, subtitle, model badge, dictation switch, settings ----
+        header = QFrame()
+        header.setObjectName("header")
+        head = QHBoxLayout(header)
+        self._z(lambda: (head.setContentsMargins(*map(theme.px, (24, 12, 20, 12))),
+                         head.setSpacing(theme.px(14))))
 
-        # Honest label: unlike the hotkey/pill flow, this button records into
-        # the panel below and deliberately does NOT paste anywhere (you
-        # clicked into this window, so there is no target). It doubles as the
-        # mic test.
-        self.btn_record = QPushButton("  Record to Panel")
-        self.btn_record.setObjectName("btn_record")
-        self.btn_record.setToolTip(
-            "Record and transcribe into the panel below (mic test).\n"
-            f"To dictate into another app, hold {self.config['hotkey_record']} "
-            "there or click the floating pill."
-        )
+        mark = QHBoxLayout()
+        mark.setSpacing(3)
+        brand = QLabel("> voice")
+        brand.setObjectName("brand")
+        def brand_font():
+            bf = QFont(theme.BRAND_FONTS[0])
+            bf.setPixelSize(theme.px(21))
+            bf.setWeight(QFont.Weight.ExtraBold)
+            brand.setFont(bf)
+        self._brand_cursor = QFrame()
+        self._brand_cursor.setObjectName("brandCursor")
+        self._z(lambda: (brand_font(), self._brand_cursor.setFixedSize(theme.px(10), theme.px(19))))
+        mark.addWidget(brand)
+        mark.addWidget(self._brand_cursor, 0, Qt.AlignmentFlag.AlignVCenter)
+        head.addLayout(mark)
+        sub = QLabel("LOCAL\nDICTATION\nASSISTANT")
+        sub.setObjectName("brandSub")
+        sf = sub.font()
+        sf.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 118)
+        sub.setFont(sf)
+        head.addWidget(sub)
+        head.addStretch()
 
-        self.btn_stop = QPushButton("  Stop")
-        self.btn_stop.setObjectName("btn_stop")
-        self.btn_stop.setEnabled(False)
-
-        self.level_bar = QProgressBar()
-        self.level_bar.setRange(0, 100)
-        self.level_bar.setValue(0)
-        self.level_bar.setTextVisible(False)
-        self.level_bar.setFixedHeight(8)
-
-        voice_lay.addWidget(self.btn_record)
-        voice_lay.addWidget(self.btn_stop)
-        voice_lay.addWidget(self.level_bar, 1)
-
-        screen_group = QGroupBox("Screen Reader")
-        screen_lay = QHBoxLayout(screen_group)
-
-        self.btn_screen_read = QPushButton("  Select Region")
-        self.btn_screen_read.setObjectName("btn_screen_read")
-        self.btn_screen_read.setToolTip("Draw a rectangle to read text from screen")
-
-        self.btn_cursor_read = QPushButton("  Read at Cursor")
-        self.btn_cursor_read.setObjectName("btn_cursor_read")
-        self.btn_cursor_read.setToolTip(
-            f"Read text near cursor ({self.config['hotkey_screen_read']})"
-        )
-
-        screen_lay.addWidget(self.btn_screen_read)
-        screen_lay.addWidget(self.btn_cursor_read)
-
-        top_row = QHBoxLayout()
-        top_row.addWidget(voice_group, 2)
-        top_row.addWidget(screen_group, 1)
-        root_layout.addLayout(top_row)
-
-        # ---- Model status (the model SELECTOR lives in Settings — its one
-        # home; it used to be duplicated here and in the dialog) ----
-        model_row = QHBoxLayout()
-        model_row.addStretch()
+        # Bridge's "Data as of" pill: a live dot plus a tinted badge. Colour follows
+        # the model state (loading / ok / degraded) via the `state` property.
+        self._model_dot = QLabel()
+        self._model_dot.setProperty("role", "dot")
+        self._z(lambda: self._model_dot.setFixedSize(theme.px(8), theme.px(8)))
         self.label_model_status = QLabel("Loading...")
-        self.label_model_status.setStyleSheet("color: #f9e2af; font-weight: bold;")
-        model_row.addWidget(self.label_model_status)
-        root_layout.addLayout(model_row)
+        self.label_model_status.setProperty("role", "badge")
+        self._z(lambda: self.label_model_status.setFixedHeight(theme.px(24)))
+        badge_row = QHBoxLayout()
+        badge_row.setSpacing(7)
+        badge_row.addWidget(self._model_dot, 0, Qt.AlignmentFlag.AlignVCenter)
+        badge_row.addWidget(self.label_model_status)
+        head.addLayout(badge_row)
 
-        # ---- Dictation mode toggle ----
-        dict_row = QHBoxLayout()
-        self.btn_dictation = QPushButton("  DICTATION MODE: ON")
+        self.btn_dictation = QPushButton()
+        self.btn_dictation.setObjectName("btn_dictation")
         self.btn_dictation.setCheckable(True)
         self.btn_dictation.setChecked(self._dictation_active)
+        self.btn_dictation.setCursor(Qt.CursorShape.PointingHandCursor)
+        def dictation_size():
+            self.btn_dictation.setFixedHeight(theme.px(28))
+            df = self.btn_dictation.font()
+            df.setWordSpacing(1.5 * theme.SCALE)   # heavy 11 px caps: give "DICTATION ON" its gap
+            self.btn_dictation.setFont(df)
+        self._z(dictation_size)
         self._update_dictation_button()
-        self.btn_dictation.setStyleSheet("""
-            QPushButton {
-                font-size: 13px; font-weight: bold; padding: 8px 16px;
-                border-radius: 6px; border: none;
-            }
-            QPushButton:checked {
-                background-color: #2e7d32; color: #ffffff;
-            }
-            QPushButton:!checked {
-                background-color: #313244; color: #6c7086;
-            }
-        """)
-        dict_row.addWidget(self.btn_dictation)
+        head.addWidget(self.btn_dictation)
 
-        self.dictation_hint = QLabel("")
-        self.dictation_hint.setStyleSheet("color: #6c7086; font-size: 11px;")
-        self._update_dictation_hint()
-        dict_row.addWidget(self.dictation_hint)
-        dict_row.addStretch()
-        root_layout.addLayout(dict_row)
+        self.btn_settings = QPushButton("Settings")
+        self.btn_settings.setProperty("variant", "ghost")
+        self.btn_settings.setProperty("size", "sm")
+        self._z(lambda: self.btn_settings.setFixedHeight(theme.px(28)))
 
-        # ---- Hotkey capture widgets (fully user-configurable, never hardcoded) ----
+        # Zoom: "- 100% +" (also Ctrl+- / Ctrl+= / Ctrl+0). Live, and remembered.
+        zoom = QHBoxLayout()
+        zoom.setSpacing(2)
+        self.btn_zoom_out = QPushButton("\u2212")
+        self.btn_zoom_in = QPushButton("+")
+        self.label_zoom = QLabel("100%")
+        self.label_zoom.setProperty("role", "hint")
+        self.label_zoom.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        for b, tip in ((self.btn_zoom_out, "Smaller (Ctrl+\u2212)"), (self.btn_zoom_in, "Bigger (Ctrl+=)")):
+            b.setProperty("variant", "icon")
+            b.setToolTip(tip)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.label_zoom.setToolTip("Interface size. Ctrl+0 resets to 100%.")
+        self._z(lambda: (self.btn_zoom_out.setFixedSize(theme.px(28), theme.px(28)),
+                         self.btn_zoom_in.setFixedSize(theme.px(28), theme.px(28)),
+                         self.label_zoom.setFixedWidth(theme.px(42))))
+        self.btn_zoom_out.clicked.connect(lambda: self._zoom_step(-1))
+        self.btn_zoom_in.clicked.connect(lambda: self._zoom_step(+1))
+        zoom.addWidget(self.btn_zoom_out)
+        zoom.addWidget(self.label_zoom)
+        zoom.addWidget(self.btn_zoom_in)
+        head.addLayout(zoom)
+        head.addWidget(self.btn_settings)
+        for keys, step in (("Ctrl+=", +1), ("Ctrl++", +1), ("Ctrl+-", -1)):
+            QShortcut(QKeySequence(keys), self, activated=lambda st=step: self._zoom_step(st))
+        QShortcut(QKeySequence("Ctrl+0"), self, activated=lambda: self._apply_zoom(1.0))
+        root_layout.addWidget(header)
+
+        body = QWidget()
+        body_lay = QVBoxLayout(body)
+        self._z(lambda: (body_lay.setContentsMargins(*map(theme.px, (20, 14, 20, 12))),
+                         body_lay.setSpacing(theme.px(12))))
+        root_layout.addWidget(body, 1)
+
+        # ---- Hotkey row (Bridge's FILTER / MARKET row: cyan label, then chips) ----
         hk_row = QHBoxLayout()
-        hk_label = QLabel("Hotkeys:")
-        hk_label.setStyleSheet("font-weight: bold;")
-        hk_row.addWidget(hk_label)
+        self._z(lambda: hk_row.setSpacing(theme.px(8)))
+        hk_row.addWidget(theme.section_label("Hotkeys", role="rowlabel"))
 
         self.hk_dictate = HotkeyCaptureWidget("Dictate", self.config["hotkey_record"])
         self.hk_read = HotkeyCaptureWidget("Read", self.config["hotkey_read_aloud"])
@@ -340,44 +354,113 @@ class MainWindow(QMainWindow):
         self.hk_ocr.hotkey_changed.connect(
             lambda c: self._save_hotkey("hotkey_screen_read", "OCR", c)
         )
-
         hk_row.addWidget(self.hk_dictate)
         hk_row.addWidget(self.hk_read)
         hk_row.addWidget(self.hk_ocr)
-        hk_row.addStretch()
+        for hk in (self.hk_dictate, self.hk_read, self.hk_ocr):
+            self._z(lambda hk=hk: (hk.setMinimumWidth(theme.px(160)),
+                                   hk.layout().setContentsMargins(*map(theme.px, (12, 6, 12, 6))),
+                                   hk.rescale()))
 
-        hk_reset = QPushButton("  Reset  ")
-        hk_reset.setStyleSheet(
-            "QPushButton { background: #45475a; color: #f9e2af; border: 1px solid #585b70; "
-            "border-radius: 4px; padding: 4px 10px; font-size: 11px; }"
-            "QPushButton:hover { background: #585b70; }"
-        )
+        hk_reset = QPushButton("Reset")
+        hk_reset.setProperty("variant", "ghost")
+        hk_reset.setProperty("size", "sm")
+        hk_reset.setToolTip("Put all three hotkeys back to their defaults")
         hk_reset.clicked.connect(self._reset_hotkeys_to_defaults)
         hk_row.addWidget(hk_reset)
-
-        hk_hint = QLabel("  (click, then press your keys)")
-        hk_hint.setStyleSheet("color: #6c7086; font-size: 10px;")
+        hk_hint = QLabel("click one, then press your keys")
+        hk_hint.setProperty("role", "hint")
         hk_row.addWidget(hk_hint)
-        root_layout.addLayout(hk_row)
+        hk_row.addStretch()
+        body_lay.addLayout(hk_row)
 
-        # ---- Text output ----
+        self.dictation_hint = QLabel("")
+        self.dictation_hint.setProperty("role", "hint")
+        self._update_dictation_hint()
+        body_lay.addWidget(self.dictation_hint)
+
+        # ---- Voice and Screen Reader cards ----
+        # Honest label: unlike the hotkey/pill flow, this button records into
+        # the panel below and deliberately does NOT paste anywhere (you
+        # clicked into this window, so there is no target). It doubles as the
+        # mic test.
+        self.btn_record = QPushButton("Record to Panel")
+        self.btn_record.setObjectName("btn_record")
+        self.btn_record.setProperty("variant", "primary")
+        self.btn_record.setToolTip(
+            "Record and transcribe into the panel below (mic test).\n"
+            f"To dictate into another app, hold {self.config['hotkey_record']} "
+            "there or click the floating pill."
+        )
+        self.btn_stop = QPushButton("Stop")
+        self.btn_stop.setObjectName("btn_stop")
+        self.btn_stop.setEnabled(False)
+        self.level_bar = QProgressBar()
+        self.level_bar.setRange(0, 100)
+        self.level_bar.setValue(0)
+        self.level_bar.setTextVisible(False)
+        self._z(lambda: self.level_bar.setFixedHeight(theme.px(6)))
+
+        voice_card, voice_lay = self._card("Voice · mic test")
+        voice_row = QHBoxLayout()
+        self._z(lambda: voice_row.setSpacing(theme.px(10)))
+        voice_row.addWidget(self.btn_record)
+        voice_row.addWidget(self.btn_stop)
+        meter = QVBoxLayout()
+        meter.setSpacing(5)
+        meter.addWidget(theme.section_label("Input level"))
+        meter.addWidget(self.level_bar)
+        voice_row.addSpacing(6)
+        voice_row.addLayout(meter, 1)
+        voice_lay.addLayout(voice_row)
+
+        self.btn_screen_read = QPushButton("Select Region")
+        self.btn_screen_read.setObjectName("btn_screen_read")
+        self.btn_screen_read.setProperty("variant", "outline")
+        self.btn_screen_read.setToolTip("Draw a rectangle to read text from screen")
+        self.btn_cursor_read = QPushButton("Read at Cursor")
+        self.btn_cursor_read.setObjectName("btn_cursor_read")
+        self.btn_cursor_read.setProperty("variant", "outline")
+        self.btn_cursor_read.setToolTip(
+            f"Read text near cursor ({self.config['hotkey_screen_read']})"
+        )
+        screen_card, screen_lay = self._card("Screen reader")
+        screen_row = QHBoxLayout()
+        self._z(lambda: screen_row.setSpacing(theme.px(10)))
+        screen_row.addWidget(self.btn_screen_read)
+        screen_row.addWidget(self.btn_cursor_read)
+        screen_lay.addLayout(screen_row)
+
+        cards = QHBoxLayout()
+        self._z(lambda: cards.setSpacing(theme.px(12)))
+        cards.addWidget(voice_card, 3)
+        cards.addWidget(screen_card, 2)
+        body_lay.addLayout(cards)
+
+        # ---- Transcript card (Copy / Clear sit on its caption row, like Bridge's card actions) ----
         self.text_output = QTextEdit()
         self.text_output.setPlaceholderText(
             "Transcription and screen reader output will appear here..."
         )
-        self.text_output.setFont(
-            QFont("Cascadia Code", self.config["font_size"])
-        )
-        root_layout.addWidget(self.text_output, 1)
+        self._z(self._apply_transcript_font)
+        self.btn_copy = QPushButton("Copy")
+        self.btn_copy.setObjectName("btn_copy")
+        self.btn_copy.setProperty("size", "sm")
+        self.btn_clear = QPushButton("Clear")
+        self.btn_clear.setProperty("size", "sm")
+        out_card, out_lay = self._card("Transcript", actions=(self.btn_copy, self.btn_clear))
+        out_lay.addWidget(self.text_output, 1)
+        body_lay.addWidget(out_card, 1)
 
-        # ---- Voice & Speed controls ----
-        playback_group = QGroupBox("Playback")
-        playback_lay = QHBoxLayout(playback_group)
-        playback_lay.setSpacing(12)
+        # ---- Playback card ----
+        playback_card, playback_card_lay = self._card("Playback")
+        playback_lay = QHBoxLayout()
+        self._z(lambda: playback_lay.setSpacing(theme.px(10)))
+        playback_card_lay.addLayout(playback_lay)
 
-        playback_lay.addWidget(QLabel("Voice:"))
+        playback_lay.addWidget(QLabel("Voice"))
         self.voice_combo = QComboBox()
-        self.voice_combo.setMinimumWidth(260)
+        self._z(lambda: self.voice_combo.setMinimumWidth(theme.px(230)))
         voices = self.tts.get_voices()
         for vid, vname in voices:
             self.voice_combo.addItem(vname, vid)
@@ -385,63 +468,123 @@ class MainWindow(QMainWindow):
         idx = self.voice_combo.findData(saved_voice)
         if idx >= 0:
             self.voice_combo.setCurrentIndex(idx)
-        playback_lay.addWidget(self.voice_combo)
+        playback_lay.addWidget(self.voice_combo, 3)
 
-        playback_lay.addSpacing(16)
-        playback_lay.addWidget(QLabel("Speed:"))
+        playback_lay.addSpacing(14)
+        playback_lay.addWidget(QLabel("Speed"))
 
         speed_max = LOCAL_MAX_SPEED if saved_voice.startswith("kokoro:") else 3.0
         initial_speed = min(self.config.get("tts_speed", 1.0), speed_max)
         self.speed_slider = QSlider(Qt.Orientation.Horizontal)
         self.speed_slider.setRange(50, int(speed_max * 100))
         self.speed_slider.setValue(int(initial_speed * 100))
-        self.speed_slider.setFixedWidth(200)
-        self.speed_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
-        self.speed_slider.setTickInterval(25)
+        self._z(lambda: (self.speed_slider.setMinimumWidth(theme.px(110)),
+                         self.speed_slider.setMaximumWidth(theme.px(240))))
         self.speed_slider.setToolTip(
             "Choose the speed before pressing Speak; one speed is kept for the whole read."
             if saved_voice.startswith("kokoro:") else
             "Playback speed"
         )
-        playback_lay.addWidget(self.speed_slider)
+        playback_lay.addWidget(self.speed_slider, 2)
 
         self.speed_label = QLabel(f"{initial_speed:.2f}x")
-        self.speed_label.setFixedWidth(60)
-        self.speed_label.setStyleSheet("color: #89b4fa; font-weight: bold;")
+        self._z(lambda: self.speed_label.setFixedWidth(theme.px(52)))
+        self.speed_label.setProperty("role", "value")
         playback_lay.addWidget(self.speed_label)
 
         self.speed_apply_label = QLabel("applies to next read")
-        self.speed_apply_label.setStyleSheet("color: #6c7086; font-size: 10px;")
+        self.speed_apply_label.setProperty("role", "hint")
         playback_lay.addWidget(self.speed_apply_label)
 
-        playback_lay.addStretch()
-        root_layout.addWidget(playback_group)
-
-        # ---- Bottom action bar ----
-        action_row = QHBoxLayout()
-
-        self.btn_copy = QPushButton("  Copy")
-        self.btn_copy.setObjectName("btn_copy")
-
-        self.btn_clear = QPushButton("  Clear")
-
-        self.btn_speak_toggle = QPushButton("  Speak")
+        self.btn_speak_toggle = QPushButton("Speak")
         self.btn_speak_toggle.setObjectName("btn_speak")
+        self.btn_speak_toggle.setProperty("variant", "primary")
         self.btn_speak_toggle.setCheckable(True)
-
-        self.btn_settings = QPushButton("  Settings")
-
-        action_row.addWidget(self.btn_copy)
-        action_row.addWidget(self.btn_clear)
-        action_row.addStretch()
-        action_row.addWidget(self.btn_speak_toggle)
-        action_row.addStretch()
-        action_row.addWidget(self.btn_settings)
-        root_layout.addLayout(action_row)
+        self._z(lambda: self.btn_speak_toggle.setMinimumWidth(theme.px(110)))
+        playback_lay.addWidget(self.btn_speak_toggle)
+        body_lay.addWidget(playback_card)
 
         # ---- Status bar ----
         self.status_bar = QStatusBar()
+        self.status_bar.setSizeGripEnabled(False)
         self.setStatusBar(self.status_bar)
+
+        # Bridge's blinking prompt cursor; it only ticks while the window is visible.
+        self._cursor_timer = QTimer(self)
+        self._cursor_timer.setInterval(1200)
+        self._cursor_timer.timeout.connect(
+            lambda: self._brand_cursor.setVisible(not self._brand_cursor.isVisible())
+        )
+        self._set_model_state("loading")
+        self._apply_zoom(self.config.get("ui_scale", 1.0), save=False)
+
+    # ---- Zoom ---------------------------------------------------------------------
+    def _z(self, apply):
+        """Run a size setter now, and again whenever the zoom changes."""
+        self._zoom_hooks.append(apply)
+        apply()
+
+    def _apply_transcript_font(self):
+        self.text_output.setFont(
+            QFont(theme.MONO_FONTS[0], max(7, round(self.config["font_size"] * theme.SCALE)))
+        )
+
+    def _apply_zoom(self, scale, save=True):
+        """Re-theme the whole app at `scale` and re-run every size hook. Live: no restart."""
+        scale = theme.clamp_scale(scale)
+        app = QApplication.instance()
+        # Re-styling the whole app is the expensive part; skip it when nothing changed
+        # (every new window used to pay it, which made the test suite 4x slower).
+        if scale != theme.SCALE or app.styleSheet() != theme.build_style(scale):
+            theme.apply_theme(app, scale)
+        for hook in self._zoom_hooks:
+            hook()
+        self.indicator.rescale()          # the floating pill is its own window
+        self.label_zoom.setText(f"{round(scale * 100)}%")
+        self.btn_zoom_out.setEnabled(scale > theme.ZOOM_STEPS[0])
+        self.btn_zoom_in.setEnabled(scale < theme.ZOOM_STEPS[-1])
+        if save and abs(scale - float(self.config.get("ui_scale", 1.0) or 1.0)) > 1e-6:
+            self.config.set("ui_scale", scale)
+
+    def _zoom_step(self, direction):
+        steps = theme.ZOOM_STEPS
+        cur = theme.SCALE
+        if direction > 0:
+            nxt = next((v for v in steps if v > cur + 1e-6), steps[-1])
+        else:
+            nxt = next((v for v in reversed(steps) if v < cur - 1e-6), steps[0])
+        self._apply_zoom(nxt)
+
+    def _card(self, title, actions=()):
+        """A Bridge card: surface, 1px border, 10px radius, a .kpi-label caption, and
+        optional small action buttons on the caption row. Returns (frame, content layout)."""
+        frame = QFrame()
+        frame.setProperty("card", "true")
+        lay = QVBoxLayout(frame)
+        top = QHBoxLayout()
+        self._z(lambda: (lay.setContentsMargins(*map(theme.px, (16, 12, 16, 14))),
+                         lay.setSpacing(theme.px(10)), top.setSpacing(theme.px(6))))
+        top.addWidget(theme.section_label(title))
+        top.addStretch()
+        for btn in actions:
+            top.addWidget(btn)
+        lay.addLayout(top)
+        return frame, lay
+
+    def _set_model_state(self, state):
+        """loading / ok / degraded: the badge and its live dot (colours live in theme.py)."""
+        theme.set_prop(self.label_model_status, "state", state)
+        theme.set_prop(self._model_dot, "state", state)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._cursor_timer.start()
+        winapi.style_title_bar(int(self.winId()), theme.C["bg"], theme.C["text"])
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self._cursor_timer.stop()
+        self._brand_cursor.setVisible(True)
 
     # -----------------------------------------------------------------------
     # Signal connections
@@ -1002,10 +1145,8 @@ class MainWindow(QMainWindow):
     def _on_recording_started(self):
         applog.dbg("_on_recording_started: showing red pill")
         self._inline_begin()
-        self.btn_record.setText("  RECORDING")
-        self.btn_record.setProperty("recording", "true")
-        self.btn_record.style().unpolish(self.btn_record)
-        self.btn_record.style().polish(self.btn_record)
+        self.btn_record.setText("Recording…")
+        theme.set_prop(self.btn_record, "recording", "true")
         self.btn_record.setEnabled(False)
         self.btn_stop.setEnabled(True)
         self._update_status("Recording... speak now")
@@ -1021,10 +1162,8 @@ class MainWindow(QMainWindow):
         max_amp = float(np.max(np.abs(audio))) if len(audio) else 0
         applog.dbg(f"_on_recording_stopped: samples={len(audio)}  duration={duration:.2f}s  peak={max_amp:.4f}")
 
-        self.btn_record.setText("  Record")
-        self.btn_record.setProperty("recording", "false")
-        self.btn_record.style().unpolish(self.btn_record)
-        self.btn_record.style().polish(self.btn_record)
+        self.btn_record.setText("Record to Panel")
+        theme.set_prop(self.btn_record, "recording", "false")
         self.btn_record.setEnabled(True)
         self.btn_stop.setEnabled(False)
         self.level_bar.setValue(0)
@@ -1134,7 +1273,7 @@ class MainWindow(QMainWindow):
     @Slot(str)
     def _on_model_loading(self, msg):
         self.label_model_status.setText(msg)
-        self.label_model_status.setStyleSheet("color: #f9e2af; font-weight: bold;")
+        self._set_model_state("loading")
         self._update_status(msg)
 
     @Slot()
@@ -1143,7 +1282,7 @@ class MainWindow(QMainWindow):
         self.label_model_status.setText(
             f"Whisper {self.transcriber.model_size} ready ({device})"
         )
-        self.label_model_status.setStyleSheet("color: #a6e3a1; font-weight: bold;")
+        self._set_model_state("ok")
         self._update_status("Ready")
 
     @Slot(str)
@@ -1160,7 +1299,7 @@ class MainWindow(QMainWindow):
         text = self.label_model_status.text()
         if "DEGRADED" not in text:
             self.label_model_status.setText(f"{text}  -  DEGRADED")
-        self.label_model_status.setStyleSheet("color: #fab387; font-weight: bold;")
+        self._set_model_state("degraded")
         try:
             self.tray.showMessage(
                 "Voice Assistant - degraded", msg,
@@ -1404,12 +1543,9 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _on_tts_started(self):
-        self.btn_speak_toggle.setText("  Stop")
+        self.btn_speak_toggle.setText("Stop")
         self.btn_speak_toggle.setChecked(True)
-        self.btn_speak_toggle.setStyleSheet(
-            "QPushButton { background-color: #d32f2f; color: #fff; border: none; "
-            "border-radius: 6px; padding: 10px 20px; font-size: 13px; font-weight: 600; }"
-        )
+        theme.set_prop(self.btn_speak_toggle, "active", "true")   # red while reading
         # A local neural read is generated at one fixed rate and voice. Lock
         # those controls while it is active so the UI cannot imply that a
         # mid-read change altered audio which was already generated.
@@ -1422,9 +1558,9 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _on_tts_finished(self):
-        self.btn_speak_toggle.setText("  Speak")
+        self.btn_speak_toggle.setText("Speak")
         self.btn_speak_toggle.setChecked(False)
-        self.btn_speak_toggle.setStyleSheet("")
+        theme.set_prop(self.btn_speak_toggle, "active", "false")
         self.voice_combo.setEnabled(True)
         self.speed_slider.setEnabled(True)
         self.speed_apply_label.setText("applies to next read")
@@ -1565,9 +1701,11 @@ class MainWindow(QMainWindow):
 
     def _update_dictation_button(self):
         if self._dictation_active:
-            self.btn_dictation.setText("  DICTATION MODE: ON")
+            self.btn_dictation.setText("● DICTATION ON")
+            self.btn_dictation.setToolTip("Dictation is on: hold your Dictate key in any app. Click to pause.")
         else:
-            self.btn_dictation.setText("  DICTATION MODE: OFF")
+            self.btn_dictation.setText("DICTATION OFF")
+            self.btn_dictation.setToolTip("Dictation is paused: text goes to the panel only. Click to turn on.")
 
     def _update_dictation_hint(self):
         hk = self.config["hotkey_record"]
@@ -1637,7 +1775,7 @@ class MainWindow(QMainWindow):
             self.transcriber.initial_prompt = vals["whisper_prompt"]
 
             self.config.set("font_size", vals["font_size"])
-            self.text_output.setFont(QFont("Cascadia Code", vals["font_size"]))
+            self._apply_transcript_font()
 
             self.config.set("always_on_top", vals["always_on_top"])
             self.config.set("start_with_windows", vals["start_with_windows"])
@@ -1665,13 +1803,13 @@ class MainWindow(QMainWindow):
 
         if prefix:
             fmt = QTextCharFormat()
-            fmt.setForeground(QColor("#89b4fa"))
+            fmt.setForeground(QColor(theme.C["cyan"]))
             fmt.setFontWeight(QFont.Weight.Bold)
             cursor.movePosition(cursor.MoveOperation.End)
             cursor.insertText(f"{prefix}  ", fmt)
 
         fmt_normal = QTextCharFormat()
-        fmt_normal.setForeground(QColor("#cdd6f4"))
+        fmt_normal.setForeground(QColor(theme.C["text"]))
         cursor.insertText(text, fmt_normal)
 
         self.text_output.setTextCursor(cursor)

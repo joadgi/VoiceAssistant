@@ -637,6 +637,28 @@ _single_instance_mutex = None
 _show_window_event = None
 
 
+def style_title_bar(hwnd, caption_hex="#0a0e17", text_hex="#f1f5f9"):
+    """Paint the window's title bar in the app's colours (Bridge's navy), Windows 11.
+
+    DWMWA_USE_IMMERSIVE_DARK_MODE (20) gives the dark frame and buttons on Windows 10
+    20H1+; DWMWA_CAPTION_COLOR (35) / DWMWA_TEXT_COLOR (36) set exact colours on
+    Windows 11 and are ignored elsewhere. Cosmetic only: every failure is swallowed.
+    """
+    def colorref(hex_color):
+        h = hex_color.lstrip("#")
+        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+        return ctypes.c_uint(r | (g << 8) | (b << 16))   # COLORREF is 0x00BBGGRR
+    try:
+        dwm = ctypes.windll.dwmapi
+        on = ctypes.c_int(1)
+        dwm.DwmSetWindowAttribute(wintypes.HWND(hwnd), 20, ctypes.byref(on), ctypes.sizeof(on))
+        for attr, value in ((35, colorref(caption_hex)), (36, colorref(text_hex))):
+            dwm.DwmSetWindowAttribute(wintypes.HWND(hwnd), attr, ctypes.byref(value), ctypes.sizeof(value))
+        return True
+    except Exception:
+        return False
+
+
 def request_existing_instance_show():
     """Ask the already-running app to show its main window."""
     EVENT_MODIFY_STATE = 0x0002

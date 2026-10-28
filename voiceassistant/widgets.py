@@ -7,6 +7,9 @@ from PySide6.QtWidgets import (
     QApplication, QFrame, QHBoxLayout, QLabel, QVBoxLayout, QWidget,
 )
 
+from . import theme
+from .theme import C
+
 
 class HotkeyCaptureWidget(QFrame):
     """A pill-shaped widget that captures any key combo when clicked.
@@ -74,26 +77,40 @@ class HotkeyCaptureWidget(QFrame):
         self._hotkey = combo
         self._update_display()
 
+    def _render(self, value, value_color):
+        """Bridge chip text: the action as a muted caption, the binding in colour."""
+        self._text.setText(
+            f'<span style="color:{C["text_muted"]};font-weight:700;">{html.escape(self._label.upper())}</span>'
+            f'&nbsp;&nbsp;<span style="color:{value_color};font-weight:700;">{html.escape(value)}</span>'
+        )
+
     def _update_display(self):
         if self._capturing:
-            self._text.setText(f"{self._label}: press any keys…")
+            self._render("press any keys…", C["orange"])
         else:
-            self._text.setText(f"{self._label}: {self._hotkey}")
+            self._render(self._hotkey, C["cyan"])
 
     def _set_idle_style(self):
         self.setStyleSheet(
-            "HotkeyCaptureWidget { background: #313244; border: 1px solid #585b70; "
-            "border-radius: 6px; }"
-            "HotkeyCaptureWidget:hover { background: #45475a; border-color: #89b4fa; }"
-            "QLabel { color: #89b4fa; font-weight: bold; font-size: 11px; background: transparent; border: none; }"
+            f"HotkeyCaptureWidget {{ background: {C['control']}; border: 1px solid {C['border']}; "
+            f"border-radius: {theme.px(6)}px; }}"
+            f"HotkeyCaptureWidget:hover {{ background: {C['control_hover']}; border-color: {C['cyan']}; }}"
+            f"QLabel {{ font-size: {theme.px(11)}px; background: transparent; border: none; }}"
         )
 
     def _set_capture_style(self):
         self.setStyleSheet(
-            "HotkeyCaptureWidget { background: #181825; border: 2px solid #f38ba8; "
-            "border-radius: 6px; }"
-            "QLabel { color: #f38ba8; font-weight: bold; font-size: 11px; background: transparent; border: none; }"
+            f"HotkeyCaptureWidget {{ background: {C['bg']}; border: 2px solid {C['orange']}; "
+            f"border-radius: {theme.px(6)}px; }}"
+            f"QLabel {{ font-size: {theme.px(11)}px; background: transparent; border: none; }}"
         )
+
+    def rescale(self):
+        """Re-apply the current style at the current zoom (sizes come from theme.px)."""
+        if self._capturing:
+            self._set_capture_style()
+        else:
+            self._set_idle_style()
 
     def mousePressEvent(self, event):
         if not self._capturing:
@@ -120,9 +137,9 @@ class HotkeyCaptureWidget(QFrame):
     def _show_in_progress(self, mods):
         """Update display while user is building a combo."""
         if mods:
-            self._text.setText(f"{self._label}: {'+'.join(mods)}+… (release to save)")
+            self._render(f"{'+'.join(mods)}+…  release to save", C["orange"])
         else:
-            self._text.setText(f"{self._label}: press any keys…")
+            self._render("press any keys…", C["orange"])
 
     def _finish_capture(self, combo):
         self._hotkey = combo
@@ -225,6 +242,9 @@ class RecordingIndicator(QWidget):
             | Qt.WindowType.Tool
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
+        # A plain QWidget only paints a style-sheet background/border with this set;
+        # without it the card's border never drew (and leaked onto the label instead).
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         # Don't steal focus from the window the user is dictating into.
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
         self.setWindowFlag(Qt.WindowType.WindowDoesNotAcceptFocus, True)
@@ -236,8 +256,6 @@ class RecordingIndicator(QWidget):
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
 
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(12, 6, 12, 6)
-        outer.setSpacing(4)
 
         # Live-preview caption: the rolling draft of what is being said. Hidden
         # (and the pill compact) until the first draft arrives. Words the last
@@ -246,25 +264,15 @@ class RecordingIndicator(QWidget):
         self._preview.setWordWrap(True)
         self._preview.setTextFormat(Qt.TextFormat.RichText)
         self._preview.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignBottom)
-        # `border: none` is load-bearing: the pill sets its border on the
-        # widget itself, and Qt style sheets propagate that to children — so
-        # without this the caption gets its own box drawn around it.
-        self._preview.setStyleSheet(
-            "color: #cdd6f4; font-size: 14px; border: none;"
-            "background-color: #181825; border-radius: 6px; padding: 6px;"
-        )
-        self._preview.setFixedWidth(self.CARD_W - 24)
         self._preview.hide()
         outer.addWidget(self._preview)
 
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
         self._dot = QLabel()
-        self._dot.setFixedSize(14, 14)
         row.addWidget(self._dot)
 
         self._label = QLabel("Ready")
-        self._label.setStyleSheet("color: #cdd6f4; font-weight: bold; font-size: 13px;")
         row.addWidget(self._label)
         row.addStretch()
         outer.addLayout(row)
@@ -272,16 +280,49 @@ class RecordingIndicator(QWidget):
         self._positioned = False  # auto-place once, then respect user drags
         self._drag_offset = None
         self._preview_text = ""   # plain text of the current draft ("" = none)
+        self._state = None        # (border, dot, text, text_color); None = idle
+        self.rescale()
         self._set_idle()
 
     # Compact pill vs. expanded caption card. The card keeps the pill's
     # bottom-right corner fixed and grows up/left, so a pill parked in the
-    # corner never walks off the screen.
-    COMPACT_W, COMPACT_H = 200, 40
-    CARD_W = 460
+    # corner never walks off the screen. Sizes are written at 100% and follow
+    # the app zoom (theme.px), like every other size in the UI.
+    @property
+    def COMPACT_W(self):
+        return theme.px(200)
+
+    @property
+    def COMPACT_H(self):
+        return theme.px(40)
+
+    @property
+    def CARD_W(self):
+        return theme.px(460)
+
     # Roughly three lines at 14px across CARD_W; older words scroll off the
-    # front so the newest words — the ones still moving — stay visible.
+    # front so the newest words — the ones still moving — stay visible. The
+    # font and the card scale together, so the count holds at every zoom.
     PREVIEW_CHARS = 170
+
+    def rescale(self):
+        """Follow the app zoom: re-apply sizes and styles, keep the current state."""
+        px = theme.px
+        self.layout().setContentsMargins(px(12), px(6), px(12), px(6))
+        self.layout().setSpacing(px(4))
+        # `border: none` is load-bearing: the pill sets its border on the
+        # widget itself, and Qt style sheets propagate that to children — so
+        # without this the caption gets its own box drawn around it.
+        self._preview.setStyleSheet(
+            f"color: {C['text']}; font-size: {px(14)}px; border: none;"
+            f"background-color: {C['bg']}; border-radius: {px(8)}px; padding: {px(7)}px {px(8)}px;"
+        )
+        self._preview.setFixedWidth(self.CARD_W - px(24))
+        self._paint()
+        if self._preview_text:
+            self._fit_card()
+        else:
+            self._resize_anchored(self.COMPACT_W, self.COMPACT_H)
 
     def preview_text(self):
         """Plain text of the draft currently shown ("" when collapsed)."""
@@ -310,16 +351,19 @@ class RecordingIndicator(QWidget):
         if stable:
             parts.append(html.escape(stable))
         if tail:
-            parts.append(f'<span style="color:#7f849c;">{html.escape(tail)}</span>')
+            parts.append(f'<span style="color:{C["text_muted"]};">{html.escape(tail)}</span>')
         self._preview.setText(" ".join(parts))
         if self._preview.isHidden():
             self._preview.show()
+        self._fit_card()
+
+    def _fit_card(self):
         # heightForWidth on a styled QLabel does not always include the style
         # sheet's padding, so take the larger of the two measurements — a card
         # one pixel short clips the last line of the draft.
         height = max(self._preview.heightForWidth(self._preview.width()),
                      self._preview.sizeHint().height())
-        self._resize_anchored(self.CARD_W, self.COMPACT_H + height + 4)
+        self._resize_anchored(self.CARD_W, self.COMPACT_H + height + theme.px(4))
 
     def clear_preview(self):
         if not self._preview_text and self._preview.isHidden():
@@ -373,30 +417,28 @@ class RecordingIndicator(QWidget):
             event.accept()
 
     def _apply(self, border, dot, text, text_color):
-        self.setStyleSheet(f"background-color: #1e1e2e; border: 2px solid {border}; border-radius: 8px;")
-        self._dot.setStyleSheet(f"background-color: {dot}; border-radius: 7px; border: none;")
-        self._label.setText(text)
-        self._label.setStyleSheet(f"color: {text_color}; font-weight: bold; font-size: 13px;")
+        self._state = (border, dot, text, text_color)
+        self._paint()
         self._position_bottom_right()
         self.show()
         self.raise_()
 
     def show_recording(self):
-        self._apply("#f38ba8", "#f38ba8", "● Recording", "#f38ba8")
+        self._apply(C["red"], C["red"], "Recording", C["red"])   # the dot is the bullet
 
     def show_transcribing(self):
-        self._apply("#f9e2af", "#f9e2af", "Transcribing…", "#f9e2af")
+        self._apply(C["yellow"], C["yellow"], "Transcribing…", C["yellow"])
 
     def show_pasting(self):
-        self._apply("#89b4fa", "#89b4fa", "Pasting…", "#89b4fa")
+        self._apply(C["cyan"], C["cyan"], "Pasting…", C["cyan"])
 
     def show_done(self):
-        self._apply("#a6e3a1", "#a6e3a1", "Pasted ✓", "#a6e3a1")
+        self._apply(C["green"], C["green"], "Pasted ✓", C["green"])
         QTimer.singleShot(1500, self.show_idle)
 
     def show_error(self, text="Paste failed — text in panel"):
         self.clear_preview()
-        self._apply("#fab387", "#fab387", text, "#fab387")
+        self._apply(C["orange"], C["orange"], text, C["orange"])
         QTimer.singleShot(2500, self.show_idle)
 
     def show_idle(self):
@@ -407,7 +449,26 @@ class RecordingIndicator(QWidget):
 
     def _set_idle(self):
         self.clear_preview()
-        self.setStyleSheet("background-color: #1e1e2e; border: 1px solid #45475a; border-radius: 8px;")
-        self._dot.setStyleSheet("background-color: #585b70; border-radius: 7px; border: none;")
-        self._label.setText("Ready — click to dictate")
-        self._label.setStyleSheet("color: #9399b2; font-weight: bold; font-size: 12px;")
+        self._state = None
+        self._paint()
+
+    def _paint(self):
+        """Style the pill for its current state at the current zoom."""
+        px = theme.px
+        if self._state is None:
+            border, dot, text, color = C["border"], C["text_muted"], "Ready — click to dictate", C["text_dim"]
+            width, size = 1, 12
+        else:
+            border, dot, text, color = self._state
+            width, size = 2, 13
+        # Scoped to the pill itself: an unscoped rule also boxed every child label.
+        self.setStyleSheet(f"RecordingIndicator {{ background-color: {C['card']}; "
+                           f"border: {px(width)}px solid {border}; border-radius: {px(10)}px; }}")
+        # Qt drops the rounding entirely when the radius exceeds half the size,
+        # so the dot's radius is derived from its scaled size, not scaled itself.
+        d = px(14)
+        self._dot.setFixedSize(d, d)
+        self._dot.setStyleSheet(f"background-color: {dot}; border-radius: {d // 2}px; border: none;")
+        self._label.setText(text)
+        self._label.setStyleSheet(f"color: {color}; font-weight: bold; font-size: {px(size)}px; "
+                                  "border: none; background: transparent;")
