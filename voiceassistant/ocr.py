@@ -22,8 +22,8 @@ import numpy as np
 from PIL import Image
 import mss
 import mss.tools
-from PySide6.QtCore import QObject, Signal, Qt, QRect
-from PySide6.QtGui import QPainter, QColor, QPen, QGuiApplication
+from PySide6.QtCore import QObject, Signal, Qt, QRectF
+from PySide6.QtGui import QCursor, QPainter, QColor, QPen, QGuiApplication, QScreen
 from PySide6.QtWidgets import QWidget
 
 from . import winapi
@@ -231,96 +231,177 @@ class OCREngine(QObject):
         self._worker.shutdown()
 
 
-class RegionSelector(QWidget):
-    """Transparent fullscreen overlay for selecting a screen region by click-drag."""
+class RegionSelector(QObject):
+    """Click-drag region picker that spans EVERY monitor.
 
-    region_selected = Signal(int, int, int, int)  # x, y, width, height
+    One translucent overlay per screen, never one window stretched over the
+    virtual desktop. The old single overlay called showFullScreen(), which
+    makes a window full-screen on the ONE monitor it lands on and discards the
+    all-monitor geometry set just before it. Measured 2026-11-10 on a 2x2 grid
+    of 3440x1440 monitors: it covered 1 of 4, so a drag on any other monitor
+    went straight through and selected text in the app underneath. A single
+    window also cannot span monitors with different scale factors.
+
+    The selection lives in PHYSICAL pixels (winapi.get_cursor_pos), the space
+    mss captures in, so the emitted rectangle is right on scaled and mixed-DPI
+    setups. Each overlay maps it into its own logical coordinates to draw.
+    A drag may cross monitors: Qt's implicit grab keeps delivering to the
+    overlay the press landed on, and every overlay draws its share.
+    """
+
+    region_selected = Signal(int, int, int, int)  # x, y, width, height (physical)
     cancelled = Signal()
 
     def __init__(self):
         super().__init__()
+        self._overlays = []
+        self._reset()
+
+    def _reset(self):
+        self._start_phys = None
+        self._current_phys = None
+        self._is_selecting = False
+
+    @staticmethod
+    def _screens():
+        return QGuiApplication.screens()
+
+    @property
+    def is_active(self):
+        """True while the overlays are up, waiting for (or in) a drag."""
+        return bool(self._overlays)
+
+    def activate(self):
+        """Cover every screen with its own overlay and wait for a drag."""
+        self._close_overlays()
+        self._reset()
+        for screen in self._screens():
+            overlay = _ScreenOverlay(self, screen)
+            overlay.show()
+            overlay.raise_()
+            self._overlays.append(overlay)
+        # Keyboard focus (for Esc) goes to the overlay under the pointer.
+        under = QGuiApplication.screenAt(QCursor.pos())
+        focus = next((o for o in self._overlays if o.screen() is under), None)
+        focus = focus or (self._overlays[0] if self._overlays else None)
+        if focus is not None:
+            focus.activateWindow()
+            focus.setFocus()
+
+    def selection(self):
+        """The current drag as a normalized PHYSICAL (x0, y0, x1, y1), or None."""
+        if not (self._is_selecting and self._start_phys and self._current_phys):
+            return None
+        (sx, sy), (ex, ey) = self._start_phys, self._current_phys
+        return min(sx, ex), min(sy, ey), max(sx, ex), max(sy, ey)
+
+    def _begin(self, phys):
+        self._start_phys = phys
+        self._current_phys = phys
+        self._is_selecting = True
+        self._repaint()
+
+    def _drag(self, phys):
+        if self._is_selecting:
+            self._current_phys = phys
+            self._repaint()
+
+    def _finish(self, phys):
+        if not self._is_selecting:
+            return  # cancelled mid-drag: the implicit-grab button-up still arrives
+        self._current_phys = phys
+        x0, y0, x1, y1 = self.selection()
+        self._close_overlays()   # off the screen BEFORE the slot captures it
+        self._reset()
+        w, h = x1 - x0, y1 - y0
+        if w > 10 and h > 10:
+            self.region_selected.emit(x0, y0, w, h)
+        else:
+            self.cancelled.emit()
+
+    def cancel(self):
+        """Esc or a right-click on any monitor. Fully resets the state machine:
+        clearing only the positions left a drag "live", and the implicit-grab
+        button-up then fired a SECOND signal (an OCR of stale coords) after the
+        user had already cancelled."""
+        self._close_overlays()
+        self._reset()
+        self.cancelled.emit()
+
+    def _repaint(self):
+        for overlay in self._overlays:
+            overlay.update()
+
+    def _close_overlays(self):
+        for overlay in self._overlays:
+            overlay.hide()
+            overlay.deleteLater()
+        self._overlays = []
+
+
+class _ScreenOverlay(QWidget):
+    """One monitor's share of the region selector: dims it and draws the
+    part of the (physical) selection that falls on it."""
+
+    def __init__(self, owner, screen):
+        super().__init__()
+        self._owner = owner
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
             | Qt.WindowType.Tool
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setCursor(Qt.CursorShape.CrossCursor)
+        if isinstance(screen, QScreen):
+            self.setScreen(screen)   # scale factor first, then the geometry
+        self.setGeometry(screen.geometry())
 
-        self._start_pos = None
-        self._current_pos = None
-        self._is_selecting = False
+    def physical_rect(self):
+        """This overlay's (left, top, right, bottom) in physical pixels."""
+        if QGuiApplication.platformName() == "windows" and self.isVisible():
+            rect = winapi.get_window_rect(int(self.winId()))
+            if rect:
+                return rect
+        g, ratio = self.geometry(), self.devicePixelRatioF()
+        return (g.x(), g.y(),
+                g.x() + round(g.width() * ratio), g.y() + round(g.height() * ratio))
 
-    def activate(self):
-        """Show the selector covering all screens."""
-        screen_geo = QGuiApplication.primaryScreen().geometry()
-        for screen in QGuiApplication.screens():
-            screen_geo = screen_geo.united(screen.geometry())
-        self.setGeometry(screen_geo)
-        self.showFullScreen()
-        self.raise_()
-        self.activateWindow()
+    def to_local(self, phys):
+        """Map a physical (x0, y0, x1, y1) into this overlay's logical coords."""
+        left, top, right, bottom = self.physical_rect()
+        sx = self.width() / max(1, right - left)
+        sy = self.height() / max(1, bottom - top)
+        x0, y0, x1, y1 = phys
+        return QRectF((x0 - left) * sx, (y0 - top) * sy, (x1 - x0) * sx, (y1 - y0) * sy)
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.fillRect(self.rect(), QColor(0, 0, 0, 80))
-
-        if self._start_pos and self._current_pos:
-            rect = QRect(self._start_pos, self._current_pos).normalized()
+        sel = self._owner.selection()
+        if sel is not None:
+            rect = self.to_local(sel)
             painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
             painter.fillRect(rect, QColor(0, 0, 0, 0))
             painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
-            pen = QPen(QColor(0, 170, 255), 2)
-            painter.setPen(pen)
+            painter.setPen(QPen(QColor(0, 170, 255), 2))
             painter.drawRect(rect)
-
         painter.end()
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
-            # Qt logical coords drive the on-screen drawing; the PHYSICAL
-            # cursor position (same space as mss) drives the emitted region —
-            # this is what makes selection correct on scaled/mixed-DPI setups.
-            self._start_pos = event.globalPosition().toPoint()
-            self._current_pos = self._start_pos
-            self._start_phys = winapi.get_cursor_pos()
-            self._is_selecting = True
-            self.update()
+            self._owner._begin(winapi.get_cursor_pos())
+        elif event.button() == Qt.MouseButton.RightButton:
+            self._owner.cancel()
 
     def mouseMoveEvent(self, event):
-        if self._is_selecting:
-            self._current_pos = event.globalPosition().toPoint()
-            self.update()
+        self._owner._drag(winapi.get_cursor_pos())
 
     def mouseReleaseEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton and self._is_selecting:
-            self._is_selecting = False
-            end_phys = winapi.get_cursor_pos()
-            sx, sy = getattr(self, "_start_phys", end_phys)
-            ex, ey = end_phys
-            x, y = min(sx, ex), min(sy, ey)
-            w, h = abs(ex - sx), abs(ey - sy)
-            self.hide()
-            if w > 10 and h > 10:
-                self.region_selected.emit(x, y, w, h)
-            else:
-                self.cancelled.emit()
-            self._start_pos = None
-            self._current_pos = None
-            self._start_phys = None
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._owner._finish(winapi.get_cursor_pos())
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Escape:
-            # Fully reset the selection state machine. Clearing only the
-            # positions (not _is_selecting / _start_phys) left an in-progress
-            # drag "live": the implicit mouse grab still delivers the eventual
-            # button-up to this hidden widget, so mouseReleaseEvent would fire
-            # a SECOND signal (region_selected from stale coords) after we
-            # already emitted cancelled — an unwanted OCR read of the wrong
-            # region right after the user pressed Esc to cancel.
-            self._is_selecting = False
-            self.hide()
-            self.cancelled.emit()
-            self._start_pos = None
-            self._current_pos = None
-            self._start_phys = None
+            self._owner.cancel()

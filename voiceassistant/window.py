@@ -228,7 +228,10 @@ class MainWindow(QMainWindow):
         # Wire hotkey signals BEFORE registering hotkeys
         self._sig_hotkey_press.connect(self._hotkey_press_handler)
         self._sig_hotkey_release.connect(self._hotkey_release_handler)
-        self._sig_hotkey_screen.connect(self._on_cursor_read)
+        # The OCR hotkey opens the region selector: the user aims it. It used to
+        # OCR a fixed box around the pointer, which cannot know where a block
+        # of text starts or ends (the same guess read-aloud stopped making).
+        self._sig_hotkey_screen.connect(self._on_screen_select)
         self._sig_hotkey_read.connect(self._on_read_aloud_toggle)
         self._sig_hotkey_pause.connect(self._on_pause_read_toggle)
         self._sig_read_text_ready.connect(self._on_read_text_ready)
@@ -481,13 +484,11 @@ class MainWindow(QMainWindow):
         self.btn_screen_read = QPushButton("Select Region")
         self.btn_screen_read.setObjectName("btn_screen_read")
         self.btn_screen_read.setProperty("variant", "outline")
-        self.btn_screen_read.setToolTip("Draw a rectangle to read text from screen")
+        self.btn_screen_read.setToolTip("Drag a box around text to read it aloud")
         self.btn_cursor_read = QPushButton("Read at Cursor")
         self.btn_cursor_read.setObjectName("btn_cursor_read")
         self.btn_cursor_read.setProperty("variant", "outline")
-        self.btn_cursor_read.setToolTip(
-            f"Read text near cursor ({self.config['hotkey_screen_read']})"
-        )
+        self.btn_cursor_read.setToolTip("Read a fixed-size box around the mouse pointer")
         screen_card, screen_lay = self._card("Screen reader")
         screen_row = QHBoxLayout()
         self._z(lambda: screen_row.setSpacing(theme.px(10)))
@@ -832,6 +833,7 @@ class MainWindow(QMainWindow):
         hk_screen = self._clean_hotkey("hotkey_screen_read")
         hk_read = self._clean_hotkey("hotkey_read_aloud")
         hk_pause = self._clean_hotkey("hotkey_pause_read")
+        self.btn_screen_read.setToolTip(f"Drag a box around text to read it aloud ({hk_screen})")
         errors = []
 
         try:
@@ -931,7 +933,7 @@ class MainWindow(QMainWindow):
             self._update_status("Hotkey errors: " + "; ".join(errors))
         else:
             self._update_status(f"Hotkeys: {hk_record}=dictate  {hk_read}=read selection  "
-                                f"{hk_pause}=pause reading  {hk_screen}=OCR")
+                                f"{hk_pause}=pause reading  {hk_screen}=read a screen region")
             applog.info("keyboard safety active: modifier passthrough and checked input batches")
 
     def _clean_hotkey(self, config_key):
@@ -1654,10 +1656,18 @@ class MainWindow(QMainWindow):
     # -----------------------------------------------------------------------
     @Slot()
     def _on_screen_select(self):
+        # Pressing the hotkey again cancels. That is the one way out that
+        # always works from the keyboard: when the hotkey fired from another
+        # app, Windows' foreground lock can refuse the overlay keyboard focus,
+        # so Esc may not reach it until the user clicks.
+        if self.region_selector.is_active:
+            self.region_selector.cancel()
+            return
         if not self.ocr.is_loaded:
             self._update_status("OCR engine still loading...")
             return
-        self._update_status("Select a screen region (ESC to cancel)")
+        self._update_status(
+            "Drag a box around the text (Esc, right-click or the hotkey again to cancel)")
         self.region_selector.activate()
 
     @Slot()
@@ -1861,13 +1871,13 @@ class MainWindow(QMainWindow):
             return "Release Ctrl, Alt, Shift, and Windows, then try reading the selection again."
         if source == SRC_CONSOLE_BLOCKED:
             return ("That's a terminal — Ctrl+C there would interrupt your command, so it "
-                    f"wasn't sent. Select and copy it yourself, or press {ocr_key} to read "
-                    "the screen.")
+                    f"wasn't sent. Select and copy it yourself, or press {ocr_key} and drag "
+                    "a box around it.")
         if source == SRC_REFOCUS_FAILED:
             return ("Couldn't switch back to that window (Windows blocked it), so the "
                     "selection wasn't read — click the window, then press the hotkey.")
         return ("Nothing selected — highlight some text first, then press the hotkey "
-                f"(or press {ocr_key} to read the screen at your cursor).")
+                f"(or press {ocr_key} and drag a box around text you can't highlight).")
 
     # -----------------------------------------------------------------------
     # Hotkey editing

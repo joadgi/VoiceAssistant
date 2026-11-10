@@ -9,9 +9,10 @@ needed). The process-global excepthooks touched in area 4 are saved and
 restored so the pytest process is never poisoned.
 
 Areas:
-  1. RegionSelector — the DPI fix: it DRAWS in Qt logical coords but EMITS the
-     physical rectangle from winapi.get_cursor_pos(). This is the only check
-     that the scaled-monitor OCR capture rectangle is computed correctly.
+  1. RegionSelector — one overlay per monitor (never one showFullScreen()
+     window, which covered 1 of 4 monitors), and the EMITTED rectangle is
+     physical, from winapi.get_cursor_pos(). This is the only check that the
+     scaled-monitor OCR capture rectangle is computed correctly.
   2. MainWindow._on_settings — the settings apply/persist wiring.
   3. MainWindow.closeEvent — close-to-tray vs. force-quit teardown.
   4. applog crash handlers — the safety net: worker-thread and main-thread
@@ -43,23 +44,51 @@ def qapp():
 
 
 # ===========================================================================
-# Area 1 — RegionSelector coordinates + DPI
+# Area 1 — RegionSelector: every monitor, physical coordinates
 # ===========================================================================
-# The selector draws its rubber-band using Qt logical coordinates
-# (event.globalPosition), but must EMIT the region in PHYSICAL pixels
-# (winapi.get_cursor_pos) — the space mss captures in. On a 125%/150% monitor
-# the two spaces differ, and the emitted rectangle must track the physical one
-# or OCR grabs the wrong area.
-class TestRegionSelectorDpi:
-    def _selector(self, qapp):
+# The selector must cover EVERY monitor with its own overlay (the old single
+# showFullScreen() overlay covered 1 of 4 on a 2x2 desk, so drags on the other
+# three selected text in the app underneath), and must EMIT the region in
+# PHYSICAL pixels (winapi.get_cursor_pos) — the space mss captures in. On a
+# 125%/150% monitor Qt's logical coordinates differ, and the emitted rectangle
+# must track the physical one or OCR grabs the wrong area.
+class _FakeScreen:
+    def __init__(self, x, y, w, h):
+        from PySide6.QtCore import QRect
+
+        self._geometry = QRect(x, y, w, h)
+
+    def geometry(self):
+        return self._geometry
+
+
+# Josh's desk, measured 2026-11-10: a 2x2 grid of 3440x1440 monitors.
+DESK = [(0, 0, 3440, 1440), (3440, -18, 3440, 1440),
+        (0, -1440, 3440, 1440), (3440, -1458, 3440, 1440)]
+
+
+class TestRegionSelector:
+    @pytest.fixture
+    def make(self, qapp, monkeypatch):
         from voiceassistant.ocr import RegionSelector
 
-        sel = RegionSelector()
-        got = []
-        cancels = []
-        sel.region_selected.connect(lambda x, y, w, h: got.append((x, y, w, h)))
-        sel.cancelled.connect(lambda: cancels.append(True))
-        return sel, got, cancels
+        made = []
+
+        def build(screens=((0, 0, 1920, 1080),)):
+            fakes = [_FakeScreen(*g) for g in screens]
+            monkeypatch.setattr(RegionSelector, "_screens", staticmethod(lambda: fakes))
+            sel = RegionSelector()
+            got, cancels = [], []
+            sel.region_selected.connect(lambda x, y, w, h: got.append((x, y, w, h)))
+            sel.cancelled.connect(lambda: cancels.append(True))
+            sel.activate()
+            made.append(sel)
+            return sel, got, cancels
+
+        yield build
+        for sel in made:
+            sel._close_overlays()
+        qapp.processEvents()
 
     def _script_cursor(self, monkeypatch, points):
         """winapi.get_cursor_pos returns each point in `points` in turn."""
@@ -75,97 +104,147 @@ class TestRegionSelectorDpi:
 
         monkeypatch.setattr(winapi, "get_cursor_pos", fake)
 
-    def _press(self, sel, logical_global):
+    def _mouse(self, overlay, kind, button, logical_global=(0, 0)):
+        down = kind == QEvent.Type.MouseButtonPress
         ev = QMouseEvent(
-            QEvent.Type.MouseButtonPress,
+            kind,
             QPointF(0, 0),
             QPointF(*logical_global),
-            Qt.MouseButton.LeftButton,
-            Qt.MouseButton.LeftButton,
+            button,
+            button if down else Qt.MouseButton.NoButton,
             Qt.KeyboardModifier.NoModifier,
         )
-        sel.mousePressEvent(ev)
+        if down:
+            overlay.mousePressEvent(ev)
+        else:
+            overlay.mouseReleaseEvent(ev)
 
-    def _release(self, sel):
-        ev = QMouseEvent(
-            QEvent.Type.MouseButtonRelease,
-            QPointF(0, 0),
-            QPointF(0, 0),
-            Qt.MouseButton.LeftButton,
-            Qt.MouseButton.NoButton,
-            Qt.KeyboardModifier.NoModifier,
-        )
-        sel.mouseReleaseEvent(ev)
+    def _press(self, overlay, logical_global=(0, 0), button=Qt.MouseButton.LeftButton):
+        self._mouse(overlay, QEvent.Type.MouseButtonPress, button, logical_global)
 
-    def _esc(self, sel):
-        sel.keyPressEvent(
+    def _release(self, overlay):
+        self._mouse(overlay, QEvent.Type.MouseButtonRelease, Qt.MouseButton.LeftButton)
+
+    def _esc(self, overlay):
+        overlay.keyPressEvent(
             QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Escape,
                       Qt.KeyboardModifier.NoModifier)
         )
 
-    def test_esc_midselection_then_release_does_not_double_emit(self, qapp, monkeypatch):
+    def test_every_monitor_gets_its_own_overlay(self, make):
+        sel, _, _ = make(DESK)
+        assert len(sel._overlays) == len(DESK), \
+            f"{len(sel._overlays)} overlays for {len(DESK)} monitors"
+        for overlay, (x, y, w, h) in zip(sel._overlays, DESK):
+            g = overlay.geometry()
+            assert (g.x(), g.y(), g.width(), g.height()) == (x, y, w, h)
+            # showFullScreen() is what shrank the old overlay to one monitor.
+            assert not overlay.windowState() & Qt.WindowState.WindowFullScreen
+
+    def test_activating_twice_does_not_stack_overlays(self, make):
+        sel, _, _ = make(DESK)
+        sel.activate()
+        assert len(sel._overlays) == len(DESK)
+
+    def test_emits_physical_rectangle_not_logical(self, make, monkeypatch):
+        sel, got, cancels = make()
+        # Physical cursor: start (200,150), end (500,450). Qt's logical global
+        # position is deliberately DIFFERENT (160,120), as under display
+        # scaling: the emitted rect must be the physical one.
+        self._script_cursor(monkeypatch, [(200, 150), (500, 450)])
+        self._press(sel._overlays[0], logical_global=(160, 120))
+        assert sel._start_phys == (200, 150), \
+            "physical coord not captured from winapi.get_cursor_pos"
+        self._release(sel._overlays[0])
+        assert got == [(200, 150, 300, 300)], got
+        assert cancels == []
+
+    def test_normalizes_min_corner_and_abs_size(self, make, monkeypatch):
+        # Drag up-and-left: physical start (500,450) -> end (200,150).
+        sel, got, cancels = make()
+        self._script_cursor(monkeypatch, [(500, 450), (200, 150)])
+        self._press(sel._overlays[0], logical_global=(400, 360))
+        self._release(sel._overlays[0])
+        assert got == [(200, 150, 300, 300)], got
+        assert cancels == []
+
+    def test_a_drag_can_cross_monitors(self, make, monkeypatch):
+        # Pressed on the bottom-left monitor, released on the top-right one.
+        # Qt's implicit grab delivers the release to the overlay pressed on.
+        sel, got, cancels = make(DESK)
+        self._script_cursor(monkeypatch, [(3000, 1000), (3700, -100)])
+        first = sel._overlays[0]
+        self._press(first)
+        self._release(first)
+        assert got == [(3000, -100, 700, 1100)], got
+        assert cancels == []
+
+    def test_each_overlay_draws_its_share_at_any_scale(self, make, monkeypatch):
+        # A 150% monitor: 3840x2160 physical, 2560x1440 logical. A physical
+        # selection must land at two-thirds of its coordinates on the overlay.
+        from PySide6.QtCore import QRectF
+
+        sel, _, _ = make([(0, 0, 2560, 1440)])
+        overlay = sel._overlays[0]
+        monkeypatch.setattr(overlay, "physical_rect", lambda: (0, 0, 3840, 2160))
+        assert overlay.to_local((300, 150, 600, 450)) == QRectF(200, 100, 200, 200)
+        # And on a monitor to the right, relative to ITS origin.
+        sel, _, _ = make([(3440, -18, 3440, 1440)])
+        right = sel._overlays[0]
+        monkeypatch.setattr(right, "physical_rect", lambda: (3440, -18, 6880, 1422))
+        assert right.to_local((3500, 0, 3600, 100)) == QRectF(60, 18, 100, 100)
+
+    def test_tiny_drag_under_10px_cancels(self, make, monkeypatch):
+        # A sub-10px drag is a click, not a region — must cancel, not emit.
+        sel, got, cancels = make()
+        self._script_cursor(monkeypatch, [(300, 300), (305, 304)])
+        self._press(sel._overlays[0])
+        self._release(sel._overlays[0])
+        assert got == [], f"tiny drag wrongly emitted a region: {got}"
+        assert cancels == [True]
+
+    def test_escape_cancels_from_any_monitor(self, make, monkeypatch):
+        sel, got, cancels = make(DESK)
+        self._script_cursor(monkeypatch, [(200, 150)])
+        self._press(sel._overlays[0])
+        self._esc(sel._overlays[3])
+        assert cancels == [True]
+        assert got == []
+        assert sel._overlays == [], "overlays left on screen after Esc"
+
+    def test_right_click_cancels(self, make, monkeypatch):
+        sel, got, cancels = make(DESK)
+        self._press(sel._overlays[2], button=Qt.MouseButton.RightButton)
+        assert cancels == [True] and got == []
+        assert sel._overlays == []
+
+    def test_esc_midselection_then_release_does_not_double_emit(self, make, monkeypatch):
         # Regression: press -> Esc -> button-up. Esc must fully reset the
         # state machine so the implicit-grab button-up (delivered to the now
-        # hidden widget) does NOT fire a second region_selected from stale
-        # coords after cancel. Before the fix this emitted an unwanted OCR
-        # region right after the user cancelled.
-        sel, got, cancels = self._selector(qapp)
+        # hidden overlay) does NOT fire a second region_selected from stale
+        # coords after cancel.
+        sel, got, cancels = make()
+        overlay = sel._overlays[0]
         self._script_cursor(monkeypatch, [(200, 150), (500, 450)])
-        self._press(sel, logical_global=(160, 120))
-        self._esc(sel)
-        self._release(sel)
+        self._press(overlay, logical_global=(160, 120))
+        self._esc(overlay)
+        self._release(overlay)
         assert got == [], f"Esc-cancelled selection still emitted a region: {got}"
         assert cancels == [True], f"expected exactly one cancel, got {cancels}"
         assert sel._is_selecting is False and sel._start_phys is None
 
-    def test_emits_physical_rectangle_not_logical(self, qapp, monkeypatch):
-        sel, got, cancels = self._selector(qapp)
-        # Physical cursor: start (200,150), end (500,450).
-        # Qt logical global at press is deliberately DIFFERENT (160,120) —
-        # as it would be under display scaling. If the code mistakenly used
-        # logical coords the emitted rect would not match the physical one.
-        self._script_cursor(monkeypatch, [(200, 150), (500, 450)])
-
-        self._press(sel, logical_global=(160, 120))
-        # Press captures BOTH spaces separately.
-        assert (sel._start_pos.x(), sel._start_pos.y()) == (160, 120), \
-            "logical draw-coord not captured from the event"
-        assert sel._start_phys == (200, 150), \
-            "physical coord not captured from winapi.get_cursor_pos"
-
-        self._release(sel)
-        # Emitted rectangle is PHYSICAL: min-corner (200,150), size (300,300).
-        assert got == [(200, 150, 300, 300)], got
-        assert cancels == []
-
-    def test_normalizes_min_corner_and_abs_size(self, qapp, monkeypatch):
-        # Drag up-and-left: physical start (500,450) -> end (200,150).
-        # Result must still be the SAME normalized rect (min corner + abs size).
-        sel, got, cancels = self._selector(qapp)
-        self._script_cursor(monkeypatch, [(500, 450), (200, 150)])
-        self._press(sel, logical_global=(400, 360))
-        self._release(sel)
-        assert got == [(200, 150, 300, 300)], got
-        assert cancels == []
-
-    def test_tiny_drag_under_10px_cancels(self, qapp, monkeypatch):
-        # A sub-10px drag is a click, not a region — must cancel, not emit.
-        sel, got, cancels = self._selector(qapp)
-        self._script_cursor(monkeypatch, [(300, 300), (305, 304)])
-        self._press(sel, logical_global=(300, 300))
-        self._release(sel)
-        assert got == [], f"tiny drag wrongly emitted a region: {got}"
-        assert cancels == [True]
-
-    def test_escape_cancels(self, qapp, monkeypatch):
-        sel, got, cancels = self._selector(qapp)
-        self._script_cursor(monkeypatch, [(200, 150)])
-        self._press(sel, logical_global=(200, 150))
-        ev = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Escape,
-                       Qt.KeyboardModifier.NoModifier)
-        sel.keyPressEvent(ev)
-        assert cancels == [True]
-        assert got == []
+    def test_overlays_leave_the_screen_before_the_region_is_reported(self, make, monkeypatch):
+        # The slot captures the screen synchronously; a dimmed overlay still up
+        # at that moment would be in the screenshot.
+        sel, got, _ = make(DESK)
+        overlays = list(sel._overlays)
+        visible_at_emit = []
+        sel.region_selected.connect(
+            lambda *_: visible_at_emit.append([o.isVisible() for o in overlays]))
+        self._script_cursor(monkeypatch, [(100, 100), (400, 300)])
+        self._press(overlays[0])
+        self._release(overlays[0])
+        assert got and visible_at_emit == [[False] * len(DESK)], visible_at_emit
 
 
 # ===========================================================================

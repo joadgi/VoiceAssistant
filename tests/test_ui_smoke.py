@@ -241,6 +241,41 @@ def test_empty_selection_never_reads_the_screen_aloud(main_window, monkeypatch):
         assert "ctrl+shift+s" in main_window._read_failure_message(source), source
 
 
+def test_the_ocr_hotkey_opens_the_region_selector_and_toggles_it(main_window, monkeypatch):
+    """The OCR hotkey used to OCR a fixed 600x300 box around the pointer, which
+    cannot know where a block of text starts or ends. It now opens the region
+    selector so the user aims it, and pressing it again cancels: when the
+    hotkey fired from another app, Esc may not reach the overlay."""
+    monkeypatch.setattr(type(main_window.ocr), "is_loaded", property(lambda self: True))
+    monkeypatch.setattr(
+        main_window.screen_capture, "capture_around_cursor",
+        lambda **kw: pytest.fail("the OCR hotkey guessed a box around the pointer"),
+    )
+    sel = main_window.region_selector
+    cancels = []
+    sel.cancelled.connect(lambda: cancels.append(True))
+    try:
+        main_window._sig_hotkey_screen.emit()
+        assert sel.is_active, "the OCR hotkey did not open the region selector"
+        main_window._sig_hotkey_screen.emit()
+        assert not sel.is_active, "pressing the hotkey again left the overlays up"
+        assert cancels == [True]
+    finally:
+        sel._close_overlays()
+
+
+def test_read_at_cursor_is_still_a_button(main_window, monkeypatch):
+    """The fixed box around the pointer lost its hotkey, not its button."""
+    grabbed = []
+    monkeypatch.setattr(type(main_window.ocr), "is_loaded", property(lambda self: True))
+    monkeypatch.setattr(main_window.screen_capture, "capture_around_cursor",
+                        lambda **kw: grabbed.append(kw) or "img")
+    monkeypatch.setattr(main_window.ocr, "read_image", lambda img: None)
+    main_window.btn_cursor_read.click()
+    assert grabbed, "Read at Cursor no longer reads around the pointer"
+    assert not main_window.region_selector.is_active
+
+
 class _BalloonTray:
     def __init__(self, broken=False):
         self.messages = []

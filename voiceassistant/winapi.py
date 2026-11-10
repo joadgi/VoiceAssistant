@@ -64,6 +64,28 @@ def get_cursor_pos():
     return pt.x, pt.y
 
 
+class _RECT(ctypes.Structure):
+    _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+
+user32.GetWindowRect.restype = wintypes.BOOL
+user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(_RECT)]
+
+
+def get_window_rect(hwnd):
+    """A window's (left, top, right, bottom) in PHYSICAL pixels, or None.
+
+    Physical for the same reason as get_cursor_pos: the process is per-monitor
+    DPI aware. The region selector uses it to map the physical selection into
+    each monitor overlay's own logical coordinates.
+    """
+    rect = _RECT()
+    if not hwnd or not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        return None
+    return rect.left, rect.top, rect.right, rect.bottom
+
+
 # Window classes that treat Ctrl+C as INTERRUPT rather than copy. Sending our
 # synthetic Ctrl+C into one of these kills whatever command is running — a real
 # data-loss hazard, and read-aloud used to do it unconditionally.

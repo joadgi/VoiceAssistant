@@ -17,7 +17,7 @@ SAPI locally.
 - **Inline typing (optional)** — the settled words can also be typed straight into the window you are dictating into, so text appears as you speak instead of arriving all at once. When the accurate transcription lands, the app corrects what it typed in place rather than pasting a second copy. It only ever deletes characters it typed itself, and it refuses to run unless your dictate hotkey is a plain key (Caps Lock, Scroll Lock, F9) — with a modifier combo the typed characters would reach the app as shortcuts. It never types into a terminal. Off by default; enable it in Settings → Transcription.
 - **Read highlighted text aloud** — highlight text in any app and hear it through a local neural voice, with optional Microsoft online and Windows SAPI choices.
 - **Pause and resume read-aloud** — **Pause** in the Playback card, the tray menu, the pill's right-click menu, or the Pause hotkey (`Ctrl+Shift+P` by default) holds the voice on the word it was saying; press again to carry on. The Pause hotkey is only taken while something is being read, so the rest of the time `Ctrl+Shift+P` still reaches your apps.
-- **OCR at cursor** — capture on-screen text from images, PDFs, error dialogs, or anything else you can't select, and have it read aloud.
+- **Read a screen region** — press the OCR hotkey (`Ctrl+Shift+S` by default) or **Select Region**, drag a box around text you can't highlight (images, scanned PDFs, error dialogs), and hear it read aloud. Works on every monitor; Esc, a right-click or the hotkey again cancels. For ordinary text, highlighting it and using Read is better: it reads exactly what you highlighted.
 - **Fast local speed control** — Michael and the other local voices generate at an intelligible rate, then pitch-preserving tempo compression supplies playback from 0.5x–2.6x. One speed is fixed for each press of Speak; the Voice and Speed controls lock during that read, then slider changes apply to the next read.
 - **Local and online neural voices** — Michael, Adam, Eric, Liam, Heart, and Sarah run locally; Microsoft voices remain available as clearly marked online choices.
 - **Fully customizable hotkeys** — every hotkey (Dictate, Read, Pause, OCR) is yours to change: click any hotkey pill on the main window, then press a **single key (like F9), a combo, or even a modifier-only combo (like Ctrl+Alt)** for push-to-talk. Nothing is hardcoded. (The `Fn` key can't be bound — it's handled in keyboard firmware and never reaches Windows.)
@@ -75,7 +75,8 @@ so rather than failing silently.
    terminal is focused, because there Ctrl+C means *interrupt* and would kill
    whatever command is running.
 3. **OCR** — for text that isn't really text: scanned PDFs, images,
-   copy-protected pages.
+   copy-protected pages. This is never automatic: press the OCR hotkey and drag
+   a box around it.
 
 **OCR** grabs a region of the screen, runs Windows' built-in OCR engine over it
 (about 10 ms, no model download), then shows and speaks the result.
@@ -161,7 +162,7 @@ VoiceAssistant/
 | Dictate | `Ctrl+Shift+R` | Hold to record, release to transcribe + paste |
 | Read Selection | `Ctrl+Shift+T` | Press once to read highlighted text, press again to stop |
 | Pause Reading | `Ctrl+Shift+P` | Pause the current read, press again to resume (only taken while reading) |
-| OCR at Cursor | `Ctrl+Shift+S` | Capture 600x300 region around cursor, OCR, read aloud |
+| Read Screen Region | `Ctrl+Shift+S` | Drag a box around text, OCR, read aloud (press again to cancel) |
 
 All hotkeys are customizable inline on the main window — click the pill, press your combo.
 
@@ -212,7 +213,7 @@ your transcribed text.**
 | Read-aloud pauses, catches up, skips sections, or reports `playback buffer ran dry` | Select a **[Local Neural]** voice. The full selection is phonemized once, Kokoro's native punctuation-aware batches retain their sentence pauses, and one fixed speed feeds one continuous VLC stream. The raw PCM callback is clock-paced so VLC cannot read ahead to EOF and mark a still-audible passage complete. |
 | Read-aloud says "backslash," reads a file path, or produces nonsense from a source link | Current builds convert Markdown source to its visible words before synthesis: escaped list markers are removed and `[label](path)` speaks only `label`. |
 | Read-aloud mangles an ASIN, SKU, mixed letter-number ID, or price | Current builds make Amazon identifiers and dollar/cents units explicit before synthesis instead of asking the phonemizer to guess. |
-| Read-aloud reads the wrong text (e.g. a browser address bar) | That app doesn't expose its selection properly. Re-select the text and try again; it will fall back to copy or OCR. |
+| Read-aloud reads the wrong text (e.g. a browser address bar) | That app doesn't expose its selection properly. Re-select the text and try again; it will fall back to copying. If that fails too, press the OCR hotkey and drag a box around the text. |
 | The `Fn` key won't bind | It can't. `Fn` is handled inside your keyboard's firmware and never reaches Windows, so no software can see it. Use `F9` or similar. |
 | A hotkey fires in the browser too | Some defaults collide (`Ctrl+Shift+T` reopens a closed tab). Click the hotkey pill and rebind it. |
 

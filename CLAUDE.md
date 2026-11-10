@@ -93,11 +93,13 @@ Pasted/idle/error. The final paste path is unchanged. Setting: `live_preview`.
    keystrokes, no focus switch, and it works when the window ISN'T focused.
 2. **Ctrl+C sentinel** (refocus → sentinel → Ctrl+C → poll → restore) for apps UIA
    doesn't expose. Skipped entirely for console windows.
-3. **OCR the area around the cursor** — still available, but on its OWN hotkey.
+3. **OCR** — still available, but on its OWN hotkey, which opens the region
+   selector so the user aims it.
    Read-aloud does NOT escalate to it automatically (see the key decision below).
 The tier is reported back so failures name the real cause and `--report` counts them.
 
-**OCR:** hotkey (cursor region) or drag-selected region → `mss` grab → `OCREngine` →
+**OCR:** hotkey or Select Region button → drag a box (one overlay per monitor) →
+`mss` grab → `OCREngine` →
 text shown and auto-spoken.
 
 **TTS:** the default local path phonemizes the complete selection once, then streams
@@ -466,6 +468,23 @@ call `TTSEngine.toggle_pause()`. Stop still works from a paused read.
   agent run, and the two scopes tried gave opposite answers on the same 18 live
   windows (any-descendant: 17 "has text", focused-only: 1). Do not reintroduce
   automatic escalation without a way to measure it on a real desktop.
+- **The region selector is one overlay PER MONITOR, never one full-screen window**
+  (`ocr.RegionSelector` + `_ScreenOverlay`). `showFullScreen()` makes a window
+  full-screen on the single monitor it lands on and discards the all-monitor
+  geometry set before it. Measured 2026-11-10 on Josh's 2x2 grid of 3440x1440
+  monitors: the old overlay covered **1 of 4**, so a drag anywhere else went
+  straight through and selected text in the app underneath. One window also cannot
+  span monitors with different scale factors. The selection is held in PHYSICAL
+  pixels (`get_cursor_pos`, the space mss captures in) and each overlay maps it
+  into its own logical coordinates through its own `GetWindowRect`, so a drag can
+  cross monitors. The overlays are hidden BEFORE `region_selected` fires, because
+  the slot captures the screen synchronously. Esc or a right-click on any monitor
+  cancels, and so does pressing the hotkey again: when it fired from another app,
+  Windows' foreground lock can refuse the overlay keyboard focus, so Esc may not
+  arrive until the user clicks. **The OCR hotkey opens this selector; it no longer
+  OCRs a fixed box around the pointer** (2026-11-10). That box cannot know where a
+  block of text starts or ends - the same guess read-aloud stopped making. It
+  survives only as the Read at Cursor button.
 - **A neural voice is a hard choice; never switch it to SAPI automatically.**
   The old fallback converted a transient neural startup delay into an unexpected
   robotic Windows voice. Stopping that voice and pressing Read again could then
@@ -752,7 +771,7 @@ user necessarily runs):
 | Dictate | `Ctrl+Shift+R` | Hold to record, release to transcribe + paste |
 | Read selection | `Ctrl+Shift+T` | Press to read highlighted text; press again to stop |
 | Pause reading | `Ctrl+Shift+P` | Pause / resume the current read; only taken while reading |
-| OCR at cursor | `Ctrl+Shift+S` | Capture region around cursor, OCR, read aloud |
+| Read screen region | `Ctrl+Shift+S` | Drag a box around text, OCR, read aloud; press again to cancel |
 
 **What Josh actually runs** (his `settings.json`, as of 2026-10-28) — every trigger
 is withheld from the focused app:
@@ -762,7 +781,7 @@ is withheld from the focused app:
 | Dictate | `caps lock` | suppressed as a dedicated solo key |
 | Read selection | `f6` | consumed by `ChordHotkey` |
 | Pause reading | `f7` | consumed by `ChordHotkey`, only while reading (F7 reaches apps otherwise) |
-| OCR at cursor | `ctrl+shift+s` | consumed by `ChordHotkey` (so Save As is gone app-wide) |
+| Read screen region | `ctrl+shift+s` | consumed by `ChordHotkey` (so Save As is gone app-wide) |
 
 All are editable inline — click a hotkey pill and press your combo (single key or combo).
 
