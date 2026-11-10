@@ -99,8 +99,12 @@ select it.
 ```powershell
 git clone https://github.com/joadgi/VoiceAssistant.git
 cd VoiceAssistant
-setup.bat
+.\setup.bat
 ```
+
+Keep the `.\` in front: PowerShell won't run a file from the current folder
+without it (`setup.bat` on its own says "not recognized"). In Command Prompt
+either form works.
 
 This creates a Python virtual environment and pulls all dependencies (~600 MB —
 no PyTorch needed; OCR uses the Windows-native engine and Whisper-GPU uses the
@@ -108,7 +112,7 @@ slim NVIDIA runtime wheels).
 
 **Run:**
 ```powershell
-run.bat
+.\run.bat
 ```
 
 Or double-click `run.bat` in File Explorer. First launch downloads the Whisper
@@ -116,7 +120,7 @@ speech model (one-time). OCR needs no download — it's built into Windows.
 
 **Verify your install** (optional — run in a terminal):
 ```powershell
-venv\Scripts\python.exe main.py --check
+.\venv\Scripts\python.exe main.py --check
 ```
 Reports PASS/WARN/FAIL for every component (mic, hotkeys, CUDA runtime, OCR,
 VLC, offline/neural TTS). Add `--deep` to also load the Whisper model and prove
@@ -182,7 +186,7 @@ All hotkeys are customizable inline on the main window — click the pill, press
 neural and offline voices):
 
 ```powershell
-venv\Scripts\python.exe main.py --check
+.\venv\Scripts\python.exe main.py --check
 ```
 
 Add `--deep` to also load the Whisper model and prove the transcription path end
@@ -193,7 +197,7 @@ audio length, volume peak, decode latency, and outcome. If dictation starts
 feeling unreliable, read this before changing any settings:
 
 ```powershell
-venv\Scripts\python.exe main.py --report
+.\venv\Scripts\python.exe main.py --report
 ```
 
 (`--last=50` limits it to the most recent 50.) It stores **counts only, never
@@ -207,7 +211,7 @@ your transcribed text.**
 | Short words ("yes", "no") get dropped | They fell below the minimum-length or minimum-volume gate. The pill names the reason. Tune `min_record_seconds` / `min_record_peak` in `settings.json`. |
 | Hotkey does nothing in *one* specific app | That app is probably running as administrator. Windows blocks keyboard hooks from a normal-privilege app into an elevated one — run this app as admin too, or use a different app. |
 | Caps Lock toggles caps while dictating | Shouldn't happen — the app swallows the key when Caps Lock is bound. If it does, report it; it means the key suppression broke. |
-| Read-aloud is silent | VLC or the local Kokoro model may be missing. Run `setup.bat`, install VLC with `winget install VideoLAN.VLC`, then run `main.py --check`. |
+| Read-aloud is silent | VLC or the local Kokoro model may be missing. Run `.\setup.bat`, install VLC with `winget install VideoLAN.VLC`, then run `main.py --check`. |
 | It reads in the robotic Windows voice, not the one I picked | A neural voice is never switched into SAPI automatically. Windows SAPI speaks only when you explicitly choose an **[Offline]** voice. |
 | Stop doesn't stop the reading | Current builds wake the local stream callback, cancel an active online request, stop VLC, and purge explicitly selected SAPI speech. A stale selection result cannot restart speech. |
 | Read-aloud pauses, catches up, skips sections, or reports `playback buffer ran dry` | Select a **[Local Neural]** voice. The full selection is phonemized once, Kokoro's native punctuation-aware batches retain their sentence pauses, and one fixed speed feeds one continuous VLC stream. The raw PCM callback is clock-paced so VLC cannot read ahead to EOF and mark a still-audible passage complete. |
@@ -228,7 +232,7 @@ keeps running.
 ## Uninstalling
 
 ```powershell
-uninstall.bat
+.\uninstall.bat
 ```
 
 Or double-click it. It walks through four steps and tells you what it's doing:
