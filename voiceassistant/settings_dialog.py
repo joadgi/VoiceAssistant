@@ -177,7 +177,8 @@ class SettingsDialog(QDialog):
     def showEvent(self, event):
         super().showEvent(event)
         from . import theme, winapi
-        winapi.style_title_bar(int(self.winId()), theme.C["bg"], theme.C["text"])
+        winapi.style_title_bar(int(self.winId()), theme.C["bg"], theme.C["text"],
+                               dark=theme.MODE == "dark")
 
     def get_values(self):
         return {

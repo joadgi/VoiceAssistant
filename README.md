@@ -22,7 +22,7 @@ SAPI locally.
 - **Local and online neural voices** — Michael, Adam, Eric, Liam, Heart, and Sarah run locally; Microsoft voices remain available as clearly marked online choices.
 - **Fully customizable hotkeys** — every hotkey (Dictate, Read, Pause, OCR) is yours to change: click any hotkey pill on the main window, then press a **single key (like F9), a combo, or even a modifier-only combo (like Ctrl+Alt)** for push-to-talk. Nothing is hardcoded. (The `Fn` key can't be bound — it's handled in keyboard firmware and never reaches Windows.)
 - **Local Whisper transcription** — `faster-whisper` on NVIDIA GPU (CUDA) with CPU fallback.
-- **Bridge look, with zoom** — the window uses the same design system as Bridge (dark navy, cyan accents, the Inter typeface, which ships with the app). Use **− / +** in the header, or **Ctrl+−**, **Ctrl+=** and **Ctrl+0**, to make the whole interface smaller or larger (70%–140%), including the floating dictation pill. It changes live and is remembered.
+- **Bridge look, light or dark, with zoom** — the window uses the same design system as Bridge (cyan accents, the Inter typeface, which ships with the app), in Bridge's dark navy or its light theme. The sun/moon button in the header switches between **Dark**, **Light** and **Auto** (follows your Windows setting, live). Use **− / +** in the header, or **Ctrl+−**, **Ctrl+=** and **Ctrl+0**, to make the whole interface smaller or larger (70%–140%), including the floating dictation pill. It changes live and is remembered.
 
 ## Stack
 

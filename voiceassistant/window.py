@@ -12,10 +12,10 @@ from collections import deque
 import keyboard as kb
 import numpy as np
 import pyperclip
-from PySide6.QtCore import Qt, QTimer, Signal, Slot
+from PySide6.QtCore import QByteArray, QSize, Qt, QTimer, Signal, Slot
 from PySide6.QtGui import (
-    QAction, QColor, QFont, QIcon, QKeySequence, QPainter, QPen, QPixmap, QShortcut,
-    QTextCharFormat,
+    QAction, QActionGroup, QColor, QFont, QIcon, QKeySequence, QPainter, QPen, QPixmap,
+    QShortcut, QTextCharFormat, QTextCursor,
 )
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialog, QFrame, QHBoxLayout, QLabel, QMainWindow, QMenu,
@@ -63,7 +63,9 @@ def _make_tray_icon():
     try:
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor(theme.C["red"]))               # the recording red (Bridge --red)
+        # The recording red (Bridge --red). The tray sits on the Windows taskbar, not
+        # in the app, so it keeps one colour whichever theme the app is in.
+        p.setBrush(QColor(theme.PALETTES["dark"]["red"]))
         p.drawRoundedRect(2, 2, 60, 60, 16, 16)
         p.setBrush(QColor("#ffffff"))
         p.drawRoundedRect(26, 13, 12, 23, 6, 6)          # mic capsule
@@ -74,6 +76,34 @@ def _make_tray_icon():
         p.drawLine(32, 48, 32, 53)                       # stem
     finally:
         p.end()
+    return QIcon(pix)
+
+
+# Bridge's appearance glyphs (its user menu: moon, sun, monitor), 24x24 stroked paths.
+_THEME_GLYPHS = {
+    "dark": '<path d="M21 12.8A9 9 0 1111.2 3a7 7 0 009.8 9.8z"/>',
+    "light": ('<circle cx="12" cy="12" r="4.2"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2'
+              'M4.9 4.9l1.4 1.4m11.4 11.4l1.4 1.4M19.1 4.9l-1.4 1.4M6.3 17.7l-1.4 1.4"/>'),
+    "auto": '<rect x="2.5" y="3.5" width="19" height="13" rx="2"/><path d="M8 20.5h8"/>',
+}
+THEME_LABELS = {"dark": "Dark", "light": "Light", "auto": "Auto (match Windows)"}
+
+
+def _theme_glyph(choice, color, size, ratio=1.0):
+    """One appearance glyph drawn in `color`; re-made whenever the palette or zoom changes."""
+    from PySide6.QtSvg import QSvgRenderer
+
+    svg = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" '
+           f'stroke="{color}" stroke-width="1.7" stroke-linecap="round" '
+           f'stroke-linejoin="round">{_THEME_GLYPHS[choice]}</svg>')
+    pix = QPixmap(max(1, round(size * ratio)), max(1, round(size * ratio)))
+    pix.fill(QColor(0, 0, 0, 0))
+    p = QPainter(pix)
+    try:
+        QSvgRenderer(QByteArray(svg.encode("utf-8"))).render(p)
+    finally:
+        p.end()
+    pix.setDevicePixelRatio(ratio)
     return QIcon(pix)
 
 
@@ -327,6 +357,28 @@ class MainWindow(QMainWindow):
         zoom.addWidget(self.btn_zoom_out)
         zoom.addWidget(self.label_zoom)
         zoom.addWidget(self.btn_zoom_in)
+
+        # Appearance: Dark / Light / Auto, as in Bridge's user menu. The button shows
+        # the current choice's glyph; the menu holds all three.
+        self._theme_choice = theme.clamp_mode(self.config.get("ui_theme", "dark"))
+        self.btn_theme = QPushButton()
+        self.btn_theme.setProperty("variant", "icon")
+        self.btn_theme.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._theme_menu = QMenu(self)
+        group = QActionGroup(self)
+        self._theme_actions = {}
+        for choice in theme.MODES:
+            act = QAction(THEME_LABELS[choice], self, checkable=True)
+            act.triggered.connect(lambda _=False, c=choice: self._apply_ui_theme(c))
+            group.addAction(act)
+            self._theme_menu.addAction(act)
+            self._theme_actions[choice] = act
+        self.btn_theme.clicked.connect(
+            lambda: self._theme_menu.exec(self.btn_theme.mapToGlobal(self.btn_theme.rect().bottomLeft())))
+        self._z(lambda: (self.btn_theme.setFixedSize(theme.px(28), theme.px(28)),
+                         self._refresh_theme_icons()))
+        zoom.addSpacing(6)
+        zoom.addWidget(self.btn_theme)
         head.addLayout(zoom)
         head.addWidget(self.btn_settings)
         for keys, step in (("Ctrl+=", +1), ("Ctrl++", +1), ("Ctrl+-", -1)):
@@ -550,7 +602,10 @@ class MainWindow(QMainWindow):
             lambda: self._brand_cursor.setVisible(not self._brand_cursor.isVisible())
         )
         self._set_model_state("loading")
+        self._apply_ui_theme(self._theme_choice, save=False)
         self._apply_zoom(self.config.get("ui_scale", 1.0), save=False)
+        # Auto follows Windows live: Qt re-reads the app colour setting on change.
+        QApplication.styleHints().colorSchemeChanged.connect(self._on_system_scheme_changed)
 
     # ---- Zoom ---------------------------------------------------------------------
     def _z(self, apply):
@@ -559,9 +614,14 @@ class MainWindow(QMainWindow):
         apply()
 
     def _apply_transcript_font(self):
-        self.text_output.setFont(
-            QFont(theme.MONO_FONTS[0], max(7, round(self.config["font_size"] * theme.SCALE)))
-        )
+        # Through the style sheet, not setFont(). Qt's style-sheet engine keeps the
+        # font a widget had when it was first styled and puts it back whenever styling
+        # is re-applied, so a setFont() made before the window was first shown -- the
+        # saved zoom, at every startup -- reverted to the 100% size (measured: 13 pt
+        # at 80%, where 10 pt was set).
+        pt = max(7, round(self.config["font_size"] * theme.SCALE))
+        self.text_output.setStyleSheet(
+            f'QTextEdit {{ font-family: "{theme.MONO_FONTS[0]}"; font-size: {pt}pt; }}')
 
     def _apply_zoom(self, scale, save=True):
         """Re-theme the whole app at `scale` and re-run every size hook. Live: no restart."""
@@ -579,6 +639,74 @@ class MainWindow(QMainWindow):
         self.btn_zoom_in.setEnabled(scale < theme.ZOOM_STEPS[-1])
         if save and abs(scale - float(self.config.get("ui_scale", 1.0) or 1.0)) > 1e-6:
             self.config.set("ui_scale", scale)
+
+    # ---- Appearance ----------------------------------------------------------------
+    def _apply_ui_theme(self, choice, save=True):
+        """Dark / light / auto (follow Windows). Live, no restart; remembered."""
+        choice = theme.clamp_mode(choice)
+        mode = theme.resolve_mode(choice)
+        if mode != theme.MODE:
+            old = dict(theme.C)
+            theme.apply_theme(QApplication.instance(), mode=mode)
+            # The app style sheet re-polishes every widget; these hold colours of
+            # their own (code-built styles, rich text, a separate window, DWM).
+            for hook in self._zoom_hooks:
+                hook()
+            self.indicator.rescale()
+            self._recolor_transcript(old)
+            self._style_title_bars()
+        self._theme_choice = choice
+        self._theme_actions[choice].setChecked(True)
+        self._refresh_theme_icons()
+        if save and choice != self.config.get("ui_theme"):
+            self.config.set("ui_theme", choice)
+
+    @Slot()
+    def _on_system_scheme_changed(self, *_):
+        if self._theme_choice == "auto":
+            self._apply_ui_theme("auto", save=False)
+
+    def _refresh_theme_icons(self):
+        size, ratio = theme.px(16), self.devicePixelRatioF()
+        self.btn_theme.setIcon(_theme_glyph(self._theme_choice, theme.C["text_dim"], size, ratio))
+        self.btn_theme.setIconSize(QSize(size, size))
+        self.btn_theme.setToolTip(f"Appearance: {THEME_LABELS[self._theme_choice]}")
+        for choice, act in self._theme_actions.items():
+            act.setIcon(_theme_glyph(choice, theme.C["text_dim"], size, ratio))
+
+    def _recolor_transcript(self, old):
+        """The transcript bakes a colour into every run it appends (prefix cyan, body
+        text), so text added under one palette would be unreadable in the other -- the
+        dark theme's near-white text on a white page. Carry those runs across, in
+        place, so anything the user has edited survives."""
+        swap = {QColor(old[k]).name(): QColor(theme.C[k]) for k in ("cyan", "text")}
+        doc = self.text_output.document()
+        runs = []
+        block = doc.begin()
+        while block.isValid():
+            for it in block:
+                frag = it.fragment()
+                target = swap.get(frag.charFormat().foreground().color().name())
+                if target is not None:
+                    runs.append((frag.position(), frag.length(), target))
+            block = block.next()
+        if not runs:
+            return
+        cursor = QTextCursor(doc)
+        cursor.beginEditBlock()
+        for pos, length, color in runs:
+            cursor.setPosition(pos)
+            cursor.setPosition(pos + length, QTextCursor.MoveMode.KeepAnchor)
+            fmt = QTextCharFormat()
+            fmt.setForeground(color)
+            cursor.mergeCharFormat(fmt)
+        cursor.endEditBlock()
+
+    def _style_title_bars(self):
+        for w in QApplication.topLevelWidgets():
+            if w.isVisible() and isinstance(w, (QMainWindow, QDialog)):
+                winapi.style_title_bar(int(w.winId()), theme.C["bg"], theme.C["text"],
+                                       dark=theme.MODE == "dark")
 
     def _zoom_step(self, direction):
         steps = theme.ZOOM_STEPS
@@ -613,7 +741,8 @@ class MainWindow(QMainWindow):
     def showEvent(self, event):
         super().showEvent(event)
         self._cursor_timer.start()
-        winapi.style_title_bar(int(self.winId()), theme.C["bg"], theme.C["text"])
+        winapi.style_title_bar(int(self.winId()), theme.C["bg"], theme.C["text"],
+                               dark=theme.MODE == "dark")
 
     def hideEvent(self, event):
         super().hideEvent(event)

@@ -363,15 +363,99 @@ class TestHotkeyCapture:
         assert w._capturing is False  # capture ended, nothing emitted
 
 
-def test_theme_builds_and_its_icons_exist():
-    """The Bridge theme is one formatted string plus three SVGs; a stray brace or a
+@pytest.mark.parametrize("mode,suffix", [("dark", ""), ("light", "-light")])
+def test_theme_builds_and_its_icons_exist(mode, suffix):
+    """Each palette is one formatted string plus three SVGs; a stray brace or a
     missing asset would silently drop the whole style sheet or an icon."""
     from voiceassistant import theme
 
-    assert "{cyan}" not in theme.DARK_STYLE and "{assets}" not in theme.DARK_STYLE
-    for name in ("check.svg", "chevron-down.svg", "chevron-up.svg"):
-        assert os.path.exists(os.path.join(theme.ASSETS, name)), name
-        assert theme.ASSETS + "/" + name in theme.DARK_STYLE
+    sheet = theme.stylesheet(mode)
+    for token in ("{cyan}", "{assets}", "{icon}", "{field}", "{on_accent}"):
+        assert token not in sheet, token
+    for name in ("check", "chevron-down", "chevron-up"):
+        path = theme.ASSETS + "/" + name + suffix + ".svg"
+        assert os.path.exists(path), path
+        assert path in sheet
+
+
+def _contrast(fg, bg):
+    """WCAG contrast ratio between two #rrggbb colours."""
+    def lum(c):
+        ch = [int(c[i:i + 2], 16) / 255 for i in (1, 3, 5)]
+        ch = [v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4 for v in ch]
+        return 0.2126 * ch[0] + 0.7152 * ch[1] + 0.0722 * ch[2]
+    hi, lo = sorted((lum(fg), lum(bg)), reverse=True)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+@pytest.mark.parametrize("mode", ["dark", "light"])
+def test_both_palettes_are_complete_and_readable(mode):
+    """Light is Bridge's [data-theme="light"]; every token dark has, light has, and
+    the words people read clear WCAG AA (4.5:1) on every surface they sit on."""
+    from voiceassistant import theme
+
+    p = theme.PALETTES[mode]
+    assert set(p) == set(theme.PALETTES["dark"])
+    for fg in ("text", "text_dim"):
+        for bg in ("bg", "card", "input_bg", "field", "control"):
+            assert _contrast(p[fg], p[bg]) >= 4.5, (mode, fg, bg, round(_contrast(p[fg], p[bg]), 2))
+    # Labels on the cyan buttons (Bridge uses white on its light cyan).
+    assert _contrast(p["on_accent"], p["cyan"]) >= 3.0
+
+
+def test_the_light_theme_is_bridges(monkeypatch):
+    """Copied, not tuned: these are Bridge's own light tokens."""
+    from voiceassistant import theme
+
+    light = theme.PALETTES["light"]
+    assert (light["bg"], light["card"], light["border"], light["cyan"], light["text"]) == (
+        "#f0f2f5", "#ffffff", "#d1d5db", "#0284c7", "#1e293b")
+
+
+def test_a_bad_saved_theme_falls_back_to_dark():
+    from voiceassistant.config import sanitize_settings
+
+    assert sanitize_settings({"ui_theme": "neon"})["ui_theme"] == "dark"
+    assert sanitize_settings({"ui_theme": "auto"})["ui_theme"] == "auto"
+    assert "dark_mode" not in sanitize_settings({"dark_mode": True})
+
+
+def test_switching_theme_is_live_and_remembered(main_window, monkeypatch):
+    """Dark -> Light -> Auto with no restart: the style sheet, the colours baked into
+    the transcript, the hotkey chips and the pill all follow, and the choice is saved."""
+    from PySide6.QtWidgets import QApplication
+
+    from voiceassistant import theme
+
+    w = main_window
+    dark, light = theme.PALETTES["dark"], theme.PALETTES["light"]
+    try:
+        assert theme.MODE == "dark"
+        w._append_output("Read this in either theme.", prefix="[Dictation]")
+
+        w._theme_actions["light"].trigger()
+        assert theme.MODE == "light"
+        assert QApplication.instance().styleSheet() == theme.build_style(theme.SCALE, "light")
+        assert w.config.get("ui_theme") == "light"
+        assert w.btn_theme.toolTip() == "Appearance: Light"
+        colours = {it.fragment().charFormat().foreground().color().name()
+                   for it in w.text_output.document().begin()}
+        assert colours == {light["cyan"], light["text"]}, "transcript kept its dark colours"
+        assert light["cyan"] in w.hk_dictate._text.text()
+        assert light["card"] in w.indicator.styleSheet()
+
+        monkeypatch.setattr(theme, "system_mode", lambda: "dark")
+        w._theme_actions["auto"].trigger()
+        assert theme.MODE == "dark" and w.config.get("ui_theme") == "auto"
+        monkeypatch.setattr(theme, "system_mode", lambda: "light")
+        w._on_system_scheme_changed()          # Windows switched its app colour
+        assert theme.MODE == "light"
+        assert w.config.get("ui_theme") == "auto"
+    finally:
+        w._apply_ui_theme("dark")
+    assert theme.MODE == "dark"
+    assert dark["text"] in {it.fragment().charFormat().foreground().color().name()
+                            for it in w.text_output.document().begin()}
 
 
 def test_model_badge_follows_model_state(main_window):
@@ -494,3 +578,28 @@ def test_pause_controls_follow_the_read(main_window):
     assert not w.btn_pause_read.isEnabled() and w.btn_pause_read.text() == "Pause"
     assert not w.act_pause_read.isEnabled()
     assert [a.text() for a in w._build_pill_menu().actions()][1] == "Read selection aloud"
+
+
+def test_hints_are_at_least_as_legible_in_light_as_in_dark():
+    """Help text is paragraphs, not captions: Bridge's light caption grey would be
+    2.6:1 on white. Light hints must read at least as well as dark ones do."""
+    from voiceassistant import theme
+
+    d, l = theme.PALETTES["dark"], theme.PALETTES["light"]
+    assert _contrast(l["hint"], l["card"]) >= _contrast(d["hint"], d["card"])
+    assert d["hint"] == d["text_muted"], "dark hints changed colour"
+
+
+def test_transcript_text_follows_the_zoom_from_the_first_show(main_window, qapp):
+    """The saved zoom is applied before the window is first shown. Set with setFont(),
+    Qt's style-sheet engine put the transcript back to its 100% size on that first
+    show (measured 13 pt at 80%), so the transcript never followed the zoom."""
+    w = main_window
+    try:
+        w._apply_zoom(0.8, save=False)
+        w.show()
+        qapp.processEvents()
+        assert w.text_output.font().pointSize() == round(w.config["font_size"] * 0.8)
+    finally:
+        w.hide()
+        w._apply_zoom(1.0, save=False)

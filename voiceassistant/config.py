@@ -60,7 +60,8 @@ DEFAULTS = {
     # opts in via Settings. (Existing users' saved True persists untouched.)
     "start_with_windows": False,
     "start_minimized": True,
-    "dark_mode": True,
+    # "dark" | "light" | "auto" (follow Windows), as in Bridge. Header sun/moon button.
+    "ui_theme": "dark",
     "font_size": 13,
     # Interface zoom (header - 100% + / Ctrl+- Ctrl+= Ctrl+0): 0.7-1.4, live.
     "ui_scale": 1.0,
@@ -235,6 +236,8 @@ def sanitize_settings(data):
                 % (key, original, value))
         cleaned[key] = value
         seen.add(value)
+    if cleaned.get("ui_theme", "dark") not in ("dark", "light", "auto"):
+        cleaned["ui_theme"] = "dark"
     return cleaned
 
 

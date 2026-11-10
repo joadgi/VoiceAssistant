@@ -637,12 +637,15 @@ _single_instance_mutex = None
 _show_window_event = None
 
 
-def style_title_bar(hwnd, caption_hex="#0a0e17", text_hex="#f1f5f9"):
-    """Paint the window's title bar in the app's colours (Bridge's navy), Windows 11.
+def style_title_bar(hwnd, caption_hex="#0a0e17", text_hex="#f1f5f9", dark=True):
+    """Paint the window's title bar in the app's colours (Bridge's navy, or its light
+    grey), Windows 11.
 
     DWMWA_USE_IMMERSIVE_DARK_MODE (20) gives the dark frame and buttons on Windows 10
-    20H1+; DWMWA_CAPTION_COLOR (35) / DWMWA_TEXT_COLOR (36) set exact colours on
-    Windows 11 and are ignored elsewhere. Cosmetic only: every failure is swallowed.
+    20H1+ (and is switched OFF for the light theme, or the minimise/close glyphs stay
+    white on a light bar); DWMWA_CAPTION_COLOR (35) / DWMWA_TEXT_COLOR (36) set exact
+    colours on Windows 11 and are ignored elsewhere. Cosmetic only: every failure is
+    swallowed.
     """
     def colorref(hex_color):
         h = hex_color.lstrip("#")
@@ -650,7 +653,7 @@ def style_title_bar(hwnd, caption_hex="#0a0e17", text_hex="#f1f5f9"):
         return ctypes.c_uint(r | (g << 8) | (b << 16))   # COLORREF is 0x00BBGGRR
     try:
         dwm = ctypes.windll.dwmapi
-        on = ctypes.c_int(1)
+        on = ctypes.c_int(1 if dark else 0)
         dwm.DwmSetWindowAttribute(wintypes.HWND(hwnd), 20, ctypes.byref(on), ctypes.sizeof(on))
         for attr, value in ((35, colorref(caption_hex)), (36, colorref(text_hex))):
             dwm.DwmSetWindowAttribute(wintypes.HWND(hwnd), attr, ctypes.byref(value), ctypes.sizeof(value))

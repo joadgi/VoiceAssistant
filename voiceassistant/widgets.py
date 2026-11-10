@@ -106,12 +106,14 @@ class HotkeyCaptureWidget(QFrame):
         )
 
     def rescale(self):
-        """Re-apply the current style at the current zoom (sizes come from theme.px)."""
+        """Re-apply the current style at the current zoom and palette (sizes come from
+        theme.px, colours from theme.C, which a light/dark switch replaces)."""
         self.setMinimumWidth(theme.px(110))
         if self._capturing:
             self._set_capture_style()
         else:
             self._set_idle_style()
+        self._update_display()     # the caption/binding colours are baked into rich text
 
     def mousePressEvent(self, event):
         if not self._capturing:
